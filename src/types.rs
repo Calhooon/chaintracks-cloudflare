@@ -332,6 +332,12 @@ pub struct InsertHeaderResult {
     pub no_tip: bool,
 }
 
+/// Maximum blocks the tracked tip may sit below the last-observed network tip
+/// before the service is treated as "behind" — drives `is_syncing` in /getInfo
+/// and the readiness verdict in /health. A handful of blocks absorbs the normal
+/// live lag between one-minute cron ticks (BSV blocks arrive ~every 10 min).
+pub const HEALTH_MAX_GAP: u32 = 6;
+
 /// Chaintracks service info (returned by /getInfo).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -348,6 +354,14 @@ pub struct ChaintracksInfo {
     pub last_synced_at: Option<String>,
     /// Height recorded at the last successful sync.
     pub last_synced_height: Option<u32>,
+    /// Last-observed network tip (WhatsOnChain), persisted at the START of each
+    /// cron tick so the gap is visible without an external call. 0 before the
+    /// first tick after a fresh deploy.
+    pub woc_tip: u32,
+    /// How far the tracked tip sits below `woc_tip` (0 when caught up). Together
+    /// with `last_synced_at` this lets a watchdog distinguish "behind but
+    /// syncing" from "cron stalled".
+    pub behind_by: u32,
 }
 
 #[cfg(test)]

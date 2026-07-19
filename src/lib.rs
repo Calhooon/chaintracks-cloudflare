@@ -3,6 +3,7 @@ use worker::*;
 mod d1;
 mod r2;
 mod routes;
+mod selfpop;
 mod storage;
 mod sync;
 mod types;

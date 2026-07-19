@@ -178,38 +178,121 @@ pub async fn get_info(db: &D1Database, chain: &Chain) -> worker::Result<Chaintra
 
     let tip_height = get_chain_tip_height(db).await?;
 
-    // Freshness from sync_state (audit M6): the table is written on every
-    // successful sync but was never read by any endpoint — staleness was
+    // Freshness from sync_state (audit M6): the table is written every tick
+    // (woc_tip_height + updated_at at tick start; last_synced_height on
+    // completion) but the tip/gap was never surfaced — staleness was
     // undetectable from the API.
     #[derive(serde::Deserialize)]
     struct SyncRow {
         last_synced_height: Option<f64>,
         updated_at: Option<String>,
+        woc_tip_height: Option<f64>,
     }
-    let sync: Option<SyncRow> =
-        match Query::new("SELECT last_synced_height, updated_at FROM sync_state WHERE id = 1")
-            .first(db)
-            .await
-        {
-            Ok(row) => row,
-            Err(e) => {
-                // Loud, not silent (review L-4): the freshness signal exists
-                // to expose degradation — swallowing its own read error
-                // would hide exactly that.
-                worker::console_error!("get_info: sync_state read failed: {}", e);
-                None
-            }
-        };
+    let sync: Option<SyncRow> = match Query::new(
+        "SELECT last_synced_height, updated_at, woc_tip_height FROM sync_state WHERE id = 1",
+    )
+    .first(db)
+    .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            // Loud, not silent (review L-4): the freshness signal exists
+            // to expose degradation — swallowing its own read error
+            // would hide exactly that.
+            worker::console_error!("get_info: sync_state read failed: {}", e);
+            None
+        }
+    };
+
+    // woc_tip = the last network tip the cron observed; behind_by = how far the
+    // tracked tip trails it. is_syncing (previously hard-coded false) now
+    // reflects that gap, so /getInfo alone tells an operator whether the
+    // service is caught up or still filling.
+    let woc_tip = sync
+        .as_ref()
+        .and_then(|r| r.woc_tip_height)
+        .map(|v| v as u32)
+        .unwrap_or(0);
+    let behind_by = woc_tip.saturating_sub(tip_height);
 
     Ok(ChaintracksInfo {
         chain: chain.as_str().to_string(),
         height_live: tip_height,
         height_bulk: 0,
         header_count,
-        is_syncing: false,
+        is_syncing: behind_by > crate::types::HEALTH_MAX_GAP,
         storage_type: "d1".to_string(),
         last_synced_at: sync.as_ref().and_then(|r| r.updated_at.clone()),
         last_synced_height: sync.as_ref().and_then(|r| r.last_synced_height.map(|v| v as u32)),
+        woc_tip,
+        behind_by,
+    })
+}
+
+/// Snapshot for the /health readiness probe — read entirely from local D1 (no
+/// upstream call) so the endpoint stays fast and safe for a watchdog to poll
+/// every minute.
+pub struct HealthSnapshot {
+    /// Tracked chain tip (highest active header).
+    pub height_live: u32,
+    /// Last network tip the cron observed (0 before the first tick).
+    pub woc_tip: u32,
+    /// Seconds since the cron last recorded an observation; `i64::MAX` if never.
+    pub stale_secs: i64,
+    /// Hash of our current chain tip (display hex); empty if no tip yet.
+    pub local_tip_hash: String,
+    /// WhatsOnChain's best block hash as of the last tick (display hex); empty
+    /// before the first tick. Lets /health detect an equal-height fork.
+    pub woc_best_hash: String,
+}
+
+/// Local health snapshot for /health. Staleness is computed in SQL (SQLite
+/// reads the stored `datetime('now')` string as UTC), so the handler needs no
+/// wall-clock of its own and makes no network call.
+pub async fn get_health(db: &D1Database) -> worker::Result<HealthSnapshot> {
+    // Tip height AND hash together so /health can detect an equal-height fork
+    // (same height as the network tip but a different block).
+    let (height_live, local_tip_hash) = match find_chain_tip(db).await? {
+        Some(h) => (h.height, h.hash),
+        None => (0, String::new()),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Row {
+        woc_tip_height: Option<f64>,
+        woc_best_hash: Option<String>,
+        stale_secs: Option<f64>,
+    }
+    let row: Option<Row> = Query::new(
+        "SELECT woc_tip_height, woc_best_hash, \
+         CAST(strftime('%s','now') - strftime('%s', updated_at) AS INTEGER) AS stale_secs \
+         FROM sync_state WHERE id = 1",
+    )
+    .first(db)
+    .await
+    .unwrap_or(None);
+
+    let woc_tip = row
+        .as_ref()
+        .and_then(|r| r.woc_tip_height)
+        .map(|v| v as u32)
+        .unwrap_or(0);
+    let woc_best_hash = row
+        .as_ref()
+        .and_then(|r| r.woc_best_hash.clone())
+        .unwrap_or_default();
+    let stale_secs = row
+        .as_ref()
+        .and_then(|r| r.stale_secs)
+        .map(|v| v as i64)
+        .unwrap_or(i64::MAX);
+
+    Ok(HealthSnapshot {
+        height_live,
+        woc_tip,
+        stale_secs,
+        local_tip_hash,
+        woc_best_hash,
     })
 }
 

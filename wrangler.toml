@@ -7,10 +7,17 @@ account_id = ""
 
 [vars]
 CHAIN = "main"
-WHATSONCHAIN_API_KEY = ""
+# Boundary between the immutable R2 bulk store (heights below this) and the
+# mutable D1 live window (heights >= this). Default matches the projectbabbage
+# CDN snapshot top; raise it only in lockstep with the bulk files R2 holds.
+BULK_TOP_HEIGHT = "942761"
 # Optional: base URL of an upstream chaintracks instance used for fast
 # catch-up (bulk getHeaders). Leave empty to sync directly from WhatsOnChain.
 UPSTREAM_CHAINTRACKS_URL = ""
+# The WhatsOnChain API key is OPTIONAL and, if used, MUST be set as a secret —
+# do NOT add it as a [vars] entry (an empty/placeholder var of the same name
+# shadows the secret, so the key silently would not be used):
+#   npx wrangler secret put WHATSONCHAIN_API_KEY
 
 # REQUIRED for the /admin/* surface (fail-closed: admin routes answer 503
 # until this secret exists). Set with: npx wrangler secret put ADMIN_TOKEN

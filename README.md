@@ -56,6 +56,41 @@ harness on 10k randomized cases):
   the ts-stack conformance vectors (20/20 testable vectors pass). SSE
   streams are not implemented (cron-pull architecture); v2 clients poll.
 
+## Bulk/live storage split, /health, self-populating R2
+
+Layers a canonical bulk/live storage split plus operational monitoring on top of
+the above, so D1 stays well under its size ceiling as the chain grows (storing
+the whole chain in D1 hits the free-tier size cap around ~795k rows).
+
+- **Bulk/live split.** Immutable headers below `BULK_TOP_HEIGHT` (default
+  `942761`, the projectbabbage CDN snapshot top) live as 80-byte records in the
+  R2 bulk store; recent heights stay in the mutable D1 live window. Reads route
+  by height (`findHeaderHexForHeight`, `isValidRootForHeight`, and the `/v2`
+  header paths), with a CDN read-through fallback that refuses a non-80-byte
+  response — so historical reads never fail while R2 is being populated. The
+  per-tick full-table sweep then only ever touches the small live window.
+
+- **`/health`.** A machine-readable readiness probe (200 / 503 + JSON), answered
+  entirely from local D1 (no upstream call) so an uptime watchdog can poll it
+  every minute. Returns 200 only when the tracked tip is within a small gap of
+  the last-observed network tip, the cron heartbeat is fresh, and (at equal
+  height) the tip hash matches the network's best block; otherwise 503 with a
+  reason (`no-data` / `stale` / `behind` / `forked`). `/getInfo` also surfaces
+  `wocTip` / `behindBy` / `isSyncing`, and each cron tick records its heartbeat
+  before any CPU-heavy work so the freshness signal stays truthful even if a
+  catch-up tick is cut short.
+
+- **Self-populating R2** (optional, off by default). With `SELFPOP_CRON=on`,
+  idle caught-up ticks stream the bulk header files from the CDN into R2 and
+  verify them lazily in bounded chunks (full linkage + the CDN index last-hash,
+  self-healing by delete on any mismatch) — removing the manual
+  `wrangler r2 object put` step and the permanent per-read CDN dependency. It is
+  **off by default** because a populate/verify unit measures ~16–50 ms CPU,
+  above the Workers Free-plan *scheduled* (cron) ~10 ms limit; the operator
+  `/admin/self-pop` route (fetch handler, higher budget) populates fine, or set
+  `SELFPOP_CRON=on` on a paid plan for automatic self-population. Reads always
+  fall back to the CDN, so an unpopulated or partially-populated R2 is safe.
+
 ## HTTP API
 
 | Endpoint | Description |

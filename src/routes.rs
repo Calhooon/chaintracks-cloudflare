@@ -145,6 +145,8 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     let response = match (method, path.as_str()) {
         // Health (plain text, no wrapper — matches production root endpoint)
         (Method::Get, "/") => health(&chain),
+        // Machine-readable readiness probe for uptime watchdogs (200 / 503 + JSON).
+        (Method::Get, "/health") => health_check(&db).await,
 
         // Info & chain
         (Method::Get, "/getChain") => wrap_success(chain.as_str()),
@@ -173,7 +175,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         }
         (Method::Get, "/getHeaders") => {
             let url = req.url()?;
-            get_headers(&db, &url).await
+            get_headers(&db, env, &url).await
         }
 
         // Validation
@@ -212,6 +214,20 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
             admin_export_r2(&db, env, &chain, &url).await
         }
 
+        // Admin: populate the R2 bulk store from the public CDN (bulk/live split)
+        (Method::Get, "/admin/import-cdn") => {
+            let url = req.url()?;
+            admin_import_cdn(env, &chain, &url).await
+        }
+
+        // Admin: run ONE self-pop unit of work now (bypasses the cron's idle
+        // gate) — for testing the streaming populate / lazy verify before the
+        // live window is caught up. The cron runs the same tick automatically.
+        (Method::Get, "/admin/self-pop") => match crate::selfpop::tick(env, &chain).await {
+            Ok(()) => wrap_success("self-pop tick ran"),
+            Err(e) => wrap_error(&format!("self-pop error: {e}"), 500),
+        },
+
         // Serve bulk header files from R2
         (Method::Get, path) if path.starts_with("/headers/") => serve_r2_file(env, path).await,
 
@@ -224,6 +240,186 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
 fn health(chain: &Chain) -> Result<Response> {
     // Root health endpoint returns plain text (matches production exactly)
     Response::ok(format!("Chaintracks {chain}Net Block Header Service"))
+}
+
+/// Readiness verdict for /health. A pure function of the three inputs so the
+/// 200/503 boundary is unit-tested without a live D1 or wall-clock.
+struct HealthVerdict {
+    healthy: bool,
+    reason: &'static str,
+}
+
+fn health_verdict(
+    height_live: u32,
+    woc_tip: u32,
+    stale_secs: i64,
+    local_tip_hash: &str,
+    woc_best_hash: &str,
+) -> HealthVerdict {
+    // Cron heartbeat: woc_tip_height + updated_at are written at the START of
+    // every tick, so a stale heartbeat means the cron itself stopped running.
+    // 60s cadence → tolerate a few missed ticks before declaring it stalled.
+    const MAX_STALE_SECS: i64 = 300;
+
+    // Nothing observed yet (fresh deploy, cron has not run) — not ready.
+    if woc_tip == 0 || height_live == 0 {
+        return HealthVerdict {
+            healthy: false,
+            reason: "no-data",
+        };
+    }
+    // Heartbeat stale ⇒ the tip has not been confirmed recently. This covers a
+    // dead cron OR a sustained WhatsOnChain outage (the heartbeat is written
+    // only after a successful tip fetch): both mean the tip is effectively
+    // frozen, which is what a watchdog must alarm on. `secondsSinceSync` in the
+    // body lets the operator tell the two apart.
+    if stale_secs > MAX_STALE_SECS {
+        return HealthVerdict {
+            healthy: false,
+            reason: "stale",
+        };
+    }
+    let gap = woc_tip.saturating_sub(height_live);
+    // Unresolved equal-height fork: we sit AT the network tip height but on a
+    // DIFFERENT block. A gap-only check reads this as caught up (gap 0) while
+    // SPV reads serve a losing branch — the merkleRoot at the tip is wrong.
+    // sync.rs tries to switch to the network's block each tick; until it does,
+    // report degraded. (Empty woc_best_hash = not yet observed → skip; that
+    // only happens before the first tick, already covered by the no-data guard.
+    // The check is gated on gap == 0 so normal below-tip lag, where the hashes
+    // differ simply because they are at different heights, is not misflagged.)
+    if gap == 0 && !woc_best_hash.is_empty() && !local_tip_hash.eq_ignore_ascii_case(woc_best_hash) {
+        return HealthVerdict {
+            healthy: false,
+            reason: "forked",
+        };
+    }
+    // Heartbeat fresh but the tracked tip trails the network tip by too much.
+    if gap > crate::types::HEALTH_MAX_GAP {
+        return HealthVerdict {
+            healthy: false,
+            reason: "behind",
+        };
+    }
+    HealthVerdict {
+        healthy: true,
+        reason: "ok",
+    }
+}
+
+/// Machine-readable liveness/readiness probe for uptime watchdogs. LOCAL-ONLY
+/// (no upstream call) so it stays fast and can be polled every minute without
+/// hammering WhatsOnChain. 200 when the tracked tip is close to the last
+/// observed network tip AND the cron heartbeat is fresh; 503 otherwise (behind,
+/// stalled cron, or no data yet). Body is JSON in both cases.
+async fn health_check(db: &worker::D1Database) -> Result<Response> {
+    let h = storage::get_health(db).await?;
+    let v = health_verdict(
+        h.height_live,
+        h.woc_tip,
+        h.stale_secs,
+        &h.local_tip_hash,
+        &h.woc_best_hash,
+    );
+    let body = serde_json::json!({
+        "status": if v.healthy { "ok" } else { "degraded" },
+        "healthy": v.healthy,
+        "reason": v.reason,
+        "heightLive": h.height_live,
+        "wocTip": h.woc_tip,
+        "behindBy": h.woc_tip.saturating_sub(h.height_live),
+        "secondsSinceSync": h.stale_secs,
+        "tipHash": h.local_tip_hash,
+        "wocBestHash": h.woc_best_hash,
+    });
+    let resp = Response::from_json(&body)?;
+    Ok(resp.with_status(if v.healthy { 200 } else { 503 }))
+}
+
+#[cfg(test)]
+mod health_verdict_tests {
+    use super::health_verdict;
+
+    // Distinct stand-in tip hashes.
+    const H_A: &str = "aaaa";
+    const H_B: &str = "bbbb";
+
+    #[test]
+    fn healthy_when_slightly_behind_and_fresh() {
+        // gap 3 (< MAX_GAP), fresh; hashes differ only because we're a few back
+        assert!(health_verdict(958_400, 958_403, 30, H_A, H_B).healthy);
+    }
+
+    #[test]
+    fn healthy_when_exact_tip_match() {
+        // gap 0 and our tip IS the network best block
+        assert!(health_verdict(958_403, 958_403, 30, H_A, H_A).healthy);
+    }
+
+    #[test]
+    fn degraded_when_far_behind_even_if_fresh() {
+        // mid-catch-up: cron alive (30s) but ~14k behind
+        let v = health_verdict(943_800, 958_400, 30, H_A, H_B);
+        assert!(!v.healthy);
+        assert_eq!(v.reason, "behind");
+    }
+
+    #[test]
+    fn degraded_when_heartbeat_stale_even_if_caught_up() {
+        // exact tip match but no heartbeat for 10 min ⇒ frozen, not trustworthy
+        let v = health_verdict(958_403, 958_403, 600, H_A, H_A);
+        assert!(!v.healthy);
+        assert_eq!(v.reason, "stale");
+    }
+
+    #[test]
+    fn degraded_on_unresolved_equal_height_fork() {
+        // same height as the network tip but a DIFFERENT block — a competitor
+        // branch sync.rs has not switched to yet. gap-only would call it healthy.
+        let v = health_verdict(958_403, 958_403, 30, H_A, H_B);
+        assert!(!v.healthy);
+        assert_eq!(v.reason, "forked");
+    }
+
+    #[test]
+    fn equal_height_fork_resolved_is_healthy() {
+        // competitor fetch succeeded: our tip == network best block
+        assert!(health_verdict(958_403, 958_403, 30, H_B, H_B).healthy);
+    }
+
+    #[test]
+    fn no_fork_flag_when_one_block_behind() {
+        // gap 1: hash naturally differs (one block back) — normal lag, NOT a
+        // fork; must stay healthy (the fork check is gated on gap == 0)
+        assert!(health_verdict(958_402, 958_403, 30, H_A, H_B).healthy);
+    }
+
+    #[test]
+    fn empty_best_hash_does_not_flag_fork() {
+        // defensive: gap 0 but no stored best hash yet → not forked
+        assert!(health_verdict(958_403, 958_403, 30, H_A, "").healthy);
+    }
+
+    #[test]
+    fn degraded_before_first_tick() {
+        let v = health_verdict(0, 0, 0, "", "");
+        assert!(!v.healthy);
+        assert_eq!(v.reason, "no-data");
+    }
+
+    #[test]
+    fn gap_boundary_is_inclusive() {
+        // gap == HEALTH_MAX_GAP (6) healthy; 7 degraded (gap>0, so no fork check)
+        assert!(health_verdict(958_400, 958_406, 30, H_A, H_B).healthy);
+        assert!(!health_verdict(958_400, 958_407, 30, H_A, H_B).healthy);
+    }
+
+    #[test]
+    fn stale_boundary() {
+        // 300s ok, 301s stalled
+        assert!(health_verdict(958_400, 958_401, 300, H_A, H_B).healthy);
+        assert!(!health_verdict(958_400, 958_401, 301, H_A, H_B).healthy);
+    }
 }
 
 async fn get_info(db: &worker::D1Database, chain: &Chain) -> Result<Response> {
@@ -268,6 +464,17 @@ async fn find_chain_tip_header_hex(db: &worker::D1Database) -> Result<Response> 
     }
 }
 
+/// Bulk/live boundary: heights below this are served from the R2 bulk store
+/// (immutable historical headers), heights at/above from the D1 live window.
+/// Configurable via BULK_TOP_HEIGHT (default = the projectbabbage CDN snapshot
+/// top). Below the boundary the reorg/tip machinery never applies.
+fn bulk_top_height(env: &Env) -> u32 {
+    env.var("BULK_TOP_HEIGHT")
+        .ok()
+        .and_then(|v| v.to_string().parse().ok())
+        .unwrap_or(942_761)
+}
+
 async fn find_header_hex_for_height(
     db: &worker::D1Database,
     env: &Env,
@@ -279,6 +486,16 @@ async fn find_header_hex_for_height(
         .find(|(k, _)| k == "height")
         .and_then(|(_, v)| v.parse().ok())
         .ok_or_else(|| Error::RustError("Missing ?height= parameter".into()))?;
+
+    // Bulk/live split: heights below the bulk boundary come from the R2 bulk
+    // store; recent heights from D1.
+    if height < bulk_top_height(env) {
+        let bucket = env.bucket("BULK_HEADERS")?;
+        return match crate::r2::read_bulk_header(&bucket, chain, height).await? {
+            Some(h) => wrap_success(PublicBlockHeader::from(h)),
+            None => wrap_error("Header not found", 404),
+        };
+    }
 
     if let Some(h) = storage::find_header_for_height(db, height).await? {
         return wrap_success(PublicBlockHeader::from(h));
@@ -356,7 +573,7 @@ async fn find_header_hex_for_block_hash(
     }
 }
 
-async fn get_headers(db: &worker::D1Database, url: &url::Url) -> Result<Response> {
+async fn get_headers(db: &worker::D1Database, env: &Env, url: &url::Url) -> Result<Response> {
     let height: u32 = url
         .query_pairs()
         .find(|(k, _)| k == "height")
@@ -367,6 +584,17 @@ async fn get_headers(db: &worker::D1Database, url: &url::Url) -> Result<Response
         .find(|(k, _)| k == "count")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(1);
+
+    // getHeaders replicates a contiguous span from D1; heights below the bulk
+    // boundary live in the R2 bulk files, not D1 (bulk/live split). Serving
+    // them from D1 would mislabel the live window, so refuse and point callers
+    // at the bulk files instead of returning a wrong answer.
+    if height < bulk_top_height(env) {
+        return wrap_error(
+            "Heights below the bulk boundary are served from the R2 bulk files (/headers/); getHeaders serves the live window only",
+            409,
+        );
+    }
 
     // Public cap only — internal callers (R2 export) read full 100k files.
     let hex_str = storage::get_headers_hex(db, height, count.min(10_000)).await?;
@@ -389,6 +617,20 @@ async fn is_valid_root_for_height(
         .find(|(k, _)| k == "height")
         .and_then(|(_, v)| v.parse().ok())
         .ok_or_else(|| Error::RustError("Missing ?height= parameter".into()))?;
+
+    // Bulk/live split: below the bulk boundary, validate the root against the
+    // R2 bulk store (immutable). A bulk miss = unable-to-verify (404), keeping
+    // the same INVALID-vs-UNABLE distinction the D1 tri-state path below makes.
+    if height < bulk_top_height(env) {
+        let bucket = env.bucket("BULK_HEADERS")?;
+        return match crate::r2::read_bulk_header(&bucket, chain, height).await? {
+            Some(h) => wrap_success(h.merkle_root.eq_ignore_ascii_case(&root)),
+            None => wrap_error(
+                &format!("No bulk header at height {height} — unable to verify root"),
+                404,
+            ),
+        };
+    }
 
     // Tri-state (audit C1, Go BHS INVALID vs UNABLE_TO_VERIFY split):
     //  * active header at height + root matches   → success true
@@ -484,6 +726,30 @@ async fn handle_v2(
             let Ok(height) = raw.parse::<u32>() else {
                 return v2_error("ERR_INVALID_PARAMS", "Invalid height parameter", 400);
             };
+            // Bulk/live split: heights below the bulk boundary come from the R2
+            // bulk store, mirroring the v1 /findHeaderHexForHeight routing.
+            if height < bulk_top_height(env) {
+                let h = match env.bucket("BULK_HEADERS") {
+                    Ok(bucket) => crate::r2::read_bulk_header(&bucket, chain, height).await?,
+                    Err(_) => None,
+                };
+                return match h {
+                    Some(h) if want_bin => {
+                        let hh = h.height.to_string();
+                        v2_binary(
+                            h.to_bytes().to_vec(),
+                            "public, max-age=3600",
+                            &[("X-Block-Height", hh)],
+                        )
+                    }
+                    Some(h) => v2_json(PublicBlockHeader::from(h), "public, max-age=3600"),
+                    None => v2_error(
+                        "ERR_NOT_FOUND",
+                        &format!("Header not found at height {height}"),
+                        404,
+                    ),
+                };
+            }
             let mut header = storage::find_header_for_height(db, height).await?;
             if header.is_none() {
                 // Same fresh-block read-through grace as the v1 surface.
@@ -559,6 +825,16 @@ async fn handle_v2(
                     )
                 }
             };
+            // Bulk/live split: this replicates a contiguous D1 span; heights
+            // below the bulk boundary live in the R2 bulk files, not D1. Refuse
+            // rather than serve the mislabeled live window.
+            if height < bulk_top_height(env) {
+                return v2_error(
+                    "ERR_NOT_FOUND",
+                    "Heights below the bulk boundary are served from the R2 bulk files (/headers/)",
+                    409,
+                );
+            }
             // Public cap mirrors the v1 route; huge counts truncate to what
             // exists (the vector expects X-Header-Count <= requested).
             let hex_str = storage::get_headers_hex(db, height, count.min(10_000)).await?;
@@ -780,6 +1056,25 @@ async fn admin_export_r2(
             }))
         }
     }
+}
+
+/// Admin: download a whole bulk CDN header file and store it in the R2 bulk
+/// bucket under the same key. Run once per file (0..9) to populate the bulk
+/// store for the bulk/live split, so old-height reads hit R2 instead of the CDN.
+/// Usage: /admin/import-cdn?file=0
+async fn admin_import_cdn(env: &Env, chain: &Chain, url: &url::Url) -> Result<Response> {
+    let file_idx: u32 = url
+        .query_pairs()
+        .find(|(k, _)| k == "file")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0);
+    let bucket = env.bucket("BULK_HEADERS")?;
+    let bytes = crate::r2::import_file_from_cdn(&bucket, chain, file_idx).await?;
+    wrap_success(serde_json::json!({
+        "file": format!("{}Net_{}.headers", chain.as_str(), file_idx),
+        "bytesWritten": bytes,
+        "headers": bytes / 80,
+    }))
 }
 
 /// Serve bulk header files from R2 bucket.

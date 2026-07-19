@@ -205,6 +205,225 @@ pub async fn serve_file(bucket: &Bucket, key: &str) -> worker::Result<Option<Vec
     }
 }
 
+// ─── Bulk read (bulk/live split) ────────────────────────────────────────────
+
+/// Read one header from the R2 bulk store by height via a ranged read (80
+/// bytes at the height's byte offset). Falls back to a projectbabbage CDN
+/// read-through if the file isn't in R2 yet, so header reads never fail while
+/// R2 is being populated or if it has a gap.
+pub async fn read_bulk_header(
+    bucket: &Bucket,
+    chain: &Chain,
+    height: u32,
+) -> worker::Result<Option<crate::types::BlockHeader>> {
+    let file_idx = height / HEADERS_PER_FILE;
+    let offset = (height % HEADERS_PER_FILE) as u64 * 80;
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+
+    // Fast path: our own R2 bucket, ranged 80-byte read (server-enforced, so
+    // it returns exactly the requested slice or fewer bytes past EOF).
+    match bucket
+        .get(&key)
+        .range(worker::Range::OffsetWithLength { offset, length: 80 })
+        .execute()
+        .await
+    {
+        Ok(Some(obj)) => {
+            if let Some(body) = obj.body() {
+                if let Ok(bytes) = body.bytes().await {
+                    if bytes.len() == 80 {
+                        if let Some(h) = crate::types::BlockHeader::from_bytes(&bytes, height) {
+                            return Ok(Some(h));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None) => {} // not in R2 yet → CDN fallback
+        Err(e) => worker::console_log!("R2 bulk read {key} failed: {e:?}"),
+    }
+
+    // Fallback: read-through from the CDN (R2 not populated yet / gap).
+    crate::woc::cdn_header_by_height(chain, height).await
+}
+
+/// Stream a whole bulk header file from the CDN straight into R2, without ever
+/// buffering the ~8MB body in the worker (Free-plan CPU is ~10ms/tick, and
+/// materialising 8MB into a Vec would blow it). The CDN response body is a
+/// ReadableStream; R2 `put` takes one directly, so bytes flow CDN→R2 as I/O,
+/// not CPU. Content is verified separately (size head + Phase-2 readback).
+pub async fn stream_cdn_file_to_r2(
+    bucket: &Bucket,
+    chain: &Chain,
+    file_idx: u32,
+) -> worker::Result<()> {
+    let url = format!(
+        "https://cdn.projectbabbage.com/blockheaders/{}Net_{}.headers",
+        chain.as_str(),
+        file_idx
+    );
+    let mut init = worker::RequestInit::new();
+    init.with_method(worker::Method::Get);
+    let request = worker::Request::new_with_init(&url, &init)?;
+    let response = worker::Fetch::Request(request).send().await?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        return Err(worker::Error::RustError(format!("CDN {url} HTTP {status}")));
+    }
+
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+    let (_, body) = response.into_parts();
+    match body {
+        worker::ResponseBody::Stream(stream) => {
+            bucket
+                .put(&key, stream)
+                .execute()
+                .await
+                .map_err(|e| worker::Error::RustError(format!("R2 stream put {key}: {e}")))?;
+            Ok(())
+        }
+        _ => Err(worker::Error::RustError(format!(
+            "CDN {url}: response body was not a stream"
+        ))),
+    }
+}
+
+/// Byte size of a bulk file already in R2, or None if absent (write-once guard
+/// + post-populate size sanity check).
+pub async fn bulk_object_size(
+    bucket: &Bucket,
+    chain: &Chain,
+    file_idx: u32,
+) -> worker::Result<Option<u64>> {
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+    Ok(bucket.head(&key).await?.map(|obj| obj.size() as u64))
+}
+
+/// Ranged read of `count` consecutive 80-byte headers from a bulk R2 file,
+/// starting at header index `header_offset` within the file. Returns the raw
+/// bytes (may be short at EOF) or None if the object is absent. Used by the
+/// Phase-2 lazy verifier.
+pub async fn read_bulk_range(
+    bucket: &Bucket,
+    chain: &Chain,
+    file_idx: u32,
+    header_offset: u32,
+    count: u32,
+) -> worker::Result<Option<Vec<u8>>> {
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+    let offset = header_offset as u64 * 80;
+    let length = count as u64 * 80;
+    match bucket
+        .get(&key)
+        .range(worker::Range::OffsetWithLength { offset, length })
+        .execute()
+        .await
+    {
+        Ok(Some(obj)) => match obj.body() {
+            Some(body) => Ok(Some(body.bytes().await?)),
+            None => Ok(None),
+        },
+        Ok(None) => Ok(None),
+        Err(e) => Err(worker::Error::RustError(format!(
+            "R2 range read {key}: {e}"
+        ))),
+    }
+}
+
+/// Delete a bulk file from R2 (self-heal: a file that fails Phase-2 verification
+/// is removed so reads fall back to the CDN and the next tick re-populates it).
+pub async fn delete_bulk_file(bucket: &Bucket, chain: &Chain, file_idx: u32) -> worker::Result<()> {
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+    bucket
+        .delete(&key)
+        .await
+        .map_err(|e| worker::Error::RustError(format!("R2 delete {key}: {e}")))
+}
+
+/// One-time populate: download a whole bulk CDN file and store it in R2 under
+/// the same key (`mainNet_{idx}.headers`), so subsequent old-height reads hit
+/// R2 instead of the CDN. Returns bytes written.
+pub async fn import_file_from_cdn(
+    bucket: &Bucket,
+    chain: &Chain,
+    file_idx: u32,
+) -> worker::Result<usize> {
+    // Integrity metadata from the CDN index.
+    let listing = crate::woc::WocClient::get_bulk_file_listing(chain).await?;
+    let info = listing
+        .files
+        .get(file_idx as usize)
+        .ok_or_else(|| worker::Error::RustError(format!("no CDN file at index {file_idx}")))?;
+    let expected_count = info
+        .count
+        .ok_or_else(|| worker::Error::RustError("CDN index missing file count".into()))?;
+    let first_height = info.first_height.unwrap_or(file_idx * HEADERS_PER_FILE);
+
+    let client = crate::woc::WocClient::new(chain, None);
+    let bytes = client.download_bulk_file_raw(chain, file_idx).await?;
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+
+    // Verify byte-alignment and that the file ends at the canonical last block
+    // BEFORE trusting it — read_bulk_header trusts offset math blindly, so a
+    // mid-file hole or truncation would silently mislabel every header (which
+    // could reject a valid SPV proof as invalid). A hole changes both the
+    // length and the last-header hash.
+    if bytes.len() as u64 != expected_count as u64 * 80 {
+        return Err(worker::Error::RustError(format!(
+            "bulk file {file_idx}: {} bytes, expected {} ({}×80)",
+            bytes.len(),
+            expected_count as u64 * 80,
+            expected_count
+        )));
+    }
+    // Full linkage scan: every header must chain to its predecessor, so a
+    // mid-file splice (correct length + last hash but a wrong middle header)
+    // cannot slip through and later yield a definitive-but-wrong SPV answer.
+    let mut prev: Option<String> = None;
+    for (i, chunk) in bytes.chunks(80).enumerate() {
+        let h = crate::types::BlockHeader::from_bytes(chunk, first_height + i as u32)
+            .ok_or_else(|| {
+                worker::Error::RustError(format!("bulk file {file_idx}: parse fail at index {i}"))
+            })?;
+        if let Some(pp) = &prev {
+            if !h.previous_hash.eq_ignore_ascii_case(pp) {
+                return Err(worker::Error::RustError(format!(
+                    "bulk file {file_idx}: linkage break at height {}",
+                    first_height + i as u32
+                )));
+            }
+        }
+        prev = Some(h.hash);
+    }
+    // The chain's final hash must match the CDN index's lastHash. Required —
+    // refuse to import a file the index can't vouch for (hardening: don't
+    // let the in-worker path be an unverified integrity gate).
+    let expected_last = info.last_hash.as_deref().ok_or_else(|| {
+        worker::Error::RustError(format!(
+            "bulk file {file_idx}: CDN index has no lastHash — refusing to import unverifiable file"
+        ))
+    })?;
+    match prev.as_deref() {
+        Some(last) if last.eq_ignore_ascii_case(expected_last) => {}
+        other => {
+            return Err(worker::Error::RustError(format!(
+                "bulk file {file_idx}: last hash {other:?} != index {expected_last}"
+            )))
+        }
+    }
+
+    let key = format!("{}Net_{}.headers", chain.as_str(), file_idx);
+    let n = bytes.len();
+    bucket
+        .put(&key, bytes)
+        .execute()
+        .await
+        .map_err(|e| worker::Error::RustError(format!("R2 put {key}: {e}")))?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +431,18 @@ mod tests {
     #[test]
     fn test_headers_per_file() {
         assert_eq!(HEADERS_PER_FILE, 100_000);
+    }
+
+    #[test]
+    fn test_bulk_read_offset_math() {
+        // height -> (file_idx, byte offset)
+        let h = 452_253u32;
+        assert_eq!(h / HEADERS_PER_FILE, 4);
+        assert_eq!((h % HEADERS_PER_FILE) as u64 * 80, 52_253 * 80);
+        // file-9 last covered height 942_760 -> file 9, offset 42_760*80
+        let h = 942_760u32;
+        assert_eq!(h / HEADERS_PER_FILE, 9);
+        assert_eq!((h % HEADERS_PER_FILE) as u64 * 80, 42_760 * 80);
     }
 
     #[test]

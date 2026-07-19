@@ -94,7 +94,22 @@ pub struct BulkHeaderFilesInfo {
 pub struct BulkHeaderFileInfo {
     pub file_name: String,
     pub first_height: Option<u32>,
+    /// Number of headers in this file. Lets the cron compute the snapshot's
+    /// top height and pull only the bytes it needs per tick.
+    pub count: Option<u32>,
+    /// Hash of the last header in this file (from the CDN index). Used to
+    /// verify an imported bulk file is byte-aligned and complete before it is
+    /// trusted as the bulk store.
+    pub last_hash: Option<String>,
     pub source_url: Option<String>,
+}
+
+impl BulkHeaderFileInfo {
+    /// Height just past the last header this file provides (exclusive upper
+    /// bound). Falls back to the standard 100k stride when `count` is absent.
+    pub fn coverage_end(&self) -> u32 {
+        self.first_height.unwrap_or(0) + self.count.unwrap_or(100_000)
+    }
 }
 
 // ─── WoC Client ─────────────────────────────────────────────────────────────
@@ -161,6 +176,30 @@ impl WocClient {
         if !(200..300).contains(&status) {
             return Err(worker::Error::RustError(format!(
                 "CDN HTTP {status} for {url}"
+            )));
+        }
+
+        response.bytes().await
+    }
+
+    /// Fetch a byte range `[start, end]` (inclusive) via an HTTP Range request.
+    /// The header CDN answers 206 Partial Content, so a caller can pull just
+    /// the slice it needs instead of the whole multi-MB file.
+    async fn fetch_bytes_range(&self, url: &str, start: u64, end: u64) -> worker::Result<Vec<u8>> {
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get);
+        let headers = Headers::new();
+        let _ = headers.set("Range", &format!("bytes={start}-{end}"));
+        init.with_headers(headers);
+
+        let request = Request::new_with_init(url, &init)?;
+        let mut response = Fetch::Request(request).send().await?;
+
+        let status = response.status_code();
+        // 206 Partial Content (and 200 if the origin ignores Range) are OK.
+        if !(200..300).contains(&status) {
+            return Err(worker::Error::RustError(format!(
+                "CDN range HTTP {status} for {url}"
             )));
         }
 
@@ -281,6 +320,109 @@ impl WocClient {
         );
         Ok(headers)
     }
+
+    /// Download and parse a bounded slice of a bulk header file via an HTTP
+    /// Range request — `count` headers starting at `start_height`. Keeps a
+    /// single cron tick small enough to always complete (tiny download + parse
+    /// + one bounded batch insert) instead of pulling the whole file.
+    ///
+    /// `file_first_height` is the height of the file's first header (the byte
+    /// offset origin); `start_height` must be >= it and inside the file. Same
+    /// linkage guard as `download_bulk_file` (audit M4): truncate at the first
+    /// header that does not link to its predecessor.
+    pub async fn download_bulk_range(
+        &self,
+        file_info: &BulkHeaderFileInfo,
+        file_first_height: u32,
+        start_height: u32,
+        count: u32,
+    ) -> worker::Result<Vec<BlockHeader>> {
+        if count == 0 || start_height < file_first_height {
+            return Ok(Vec::new());
+        }
+        let cdn_base = "https://cdn.projectbabbage.com/blockheaders";
+        let url = file_info
+            .source_url
+            .as_deref()
+            .map(|base| format!("{base}/{}", file_info.file_name))
+            .unwrap_or_else(|| format!("{cdn_base}/{}", file_info.file_name));
+
+        let byte_start = (start_height - file_first_height) as u64 * 80;
+        let byte_end = byte_start + (count as u64 * 80) - 1; // inclusive
+
+        console_log!(
+            "Range {}: heights {}..{} ({} bytes)",
+            file_info.file_name,
+            start_height,
+            start_height + count,
+            count * 80
+        );
+
+        let bytes = self.fetch_bytes_range(&url, byte_start, byte_end).await?;
+        let mut headers: Vec<BlockHeader> = Vec::with_capacity(bytes.len() / 80);
+        for (i, chunk) in bytes.chunks(80).enumerate() {
+            if chunk.len() < 80 {
+                break;
+            }
+            let height = start_height + i as u32;
+            if let Some(header) = BlockHeader::from_bytes(chunk, height) {
+                if let Some(prev) = headers.last() {
+                    if !header.previous_hash.eq_ignore_ascii_case(&prev.hash) {
+                        console_log!(
+                            "Bulk range {} linkage break at height {} — truncating",
+                            file_info.file_name,
+                            height
+                        );
+                        break;
+                    }
+                }
+                headers.push(header);
+            } else {
+                break;
+            }
+        }
+        Ok(headers)
+    }
+
+    /// Fetch the raw bytes of a whole bulk-header CDN file (for one-time R2
+    /// import). `mainNet_{idx}.headers` etc. — ~8 MB, 100k×80-byte headers.
+    pub async fn download_bulk_file_raw(
+        &self,
+        chain: &Chain,
+        file_idx: u32,
+    ) -> worker::Result<Vec<u8>> {
+        let url = format!(
+            "https://cdn.projectbabbage.com/blockheaders/{}Net_{}.headers",
+            chain.as_str(),
+            file_idx
+        );
+        self.fetch_bytes(&url).await
+    }
+}
+
+/// Fetch a single 80-byte header from the projectbabbage bulk CDN by height
+/// (HTTP Range). Read-through fallback for the R2 bulk store so header reads
+/// never fail while R2 is being populated or if it has a gap.
+pub async fn cdn_header_by_height(
+    chain: &Chain,
+    height: u32,
+) -> worker::Result<Option<BlockHeader>> {
+    let idx = height / 100_000;
+    let offset = (height % 100_000) as u64 * 80;
+    let url = format!(
+        "https://cdn.projectbabbage.com/blockheaders/{}Net_{}.headers",
+        chain.as_str(),
+        idx
+    );
+    let client = WocClient::new(chain, None);
+    let bytes = client.fetch_bytes_range(&url, offset, offset + 79).await?;
+    // If the origin ignored the Range and returned other than the requested 80
+    // bytes, refuse rather than risk labeling a different block as this height
+    // (a wrong header here would reject a valid SPV proof as invalid).
+    if bytes.len() != 80 {
+        return Ok(None);
+    }
+    Ok(BlockHeader::from_bytes(&bytes, height))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
