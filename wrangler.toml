@@ -5,6 +5,12 @@ account_id = "<your-account-id>"
 
 [vars]
 CHAIN = "main"
+# P0-4 (bsv-stack-lean #35) and the owner's word of 2026-10-09 (docs/RULINGS-2026-10-09.md item 17): a recent
+# checkpoint so the post-deploy re-validation pass runs from here to the tip in minutes instead of from the
+# node's last listed checkpoint (530359, hours). The hash at 965000 was read once on 2026-10-09 from two
+# independent public header services (GorillaPool JungleBus and Bitails) and they agreed; the pass checks
+# every header above it itself (proof of work, the difficulty rule, ancestry). A wrong entry fails closed.
+CHECKPOINTS = "965000:000000000000000004f9492052ec33c3fee0efaae1a5615bdbc91084202f7260"
 # a private program loop 10 D5 (2026-09-08): the live path's courier ladder (WoC, Arcade,
 # Bitails as each other's fallbacks; the 965877 lag of loop 9). The defaults
 # live in `couriers.rs`; these make them visible and overridable per deploy.
