@@ -18,6 +18,48 @@
 //! `chain_info` asks every rung and follows the HIGHEST tip (a lagging courier
 //! must never read as the chain); the rung that answered it is asked first
 //! for the headers of that tick.
+//!
+//! Rule 28 (the owner's ruling of 2026-10-09; bsv-stack-lean
+//! `docs/p0/rule-28-explorer-calls.md` sections 3 and 5): a third-party chain
+//! explorer is break-glass, and every read that leaves our services is judged
+//! by one question, what header, proof or own-index answer do we already hold
+//! for it. Why THESE reads stay: headers come from outside the service. A
+//! header service has no header to hold until it is told one, so no header,
+//! proof or index of ours can answer for a block we have not yet been told
+//! about. This is the irreducible case of the whole stack, and the ladder is
+//! where it lives: every outward header read of the worker (the cron, the
+//! read-through, the operator's backfill) goes through it.
+//!
+//! What makes it safe to take a header from anyone: every answer is
+//! re-derived locally (proof of work, the difficulty rule, the checkpoints,
+//! ancestry) before it counts. The hash is recomputed from the fields and the
+//! work checked here, in `bind`; the bits the node's rule answers, the
+//! checkpoint at the height and the link to a stored parent are checked on
+//! insert (`storage::insert_header`, `storage::insert_headers_batch`). A
+//! header is believed for its work and its ancestry, never for who served it.
+//! The one number that is not re-derived is a courier's claimed tip HEIGHT:
+//! it only decides whether to ask for headers, and it is recorded as
+//! `last_seen_height` (served by `/getPresentHeight` and `/getInfo` as what
+//! the couriers said, never as our tip); the headers it leads to are checked
+//! like any other.
+//!
+//! The fallback shape, in the rule's words:
+//! - a negative needs a second provider: a rung that does not serve a header
+//!   is a fault of that rung, and the next rung is asked; for the tip every
+//!   rung is asked and the highest wins, so "no new block" is never one
+//!   lagging courier's word while another answers;
+//! - "could not look" is never "nothing there": when every rung has faulted
+//!   the answer is an error naming each fault, recorded with its time
+//!   (`sync_state.last_error`), and the routes answer "unable to verify";
+//!   the ladder has no answer that means "no such block";
+//! - the start rotates, per minute, so no courier is the one everything
+//!   leans on; a courier that answers wrong is a faulting rung with the
+//!   evidence in the log, one that rate-limits is skipped after three faults.
+//!
+//! The rungs are not all explorers: Arcade's chaintracks v2 is a PEER header
+//! service; WhatsOnChain and Bitails are explorers. Testnet's ladder is
+//! WhatsOnChain alone (`for_chain`): there a negative has no second provider,
+//! and it still reads as "could not look".
 use std::cell::{Cell, RefCell};
 
 use worker::{Fetch, Headers, Method, Request, RequestInit};

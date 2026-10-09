@@ -164,11 +164,10 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         (Method::Get, "/getInfo") => get_info(&db, &chain).await,
         (Method::Get, "/currentHeight") => current_height(&db).await,
         // TS ChaintracksService wire parity: the toolbox client and
-        // rust-overlay probe /getPresentHeight (external chain height).
-        // WoC is the truthful source; our own tip is the fallback when WoC
-        // is unreachable (slightly stale is better than 404-breaking every
-        // stock client).
-        (Method::Get, "/getPresentHeight") => get_present_height(&db, &chain).await,
+        // rust-overlay probe /getPresentHeight. Answered from the store
+        // (Rule 28, H11): the larger of the served tip and the highest tip
+        // the couriers answered in the last cron tick; no request goes out.
+        (Method::Get, "/getPresentHeight") => get_present_height(&db).await,
 
         // Chain tip
         (Method::Get, "/findChainTipHashHex") => find_chain_tip_hash(&db).await,
@@ -264,14 +263,15 @@ async fn current_height(db: &worker::D1Database) -> Result<Response> {
     }
 }
 
-async fn get_present_height(db: &worker::D1Database, chain: &Chain) -> Result<Response> {
-    let client = crate::woc::WocClient::new(chain, None);
-    match client.get_chain_info().await {
-        Ok(info) if info.blocks > 0 => wrap_success(info.blocks),
-        _ => match storage::served_tip(db).await? {
-            Some(tip) => wrap_success(tip.height),
-            None => wrap_error("No chain tip (service syncing or degraded)", 503),
-        },
+/// Rule 28 (H11): the present height is answered from what this service
+/// holds, the larger of the served tip and `last_seen_height` (the highest
+/// tip the courier ladder answered in the last cron tick, already in D1).
+/// The route asks no one: it was a public proxy to one explorer, one request
+/// out per request in, serving a number nothing here had checked.
+async fn get_present_height(db: &worker::D1Database) -> Result<Response> {
+    match storage::present_height(db).await? {
+        Some(height) => wrap_success(height),
+        None => wrap_error("No chain tip (service syncing or degraded)", 503),
     }
 }
 
@@ -305,7 +305,7 @@ async fn find_header_hex_for_height(
     if let Some(h) = storage::served_header_for_height(db, height).await? {
         return wrap_success(PublicBlockHeader::from(h));
     }
-    // Fresh-block grace: verified read-through from WoC (tip+1..=tip+6).
+    // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
     if ensure_fresh_header(db, env, chain, height).await?.is_some() {
         if let Some(h) = storage::served_header_for_height(db, height).await? {
             return wrap_success(PublicBlockHeader::from(h));
@@ -318,13 +318,14 @@ async fn find_header_hex_for_height(
 /// the cron ingests once a minute, so a just-mined block is locally unknown
 /// for up to ~60s ; and a fail-closed consumer (overlay SPV) would bounce a
 /// legitimate proof during that window. If the requested height is at most
-/// GRACE_BLOCKS above our tip, fetch it live from WoC NOW, ingest it through
-/// the full validation path (hash integrity, badPrev, parent backfill, work
-/// accounting), and serve the verified answer. This is "grace WITH
-/// verification" ; the TS references are equally fail-closed but query WoC
-/// live, so this exactly reproduces their effective behavior. A height
-/// beyond the grace window (or unknown to WoC too) still answers 404:
-/// unverifiable is never accepted.
+/// GRACE_BLOCKS above our tip, fetch it live from the courier ladder NOW
+/// (Rule 28, H12: the ladder the cron reads, never one courier), ingest it
+/// through the full validation path (hash integrity, badPrev, parent
+/// backfill, work accounting), and serve the verified answer. This is "grace
+/// WITH verification" ; the TS references are equally fail-closed but query
+/// WoC live, so this reproduces their effective behavior. A height beyond the
+/// grace window (or one no courier has yet) still answers 404: unverifiable
+/// is never accepted.
 const GRACE_BLOCKS: u32 = 6;
 
 async fn ensure_fresh_header(
@@ -340,40 +341,14 @@ async fn ensure_fresh_header(
     if height <= tip || height > tip.saturating_add(GRACE_BLOCKS) {
         return Ok(None);
     }
-    let api_key = env
-        .secret("WHATSONCHAIN_API_KEY")
-        .map(|v| v.to_string())
-        .ok()
-        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
-        .filter(|s| !s.is_empty());
-    let client = crate::woc::WocClient::new(chain, api_key);
+    // Rule 28 (H12): the ladder the cron reads (WhatsOnChain, Arcade and
+    // Bitails as each other's fallbacks), by height and for the parent walk,
+    // never one courier. Every answer is checked before it is stored.
+    let ladder = crate::sync::courier_ladder(env, chain);
     let params = crate::sync::chain_params(env, chain)?;
-    // Fill the whole gap tip+1..=height so linkage/backfill stays simple.
-    for h in (tip + 1)..=height {
-        match client.get_header_by_height(h).await {
-            Ok(header) => {
-                // P0-4: a header the node's rules refuse is never stored, and
-                // the request answers "unable to verify", never an error page.
-                if let Err(e) =
-                    crate::sync::insert_with_parent_backfill(db, &params, &client, header).await
-                {
-                    worker::console_log!("read-through: header at {} refused: {:?}", h, e);
-                    crate::sync::announce_tip(db, env, None).await;
-                    return Ok(None);
-                }
-            }
-            Err(e) => {
-                worker::console_log!("read-through: WoC has no header at {} yet: {:?}", h, e);
-                // Whatever DID land is a tip move the consumers must hear.
-                crate::sync::announce_tip(db, env, None).await;
-                return Ok(None);
-            }
-        }
-    }
-    // The chain tip moved on a consumer's request, not the cron's: announce it
-    // here (a private program W2-P4 ; the cron alone left block 965076 unannounced).
-    crate::sync::announce_tip(db, env, None).await;
-    Ok(Some(()))
+    let landed = crate::sync::read_through(db, &params, &ladder, env, tip, height).await?;
+    worker::console_log!("read-through: couriers: {}", ladder.summary());
+    Ok(landed)
 }
 
 async fn find_header_hex_for_block_hash(
@@ -436,7 +411,7 @@ async fn is_valid_root_for_height(
     if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
         return wrap_success(valid);
     }
-    // Fresh-block grace: verified read-through from WoC (tip+1..=tip+6).
+    // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
     if ensure_fresh_header(db, env, chain, height).await?.is_some() {
         if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
             return wrap_success(valid);
@@ -668,7 +643,8 @@ async fn admin_ingest(
     }))
 }
 
-/// Admin endpoint: backfill a below-tip gap one header at a time from WoC.
+/// Admin endpoint: backfill a below-tip gap one header at a time from the
+/// courier ladder (Rule 28, H13).
 /// Usage: /admin/backfill?from=942761&to=943500 ; the span is clamped to 800
 /// heights per invocation (Workers subrequest budget); drive larger gaps with
 /// repeated calls. Inserts via the batch path and never touches the chain
@@ -690,30 +666,15 @@ async fn admin_backfill(
     if to < from {
         return wrap_error("to must be >= from", 400);
     }
-    // ~800 WoC subrequests per invocation keeps us inside the 1000 cap.
+    // ~800 courier subrequests per invocation keeps us inside the 1000 cap
+    // (a rung that faults three times is skipped for the rest of the call).
     let to = to.min(from + 799);
 
-    // The key is a worker SECRET (env.secret), with a var fallback for
-    // local dev ; env.var() fails silently on secrets.
-    let api_key = env
-        .secret("WHATSONCHAIN_API_KEY")
-        .map(|v| v.to_string())
-        .ok()
-        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
-        .filter(|s| !s.is_empty());
-    let client = crate::woc::WocClient::new(chain, api_key);
-
-    let mut headers = Vec::with_capacity((to - from + 1) as usize);
-    for height in from..=to {
-        match client.get_header_by_height(height).await {
-            Ok(header) => headers.push(header),
-            Err(e) => {
-                // Insert what we have ; the caller re-runs from the gap.
-                console_log!("backfill: WoC failed at {height}: {e:?}");
-                break;
-            }
-        }
-    }
+    // Rule 28 (H13): the ladder the cron reads, never one courier.
+    let ladder = crate::sync::courier_ladder(env, chain);
+    // Insert what we have ; the caller re-runs from the gap.
+    let headers = crate::sync::fetch_span(&ladder, from, to).await;
+    console_log!("backfill: couriers: {}", ladder.summary());
     let fetched = headers.len() as u32;
     let params = crate::sync::chain_params(env, chain)?;
     let inserted = if headers.is_empty() {
@@ -734,41 +695,97 @@ async fn admin_backfill(
     }))
 }
 
-/// Admin endpoint: download one bulk CDN file and insert into D1.
-/// Usage: /admin/bulk-sync?file=0 (file index 0-8)
-/// Each file contains ~100k headers. Run one at a time.
+/// Headers per bulk file, and per `/admin/bulk-sync` call.
+const BULK_FILE_HEADERS: u32 = 100_000;
+
+/// Admin endpoint: bootstrap one span of 100,000 headers into D1.
+/// Usage: /admin/bulk-sync?file=0 (span index: file N is heights
+/// N * 100,000 and up). Run one at a time.
+///
+/// Rule 28 (H14, H15): the upstream PEER's `getHeaders` is asked first (the
+/// header service the cron already catches up from); the bulk FILE HOST
+/// (`woc::BULK_FILE_HOST`, pinned, neither peer nor explorer) is what remains
+/// when no peer is configured or the peer could not serve the span, and the
+/// answer says which served it and why. `&source=file` asks the file host
+/// alone. Either way the batch meets the node's rules on insert.
 async fn admin_bulk_sync(
     db: &worker::D1Database,
     env: &Env,
     chain: &Chain,
     url: &url::Url,
 ) -> Result<Response> {
-    let file_idx: usize = url
-        .query_pairs()
-        .find(|(k, _)| k == "file")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
+    let q = |k: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.to_string())
+    };
+    let file_idx: usize = q("file").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let Some(span_start) = u32::try_from(file_idx)
+        .ok()
+        .and_then(|i| i.checked_mul(BULK_FILE_HEADERS))
+    else {
+        return wrap_error("File index out of range", 400);
+    };
 
-    // Get file listing from CDN
-    let listing = crate::woc::WocClient::get_bulk_file_listing(chain).await?;
+    let upstream = env
+        .var("UPSTREAM_CHAINTRACKS_URL")
+        .map(|v| v.to_string())
+        .ok()
+        .filter(|s| !s.is_empty() && q("source").as_deref() != Some("file"));
+    let peer = upstream.as_deref().map(crate::sync::UpstreamPeer);
+    // The peer's first header must link to our stored header below the span.
+    let anchor = match span_start.checked_sub(1) {
+        Some(below) => storage::find_header_for_height(db, below)
+            .await?
+            .map(|h| h.hash),
+        None => None,
+    };
+    let from_peer = crate::sync::bootstrap_from_peer(
+        peer.as_ref(),
+        span_start,
+        BULK_FILE_HEADERS,
+        anchor.as_deref(),
+    )
+    .await;
 
-    if file_idx >= listing.files.len() {
-        return wrap_error(
-            &format!(
-                "File index {} out of range (0-{})",
-                file_idx,
-                listing.files.len() - 1
-            ),
-            400,
-        );
-    }
-
-    let file_info = &listing.files[file_idx];
-    let start_height = file_info.first_height.unwrap_or(file_idx as u32 * 100_000);
-
-    // Download and parse
-    let client = crate::woc::WocClient::new(chain, None);
-    let headers = client.download_bulk_file(file_info, start_height).await?;
+    let (file_name, start_height, headers, source, peer_fault) = match from_peer {
+        crate::sync::Bootstrap::Peer(headers) => (
+            format!("{chain}Net_{file_idx}.headers"),
+            span_start,
+            headers,
+            "peer",
+            None,
+        ),
+        crate::sync::Bootstrap::FileHost { peer_fault } => {
+            if let Some(fault) = &peer_fault {
+                console_log!("bulk-sync: the upstream peer could not serve span {file_idx} ({fault}); reading the file host");
+            }
+            // The file host's listing
+            let listing = crate::woc::WocClient::get_bulk_file_listing(chain).await?;
+            if file_idx >= listing.files.len() {
+                return wrap_error(
+                    &format!(
+                        "File index {} out of range (0-{})",
+                        file_idx,
+                        listing.files.len().saturating_sub(1)
+                    ),
+                    400,
+                );
+            }
+            let file_info = &listing.files[file_idx];
+            let start_height = file_info.first_height.unwrap_or(span_start);
+            // Download and parse (the URL is always on the pinned host)
+            let client = crate::woc::WocClient::new(chain, None);
+            let headers = client.download_bulk_file(file_info, start_height).await?;
+            (
+                file_info.file_name.clone(),
+                start_height,
+                headers,
+                "fileHost",
+                peer_fault,
+            )
+        }
+    };
     let count = headers.len();
 
     // Batch insert (P0-4: refused whole when any header fails the node's rules)
@@ -787,10 +804,12 @@ async fn admin_bulk_sync(
     storage::update_chain_tip_to_highest(db).await?;
 
     wrap_success(serde_json::json!({
-        "file": file_info.file_name,
+        "file": file_name,
         "startHeight": start_height,
         "headersInFile": count,
         "inserted": inserted,
+        "source": source,
+        "peerFault": peer_fault,
     }))
 }
 

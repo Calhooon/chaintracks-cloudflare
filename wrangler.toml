@@ -7,9 +7,21 @@ account_id = "<your-account-id>"
 CHAIN = "main"
 # P0-4 (bsv-stack-lean #35) and the owner's word of 2026-10-09 (docs/RULINGS-2026-10-09.md item 17): a recent
 # checkpoint so the post-deploy re-validation pass runs from here to the tip in minutes instead of from the
-# node's last listed checkpoint (530359, hours). The hash at 965000 was read once on 2026-10-09 from two
-# independent public header services (GorillaPool JungleBus and Bitails) and they agreed; the pass checks
-# every header above it itself (proof of work, the difficulty rule, ancestry). A wrong entry fails closed.
+# node's last listed checkpoint (530359, hours). A wrong entry fails closed.
+#
+# The hash at 965000 is OUR OWN DERIVATION (Rule 28; bsv-stack-lean docs/p0/rule-28-chaintracks.md): the long
+# pass run on 2026-10-09 on a local store with CHECKPOINTS unset, over this service's own headers 530000..=970338
+# (exported through its public getHeaders), under the node's rules alone (proof of work, the difficulty rule,
+# the node's 16 checkpoints, ancestry): 439,979 rows above 530359, by the batch ingest and again by
+# revalidate_step in 220 steps, complete at 970338. Both derive
+# 000000000000000004f9492052ec33c3fee0efaae1a5615bdbc91084202f7260 at 965000. The run is
+# `rule28_tests::the_long_pass_from_the_nodes_last_checkpoint_derives_the_hash_at_965000` (ignored; by hand).
+# No explorer's word stands behind this entry.
+#
+# BEFORE THIS ENTRY IS EVER REMOVED: that run needed one row the production store holds wrongly. Its active
+# row at 956433 (...0e9161728a30) is an orphan the row at 956434 does not link to; the chain's 956433 is
+# ...af193df26eb5. With CHECKPOINTS unset the pass stops at 956434 and nothing above 956433 is served, so the
+# row is repaired first (the same report, "The finding").
 CHECKPOINTS = "965000:000000000000000004f9492052ec33c3fee0efaae1a5615bdbc91084202f7260"
 # a private program loop 10 D5 (2026-09-08): the live path's courier ladder (WoC, Arcade,
 # Bitails as each other's fallbacks; the 965877 lag of loop 9). The defaults

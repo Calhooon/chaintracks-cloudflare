@@ -1461,6 +1461,34 @@ pub async fn served_tip(db: &impl HeaderDb) -> worker::Result<Option<BlockHeader
     }
 }
 
+/// The present height (`/getPresentHeight`, Rule 28 H11): the larger of the
+/// served tip and `last_seen_height`, the highest tip the courier ladder
+/// answered in the last cron tick (migration 0007). Both are this store's own
+/// rows; no request leaves the service. `None` when nothing is served (an
+/// empty store, or a re-validation with no anchor yet): the courier record
+/// alone is never a height. A store before migration 0007 answers its served
+/// tip, the read fault loud like `/getInfo`'s.
+pub async fn present_height(db: &impl HeaderDb) -> worker::Result<Option<u32>> {
+    let Some(tip) = served_tip(db).await? else {
+        return Ok(None);
+    };
+    #[derive(serde::Deserialize)]
+    struct SeenRow {
+        last_seen_height: Option<f64>,
+    }
+    let seen = match Query::new(SQL_COURIER_HEALTH).first::<SeenRow>(db).await {
+        Ok(row) => row.and_then(|r| r.last_seen_height.map(|v| v as u32)),
+        Err(e) => {
+            log_error!(
+                "present_height: courier health read failed (migration 0007 applied?): {}",
+                e
+            );
+            None
+        }
+    };
+    Ok(Some(seen.map_or(tip.height, |s| s.max(tip.height))))
+}
+
 /// `count` headers from `start` as hex, clipped to the ceiling (the routes).
 pub async fn served_headers_hex(
     db: &impl HeaderDb,

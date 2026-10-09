@@ -48,6 +48,8 @@ mod reorg_producer_tests;
 mod retarget_tests;
 mod routes;
 #[cfg(test)]
+mod rule28_tests;
+#[cfg(test)]
 mod statement_pins;
 mod storage;
 #[cfg(test)]

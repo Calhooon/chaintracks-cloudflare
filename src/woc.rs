@@ -97,6 +97,48 @@ pub struct BulkHeaderFileInfo {
     pub source_url: Option<String>,
 }
 
+/// The bulk header FILE HOST (Rule 28, H14 and H15): a static file server,
+/// neither a peer (it speaks no header protocol and holds no tip) nor an
+/// explorer (it answers no question about the chain). It serves a listing
+/// and files of 100,000 concatenated 80-byte headers, for the bootstrap of
+/// an empty store when the upstream peer's `getHeaders` cannot be had
+/// (`sync::bootstrap_from_peer` is asked first). Nothing it serves is
+/// believed for where it came from: the file's linkage is checked here and
+/// the batch meets the node's rules on insert (proof of work, the difficulty
+/// rule, the checkpoints, ancestry), refused whole on one fault.
+///
+/// The host is PINNED. The listing carries a `sourceUrl` per file; at
+/// `62cf619` it was followed unchecked, so a listing could send the
+/// bootstrap to any host. A `sourceUrl` that is not `https` on this host is
+/// ignored and the file is read from the pinned base.
+pub(crate) const BULK_FILE_HOST: &str = "cdn.projectbabbage.com";
+const BULK_FILE_BASE: &str = "https://cdn.projectbabbage.com/blockheaders";
+
+/// The URL a bulk header file is read from: always on `BULK_FILE_HOST`.
+pub(crate) fn bulk_file_url(file_info: &BulkHeaderFileInfo) -> String {
+    let on_the_pinned_host = |base: &&str| {
+        url::Url::parse(base).is_ok_and(|u| {
+            u.scheme() == "https"
+                && u.host_str() == Some(BULK_FILE_HOST)
+                && u.username().is_empty()
+                && u.password().is_none()
+                && u.port().is_none()
+        })
+    };
+    let base = match file_info.source_url.as_deref() {
+        Some(base) if on_the_pinned_host(&base) => base.trim_end_matches('/'),
+        Some(other) => {
+            log!(
+                "Bulk file {}: the listing's sourceUrl {other:?} is not on the pinned file host {BULK_FILE_HOST}; ignored",
+                file_info.file_name
+            );
+            BULK_FILE_BASE
+        }
+        None => BULK_FILE_BASE,
+    };
+    format!("{base}/{}", file_info.file_name)
+}
+
 // ─── WoC Client ─────────────────────────────────────────────────────────────
 
 pub struct WocClient {
@@ -198,12 +240,13 @@ impl WocClient {
         woc_header.into_block_header()
     }
 
-    // ─── Bulk CDN ───────────────────────────────────────────────────────────
+    // ─── The bulk file host (see `BULK_FILE_HOST`) ──────────────────────────
 
-    /// Fetch the CDN file listing for bulk header download.
+    /// Fetch the file host's listing of bulk header files.
     pub async fn get_bulk_file_listing(chain: &Chain) -> worker::Result<BulkHeaderFilesInfo> {
-        // Primary CDN is down (DNS not resolving), use legacy CDN
-        let cdn_base = "https://cdn.projectbabbage.com/blockheaders";
+        // The pinned file host (`BULK_FILE_HOST`); the primary one of the
+        // reference is down (DNS not resolving).
+        let cdn_base = BULK_FILE_BASE;
         let index_url = match chain {
             Chain::Main => format!("{cdn_base}/mainNetBlockHeaders.json"),
             Chain::Test => format!("{cdn_base}/testNetBlockHeaders.json"),
@@ -231,12 +274,7 @@ impl WocClient {
         file_info: &BulkHeaderFileInfo,
         start_height: u32,
     ) -> worker::Result<Vec<BlockHeader>> {
-        let cdn_base = "https://cdn.projectbabbage.com/blockheaders";
-        let url = file_info
-            .source_url
-            .as_deref()
-            .map(|base| format!("{base}/{}", file_info.file_name))
-            .unwrap_or_else(|| format!("{cdn_base}/{}", file_info.file_name));
+        let url = bulk_file_url(file_info);
 
         console_log!(
             "Downloading bulk headers: {} (height {}+)",

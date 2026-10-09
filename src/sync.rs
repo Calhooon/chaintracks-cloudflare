@@ -1,9 +1,17 @@
 //! Cron-triggered chain synchronization.
 //!
-//! Polls WhatsOnChain for new blocks, ingests headers into D1.
-//! During catch-up, optionally fetches bulk headers from an upstream
-//! chaintracks instance (UPSTREAM_CHAINTRACKS_URL env var) ; much faster
-//! than WoC one-by-one. Falls back to WoC if upstream is unset or fails.
+//! Polls the courier ladder (`couriers.rs`: WhatsOnChain, Arcade, Bitails as
+//! each other's fallbacks) for new blocks, ingests headers into D1. During
+//! catch-up, optionally fetches bulk headers from an upstream chaintracks
+//! instance, a peer (UPSTREAM_CHAINTRACKS_URL env var) ; much faster than
+//! one-by-one. Falls back to the ladder if upstream is unset or fails.
+//!
+//! Rule 28: every read here leaves the service because headers come from
+//! outside it (the irreducible case; the reason and the fallback shape are
+//! named at `couriers.rs`), and every answer is re-derived locally before it
+//! counts. The minute poll is the routine read of the three; the push source
+//! that goes ahead of it is designed in bsv-stack-lean
+//! `docs/p0/rule-28-chaintracks.md`.
 
 use worker::*;
 
@@ -34,26 +42,39 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         _ => Chain::Main,
     };
 
-    // The key is a worker SECRET (env.secret), with a var fallback for
-    // local dev ; env.var() fails silently on secrets.
-    let api_key = env
-        .secret("WHATSONCHAIN_API_KEY")
-        .map(|v| v.to_string())
-        .ok()
-        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
-        .filter(|s| !s.is_empty());
-
-    let client = WocClient::new(&chain, api_key);
-
     let upstream_url = env
         .var("UPSTREAM_CHAINTRACKS_URL")
         .map(|v| v.to_string())
         .ok()
         .filter(|s| !s.is_empty());
 
-    // a private program loop 10 D5: the live path reads the courier LADDER (WoC, Arcade,
-    // Bitails as each other's fallbacks, the start rotating per minute), never
-    // one courier (loop 9's 965877: 23 min behind on one courier's refusal).
+    let params = chain_params(env, &chain)?;
+    let ladder = courier_ladder(env, &chain);
+    let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), env).await;
+    if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
+        log_error!("Chain-event outbox error (cursor retained): {e:?}");
+    }
+    result
+}
+
+/// The courier ladder of this deploy, for one cron tick or one request:
+/// WhatsOnChain (its key a worker SECRET, with a var fallback for local dev;
+/// `env.var()` fails silently on secrets), Arcade and Bitails as each other's
+/// fallbacks, the start rotating per minute (a private program loop 10 D5: loop 9's
+/// 965877 left the store 23 min behind on one courier's refusal). Rule 28:
+/// every path that reads a header from outside builds THIS ladder, the cron,
+/// the read-through (H12) and the operator's backfill (H13), so no path
+/// depends on one courier and the three cannot drift apart.
+pub(crate) fn courier_ladder(
+    env: &Env,
+    chain: &Chain,
+) -> crate::couriers::CourierLadder<crate::couriers::Courier> {
+    let api_key = env
+        .secret("WHATSONCHAIN_API_KEY")
+        .map(|v| v.to_string())
+        .ok()
+        .or_else(|| env.var("WHATSONCHAIN_API_KEY").map(|v| v.to_string()).ok())
+        .filter(|s| !s.is_empty());
     let var = |name: &str| {
         env.var(name)
             .map(|v| v.to_string())
@@ -61,19 +82,13 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
             .filter(|s| !s.is_empty())
     };
     let minute = Date::now().as_millis() / 60_000;
-    let params = chain_params(env, &chain)?;
-    let ladder = crate::couriers::CourierLadder::for_chain(
-        &chain,
-        client,
+    crate::couriers::CourierLadder::for_chain(
+        chain,
+        WocClient::new(chain, api_key),
         var("ARCADE_URL"),
         var("BITAILS_URL"),
         minute,
-    );
-    let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), env).await;
-    if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
-        log_error!("Chain-event outbox error (cursor retained): {e:?}");
-    }
-    result
+    )
 }
 
 /// The chain's rules (P0-4): the node's parameters for `chain`, with the
@@ -601,6 +616,169 @@ pub(crate) async fn insert_with_parent_backfill(
         );
     }
     Ok(repaired)
+}
+
+/// The read-through for a FRESH block (`routes::ensure_fresh_header`): fill
+/// `tip + 1 ..= height` from `source` through the full validation path (the
+/// node's rules, the parent walk) and announce whatever landed. `Some` when
+/// the whole span landed; `None` when a header could not be had or was
+/// refused, which the route answers as "unable to verify", never an error
+/// page and never "no such block". Rule 28 (H12): `source` is the courier
+/// ladder on the worker, so a fresh block never depends on one courier.
+pub(crate) async fn read_through(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    hooks: &impl TipWebhooks,
+    tip: u32,
+    height: u32,
+) -> Result<Option<()>> {
+    // Fill the whole gap tip+1..=height so linkage/backfill stays simple.
+    for h in (tip + 1)..=height {
+        match source.header_by_height(h).await {
+            Ok(header) => {
+                // P0-4: a header the node's rules refuse is never stored, and
+                // the request answers "unable to verify", never an error page.
+                if let Err(e) = insert_with_parent_backfill(db, params, source, header).await {
+                    log!("read-through: header at {h} refused: {e:?}");
+                    announce_tip(db, hooks, None).await;
+                    return Ok(None);
+                }
+            }
+            Err(e) => {
+                log!("read-through: no courier has the header at {h} yet: {e:?}");
+                // Whatever DID land is a tip move the consumers must hear.
+                announce_tip(db, hooks, None).await;
+                return Ok(None);
+            }
+        }
+    }
+    // The chain tip moved on a consumer's request, not the cron's: announce it
+    // here (a private program W2-P4 ; the cron alone left block 965076 unannounced).
+    announce_tip(db, hooks, None).await;
+    Ok(Some(()))
+}
+
+/// The headers of `from ..= to` by height from `source`, in order, ending at
+/// the first height no courier served (the operator's backfill inserts what
+/// it has and re-runs from the gap). Rule 28 (H13): `source` is the courier
+/// ladder on the worker; each answer is bound to the height asked and to its
+/// own proof of work before it counts, and a rung faulting three times is
+/// skipped for the rest of the call.
+pub(crate) async fn fetch_span(source: &impl ChainSource, from: u32, to: u32) -> Vec<BlockHeader> {
+    let mut headers = Vec::with_capacity((to.saturating_sub(from) + 1) as usize);
+    for height in from..=to {
+        match source.header_by_height(height).await {
+            Ok(header) => headers.push(header),
+            Err(e) => {
+                log!("backfill: no courier served the header at {height}: {e:?}");
+                break;
+            }
+        }
+    }
+    headers
+}
+
+/// A PEER header service: another service speaking the header protocol, asked
+/// for a run of headers by `getHeaders` (the worker's is our own upstream,
+/// `UPSTREAM_CHAINTRACKS_URL`; the host suite scripts one). A peer is a
+/// courier like any other: nothing it serves is believed for who served it.
+pub(crate) trait HeaderPeer {
+    /// Up to `count` headers from `start`, each linked to the one below it and
+    /// the first to `expected_prev` when given; fewer when the peer holds fewer.
+    async fn headers(
+        &self,
+        start: u32,
+        count: u32,
+        expected_prev: Option<&str>,
+    ) -> Result<Vec<BlockHeader>>;
+}
+
+/// The upstream peer of this deploy, by its base URL.
+pub(crate) struct UpstreamPeer<'a>(pub &'a str);
+
+impl HeaderPeer for UpstreamPeer<'_> {
+    async fn headers(
+        &self,
+        start: u32,
+        count: u32,
+        expected_prev: Option<&str>,
+    ) -> Result<Vec<BlockHeader>> {
+        fetch_headers_from_upstream(self.0, start, count, expected_prev).await
+    }
+}
+
+/// Headers per `getHeaders` request of the bootstrap (the catch-up's batch).
+pub(crate) const BOOTSTRAP_BATCH: u32 = 1000;
+
+/// Where the bootstrap of a span reads from.
+#[derive(Debug)]
+pub(crate) enum Bootstrap {
+    /// The peer served the span, or its prefix up to the peer's own tip.
+    Peer(Vec<BlockHeader>),
+    /// The peer could not be had, so the file host is what remains:
+    /// `peer_fault` is why (`None`: no peer is configured). "Could not look"
+    /// stays apart from an answer; it is reported, never dropped.
+    FileHost { peer_fault: Option<String> },
+}
+
+/// The bootstrap of `count` headers from `start` (Rule 28, H14): the upstream
+/// peer's `getHeaders` is asked FIRST, a batch at a time, each batch linked to
+/// the one below it (`anchor` is our stored header below `start`, when the
+/// store holds one). Any peer fault, a broken link or an empty answer hands
+/// the whole span to the file host (`woc::BULK_FILE_HOST`), so one span is
+/// never stitched from two sources. Whichever serves it, the batch meets the
+/// node's rules on insert and is refused whole on one fault.
+pub(crate) async fn bootstrap_from_peer(
+    peer: Option<&impl HeaderPeer>,
+    start: u32,
+    count: u32,
+    anchor: Option<&str>,
+) -> Bootstrap {
+    let Some(peer) = peer else {
+        return Bootstrap::FileHost { peer_fault: None };
+    };
+    let fault = |text: String| Bootstrap::FileHost {
+        peer_fault: Some(text),
+    };
+    let end = start.saturating_add(count);
+    let mut headers: Vec<BlockHeader> = Vec::new();
+    let mut height = start;
+    while height < end {
+        let ask = BOOTSTRAP_BATCH.min(end - height);
+        let below = headers
+            .last()
+            .map(|h| h.hash.clone())
+            .or_else(|| anchor.map(str::to_string));
+        let mut batch = match peer.headers(height, ask, below.as_deref()).await {
+            Ok(batch) => batch,
+            Err(e) => return fault(format!("getHeaders at {height}: {e}")),
+        };
+        batch.truncate(ask as usize);
+        let mut expected = below;
+        for (i, h) in batch.iter().enumerate() {
+            let at = height + i as u32;
+            let linked = expected
+                .as_deref()
+                .is_none_or(|p| h.previous_hash.eq_ignore_ascii_case(p));
+            if h.height != at || !linked {
+                return fault(format!(
+                    "getHeaders at {height}: the header at {at} does not link to the one below it"
+                ));
+            }
+            expected = Some(h.hash.clone());
+        }
+        let got = batch.len() as u32;
+        headers.extend(batch);
+        if got < ask {
+            break; // the peer's own tip
+        }
+        height += got;
+    }
+    if headers.is_empty() {
+        return fault(format!("the peer holds no header at {start}"));
+    }
+    Bootstrap::Peer(headers)
 }
 
 /// Fetch headers from an upstream chaintracks instance via getHeaders endpoint.
