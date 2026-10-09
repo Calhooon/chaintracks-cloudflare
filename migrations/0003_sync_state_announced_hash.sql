@@ -1,0 +1,14 @@
+-- 0003: the last ANNOUNCED tip hash (a private program M19 R2 round 2, review H3,
+-- 2026-09-08). ADDITIVE and idempotent under wrangler's migration ledger;
+-- apply with `npx wrangler d1 migrations apply rust-chaintracks --remote`
+-- before deploying the build that ships with it (the pre-0003 build never
+-- reads the column; the 0003 build tolerates a NULL as "never announced").
+--
+-- Why: `notify_if_tip_advanced` announced only when last_synced_height < tip.
+-- A same-height REPLACEMENT (the common reorg shape: the 34 MB block at
+-- 965771 orphaned by a 58-tx block at the same height, 2026-09-07 22:39Z) is
+-- not a height advance, so the consumers never heard it and the overlay's
+-- reorg detector had nothing to compare. The announce now fires when the
+-- (height, hash) pair differs from the last announced one, and the webhook
+-- body carries both.
+ALTER TABLE sync_state ADD COLUMN last_announced_hash TEXT;

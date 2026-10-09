@@ -1,0 +1,61 @@
+name = "rust-chaintracks"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+account_id = "<your-account-id>"
+
+[vars]
+CHAIN = "main"
+# a private program loop 10 D5 (2026-09-08): the live path's courier ladder (WoC, Arcade,
+# Bitails as each other's fallbacks; the 965877 lag of loop 9). The defaults
+# live in `couriers.rs`; these make them visible and overridable per deploy.
+ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
+BITAILS_URL = "https://api.bitails.io"
+# Optional: base URL of an upstream chaintracks instance used for fast
+# catch-up (bulk getHeaders). Leave empty to sync directly from WhatsOnChain.
+UPSTREAM_CHAINTRACKS_URL = "https://api.calhouninfra.com"
+# a private program W2-P4 (2026-09-02): comma-separated POST targets told `{"height"}`
+# after every synced tip (bearer secret TIP_WEBHOOK_TOKEN). Each entry is
+# `[BINDING=]URL`: a Worker on THIS account must be reached through the named
+# service binding below — Cloudflare refuses a plain fetch between two Workers
+# on one zone (1042 behind a 404; every *.workers.dev host of an account is
+# one zone). Beta only while prod is frozen; add
+# `APP_LAYER=https://your-worker.your-account.workers.dev/internal/tip-changed`
+# (+ its binding) at promotion.
+TIP_WEBHOOK_URLS = "APP_LAYER_BETA=https://your-worker.your-account.workers.dev/internal/tip-changed,APP_LAYER=https://your-worker.your-account.workers.dev/internal/tip-changed"
+
+# Service binding for the tip webhook above. `service` is a worker name, not
+# a secret.
+[[services]]
+binding = "APP_LAYER_BETA"
+service = "low-app-layer-beta"
+
+# a private program promotion (2026-09-09): the PROD app-layer target of the tip webhook above.
+[[services]]
+binding = "APP_LAYER"
+service = "low-app-layer"
+
+[build]
+# Pin worker-build to the worker-crate/wasm-bindgen pairing (worker 0.7.5 /
+# wasm-bindgen 0.2.117 / worker-build 0.7.5). The global install flips between
+# repos (composer-storage needs 0.8.4) and wrangler 4 autoconfig installs
+# latest — a mismatched trio fails with "different bindgen format".
+command = "cargo install -q worker-build@0.7.5 && worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "rust-chaintracks"
+database_id = "<your-d1-database-id>"
+
+[[r2_buckets]]
+binding = "BULK_HEADERS"
+bucket_name = "rust-chaintracks-headers"
+
+[triggers]
+crons = ["* * * * *"]
+
+# a private program loop 10 D5 (2026-09-08): the 23-minute lag of loop 9 left NO log
+# line to read (observability was never enabled). Every cron line, every
+# courier fault and the per-tick tally are worth their storage.
+[observability]
+enabled = true
+head_sampling_rate = 1

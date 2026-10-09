@@ -1,0 +1,29 @@
+[package]
+name = "rust-chaintracks"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = { version = "0.7", features = ["d1"] }
+serde-wasm-bindgen = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+hex = "0.4"
+url = "2"
+sha2 = "0.10"
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+# Dev-only: the header query shapes are planned on a real SQLite with the real
+# migrations (storage.rs plan pins). Never compiled into the worker.
+rusqlite = { version = "0.32", features = ["bundled"] }

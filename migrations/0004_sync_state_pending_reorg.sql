@@ -1,0 +1,15 @@
+-- 0004: the deepest pending reorg fork height (a private program M19 R2 round 3,
+-- review MED-1, 2026-09-08). ADDITIVE and idempotent under wrangler's
+-- migration ledger; apply with `npx wrangler d1 migrations apply
+-- rust-chaintracks --remote` before deploying the build that ships with it.
+--
+-- Why: chaintracks activates a branch only on MORE cumulative work, so an
+-- equal-work sibling at height H is inserted INACTIVE and the tip flips only
+-- when the competing CHILD at H+1 arrives. The reorg is real, but the tip
+-- advance announces {H+1, hash} — which the overlay classifies as a plain
+-- extension, missing the fork. `handle_reorg` DOES know the fork point
+-- (the common ancestor), so it records the lowest CHANGED height here
+-- (ancestor_height + 1); the next winning tip announce carries it as
+-- `reorgFrom` and clears it, and the overlay runs its targeted, evidence
+-- -driven re-verify over [reorgFrom, tip]. NULL = no pending reorg.
+ALTER TABLE sync_state ADD COLUMN pending_reorg_from INTEGER;

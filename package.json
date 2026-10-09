@@ -1,0 +1,15 @@
+{
+  "name": "rust-chaintracks",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "cargo test 2>&1",
+    "test:e2e": "./tests/e2e/run_all.sh",
+    "test:e2e:health": "./tests/e2e/health_check.sh",
+    "seed": "npx wrangler d1 execute rust-chaintracks --file=./seed/bootstrap.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^3"
+  }
+}

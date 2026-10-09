@@ -1,0 +1,26 @@
+-- 0002: the composite (is_active, height) index (a private program M19-5, issue #428,
+-- 2026-09-08). ADDITIVE and idempotent; apply with
+-- `npx wrangler d1 migrations apply rust-chaintracks --remote` before or after
+-- deploying the build that ships with it (the queries are unchanged in shape).
+--
+-- Why: Cloudflare D1 query insights for 2026-09-07 22:16–22:56Z showed eight
+-- SELECT_HEADER calls reading ~965k rows each at 435 ms. `EXPLAIN QUERY PLAN`
+-- on this schema names them: with `idx_headers_active` (is_active alone, where
+-- every canonical row is 1) the planner answers `WHERE is_active = 1 ORDER BY
+-- height DESC LIMIT 1` (the tip-to-highest repair on the reorg path) and
+-- `COUNT(*) WHERE is_active = 1 AND height > ?` (the reorg walk) by reading the
+-- whole active set. A composite index lets both seek (`is_active=? AND
+-- height>?`) and lets `WHERE height = ? AND is_active = 1` seek both columns
+-- (SELECT_HEADER reads 13 columns, so that read is a seek plus a rowid lookup,
+-- not a covering read).
+--
+-- The bigger win is the hottest read of all. On main, find_header_for_height
+-- (`height = ? AND is_active = 1 ORDER BY header_id DESC LIMIT 1`, every proof
+-- check by every wallet and the tower's tip pass) planned through
+-- idx_headers_active as a REVERSE ROWID WALK of the active set from the newest
+-- row down to the height asked: roughly (tip minus height) rows per call. The
+-- composite turns it into a two-column seek.
+--
+-- Not added: an index on `hash`. `hash` is `UNIQUE` in 0001, so SQLite already
+-- maintains `sqlite_autoindex_headers_1` and every `WHERE hash = ?` is a seek.
+CREATE INDEX IF NOT EXISTS idx_headers_active_height ON headers(is_active, height);
