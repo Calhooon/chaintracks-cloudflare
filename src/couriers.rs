@@ -113,7 +113,7 @@ pub struct ArcadeClient {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ArcadeHeader {
+pub(crate) struct ArcadeHeader {
     version: u32,
     #[serde(rename = "previousHash")]
     previous_hash: String,
@@ -127,7 +127,7 @@ struct ArcadeHeader {
 }
 
 impl ArcadeHeader {
-    fn into_block_header(self) -> worker::Result<BlockHeader> {
+    pub(crate) fn into_block_header(self) -> worker::Result<BlockHeader> {
         let header = BlockHeader {
             header_id: None,
             previous_header_id: None,
@@ -428,6 +428,13 @@ impl<S: ChainSource> CourierLadder<S> {
             })
             .collect::<Vec<_>>()
             .join(" · ")
+    }
+
+    /// E5: the requests the rungs were asked this tick (each answer and each
+    /// fault is one), the count the push's reduction of the poll is read in.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn requests(&self) -> u32 {
+        self.rungs.iter().map(|r| r.ok.get() + r.faults.get()).sum()
     }
 
     /// Every fault of the tick, in order (the pins read it).

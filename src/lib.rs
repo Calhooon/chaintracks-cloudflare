@@ -43,6 +43,9 @@ mod events;
 mod host_harness;
 #[cfg(test)]
 mod pow_tests;
+mod push;
+#[cfg(test)]
+mod push_tests;
 mod r2;
 #[cfg(test)]
 mod reorg_producer_tests;
@@ -51,12 +54,14 @@ mod retarget_tests;
 mod routes;
 #[cfg(test)]
 mod rule28_tests;
+mod sse;
 #[cfg(test)]
 mod statement_pins;
 mod storage;
 #[cfg(test)]
 mod storage_host_tests;
 mod sync;
+mod tip_stream;
 mod types;
 mod woc;
 
@@ -75,6 +80,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     console_error_panic_hook::set_once();
+    // E5: the poll wakes the push source first and asks the couriers only
+    // when the push does not cover the tick (`sync::poll_for_new_blocks`).
     if let Err(e) = sync::poll_for_new_blocks(&env).await {
         console_log!("Cron sync error: {e:?}");
     }

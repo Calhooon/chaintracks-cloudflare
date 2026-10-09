@@ -50,6 +50,20 @@ binding = "DB"
 database_name = "rust-chaintracks"
 database_id = "<your-d1-database-id>"
 
+# E5 (Rule 28): the push source. One Durable Object holds the outbound tip
+# stream of the peer at ARCADE_URL (/chaintracks/v2/tip/stream) and hands
+# every tip to the ingest door, re-derived by the service's rules; the minute
+# cron wakes it if it is gone and keeps the courier poll as the fallback.
+# SQLite-backed (Cloudflare's class for new objects; the storage API used is
+# the key-value one). The deploy that carries this migration is the owner's.
+[[durable_objects.bindings]]
+name = "TIP_STREAM"
+class_name = "TipStream"
+
+[[migrations]]
+tag = "e5-tip-stream"
+new_sqlite_classes = ["TipStream"]
+
 [[r2_buckets]]
 binding = "BULK_HEADERS"
 bucket_name = "rust-chaintracks-headers"

@@ -65,13 +65,14 @@ A third-party chain explorer is break-glass: a read that leaves the service is k
 
 | read | who is asked | when |
 |---|---|---|
-| the tip, a header by height, a header by hash | the courier ladder: WhatsOnChain and Bitails (explorers), Arcade's chaintracks v2 (a peer) | the minute cron; the read-through for a block up to six above the tip; `/admin/backfill` |
+| the tip, as it is announced | Arcade's chaintracks v2 tip stream (a peer, `ARCADE_URL` + `/chaintracks/v2/tip/stream`), held by the `TipStream` Durable Object | always (E5): one outbound stream, each tip through the ingest door |
+| the tip, a header by height, a header by hash | the courier ladder: WhatsOnChain and Bitails (explorers), Arcade's chaintracks v2 (a peer) | the minute cron when the push does not cover the tick (the stream down, or no push nor poll in 10 minutes); the read-through for a block up to six above the tip; `/admin/backfill`; the push's parent walk by hash |
 | up to 1,000 headers from a height | the upstream peer, `UPSTREAM_CHAINTRACKS_URL` (`getHeaders`) | the cron's catch-up (a gap over 10); `/admin/bulk-sync`, asked first |
 | a file of 100,000 headers | the bulk file host, pinned (`woc::BULK_FILE_HOST`; neither peer nor explorer) | `/admin/bulk-sync` when the peer cannot serve the span |
 
 - **The shape.** A negative needs a second provider (a rung that does not serve a header is a faulting rung and the next is asked; for the tip every rung is asked and the highest wins). "Could not look" is never "nothing there" (every rung faulted is an error recorded with its time, and the routes answer unable to verify). The start rotates per minute. Testnet's ladder is WhatsOnChain alone.
 - **Nothing else goes out.** `/getPresentHeight` answers from the store (it was one explorer request per request in). No route proxies an explorer.
-- **The routine read** is the minute poll of the tip. The push source that goes ahead of it (a peer's chain-event feed, the poll kept as the fallback) is designed in bsv-stack-lean `docs/p0/rule-28-chaintracks.md`.
+- **The push source (E5).** The routine read was the minute poll of the tip. The `TipStream` Durable Object (`src/tip_stream.rs`) now holds the peer's tip stream and hands each tip to the one ingest door, `push::ingest_announced`: the header's own proof of work first, its missing parents fetched by hash through the ladder (at most 36), then `storage::ingest_pushed`, the operator's ingest of #33, so a pushed header is stored and activated exactly as an operator's is. A wrong push is a refused header and a logged fault (`/getInfo` `lastError`), never a row. The object reads inside its alarm handler in sessions of 10 minutes, drops a stream silent for 45 s (three of Arcade's 15 s keepalives) and reconnects with the last event id; the minute cron wakes it if it is gone (`POST /wake`) and keeps the courier poll as the fallback: every minute while the stream is down, once in 10 minutes behind a live one with no push. Each poll's courier requests are counted in the object (`GET /status` on the object: `polls`). Design: bsv-stack-lean `docs/p0/rule-28-chaintracks.md`; report: `docs/p0/e5-push-source.md`.
 - **Tests** (`src/rule28_tests.rs`): each fix red at the commit before it, then the behavior on scripted couriers and a scripted peer.
 
 ## Differences from Node.js chaintracks-server
@@ -130,6 +131,9 @@ Bulk     → R2 bucket (CDN replacement)
 | `BULK_HEADERS` | R2 | Bulk header binary files |
 | `CHAIN` | Var | `"main"` or `"test"` |
 | `WHATSONCHAIN_API_KEY` | Var/Secret | Optional WoC API key |
+| `TIP_STREAM` | Durable Object (`TipStream`, migration `e5-tip-stream`, SQLite-backed) | The push source: the peer's tip stream (E5) |
+| `ARCADE_URL` | Var | The peer: a courier rung, and the tip stream's host |
+| `TIP_STREAM_HEARTBEAT_S`, `TIP_STREAM_SESSION_S`, `TIP_STREAM_QUIET_S` | Var, optional | The stream's heartbeat (45), session (600) and the poll's quiet interval (600), in seconds |
 
 ## Build and Deploy
 
@@ -162,8 +166,8 @@ cargo test --lib
 worker-build --release
 ```
 
-- **Unit tests:** `cargo test` (238 pass, two runs by hand ignored: the extended header run, and the long pass from the node's checkpoint 530359 that derives the `CHECKPOINTS` entry; includes the chain-event witness and the Rule 28 witnesses on the host harness)
-- **The compiled Worker, local:** `node tests/worker_events.mjs <witness.json>` (D1, the event feed, SSE), `node tests/worker_ct33.mjs` (the 956433 class through `/admin/linkcheck` and `/admin/ingest`) and `node tests/worker_rule28.mjs` (what leaves the Worker and to whom: every outbound request is caught and answered in the harness, none reaches the network)
+- **Unit tests:** `cargo test` (272 pass, two runs by hand ignored: the extended header run, and the long pass from the node's checkpoint 530359 that derives the `CHECKPOINTS` entry; includes the chain-event witness and the Rule 28 witnesses on the host harness)
+- **The compiled Worker, local:** `node tests/worker_events.mjs <witness.json>` (D1, the event feed, SSE), `node tests/worker_ct33.mjs` (the 956433 class through `/admin/linkcheck` and `/admin/ingest`) `node tests/worker_rule28.mjs` (what leaves the Worker and to whom: every outbound request is caught and answered in the harness, none reaches the network) and `node tests/worker_e5.mjs` (the push source: a scripted SSE peer, the object's reconnects and heartbeat, a refused and an accepted push, the poll's requests counted)
 - **Comparison:** `tests/e2e/compare.sh` (13-test parity check against a reference chaintracks instance)
 
 ## Consumers

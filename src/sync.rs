@@ -49,12 +49,59 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         .filter(|s| !s.is_empty());
 
     let params = chain_params(env, &chain)?;
-    let ladder = courier_ladder(env, &chain);
-    let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), env).await;
+
+    // E5: the push source goes ahead of the poll. The object holding the
+    // peer's tip stream is woken if it is gone, and answers whether this
+    // tick asks the couriers (`tip_stream::poll_due`: every minute while the
+    // stream is down, once a quiet interval behind it). No answer (no
+    // binding, a fault) is a poll, as before E5.
+    #[cfg(target_arch = "wasm32")]
+    let wake = crate::tip_stream::wake(env).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    let wake: Option<serde_json::Value> = None;
+    let poll = wake
+        .as_ref()
+        .and_then(|w| w.get("poll"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let result = if poll {
+        let ladder = courier_ladder(env, &chain);
+        let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), env).await;
+        let requests = ladder.requests();
+        log!(
+            "Cron: the poll asked the couriers {requests} times ({})",
+            wake.as_ref()
+                .and_then(|w| w.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("no push source answered")
+        );
+        #[cfg(target_arch = "wasm32")]
+        crate::tip_stream::polled(env, requests).await;
+        result
+    } else {
+        log!("Cron: the push is live; the couriers are not asked this tick");
+        run_pushed_tick(&db, &params, env).await
+    };
     if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
         log_error!("Chain-event outbox error (cursor retained): {e:?}");
     }
     result
+}
+
+/// E5: a cron tick the push covers. Everything of the cron that reads no
+/// courier still runs: the tip's age (#32), one step of the re-validation
+/// (P0-4), the announce (a refused delivery is retried every minute) and the
+/// cumulative-work repair.
+pub(crate) async fn run_pushed_tick(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    hooks: &impl TipWebhooks,
+) -> Result<()> {
+    crate::events::timer(db).await?;
+    revalidate(db, params).await;
+    finish_sync(db, hooks, None).await;
+    Ok(())
 }
 
 /// The courier ladder of this deploy, for one cron tick or one request:
@@ -89,6 +136,21 @@ pub(crate) fn courier_ladder(
         var("BITAILS_URL"),
         minute,
     )
+}
+
+/// The deploy's chain from the `CHAIN` var (`"test"`, else main), as the
+/// cron and the routes read it.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn chain_of(env: &Env) -> Chain {
+    match env
+        .var("CHAIN")
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "test" => Chain::Test,
+        _ => Chain::Main,
+    }
 }
 
 /// The chain's rules (P0-4): the node's parameters for `chain`, with the
@@ -129,6 +191,31 @@ async fn record_seen(db: &impl HeaderDb, height: u32) {
     }
 }
 
+/// E5: a pushed header's height recorded as the couriers' answer is
+/// (`/getPresentHeight` serves the larger of it and the served tip), only
+/// when it is above what stands, so a push of an older header never lowers
+/// the record. A read fault is loud and skips the write, as below.
+pub(crate) async fn note_seen(db: &impl HeaderDb, height: u32) {
+    #[derive(serde::Deserialize)]
+    struct SeenRow {
+        last_seen_height: Option<f64>,
+    }
+    match crate::d1::Query::new(storage::SQL_COURIER_HEALTH)
+        .first::<SeenRow>(db)
+        .await
+    {
+        Ok(row) => {
+            let seen = row.and_then(|r| r.last_seen_height.map(|v| v as u32));
+            if seen.is_none_or(|s| s < height) {
+                record_seen(db, height).await;
+            }
+        }
+        Err(e) => {
+            log_error!("push: could not read the courier record (migration 0007 applied?): {e:?}")
+        }
+    }
+}
+
 /// The idle tick's half of the record (D5): read what stands; write the
 /// couriers' answer only when it differs. A read fault is loud and skips the
 /// write (the migration not applied: `/getInfo` names it).
@@ -152,7 +239,7 @@ async fn keep_seen_current(db: &impl HeaderDb, woc_height: u32) {
     }
 }
 
-async fn record_fault(db: &impl HeaderDb, text: &str) {
+pub(crate) async fn record_fault(db: &impl HeaderDb, text: &str) {
     let capped: String = text.chars().take(FAULT_TEXT_CAP).collect();
     if let Err(e) = crate::d1::Query::new(RECORD_FAULT_SQL)
         .bind(capped)
@@ -1610,7 +1697,7 @@ mod tip_webhook_tests {
 
 // #32: uses the existing service-binding transport, with separate opt-in
 // targets so the legacy height webhook remains compatible.
-struct EventWebhookConfig<'a>(&'a Env);
+pub(crate) struct EventWebhookConfig<'a>(pub(crate) &'a Env);
 
 impl TipWebhooks for EventWebhookConfig<'_> {
     fn targets(&self) -> Vec<WebhookTarget> {
