@@ -1,4 +1,4 @@
-//! The unit tier of the host harness (a private program M19B-G2, 2026-09-08): one test
+//! The unit tier of the host harness (bsv-low M19B-G2, 2026-09-08): one test
 //! per `HeaderDb` method on the rusqlite implementation, then one per storage
 //! and announce behavior the reorg producer stands on, each driven through the
 //! REAL function (`insert_header`, `handle_reorg`, `find_chain_tip`,

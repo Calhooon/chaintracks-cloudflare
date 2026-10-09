@@ -1,4 +1,4 @@
--- 0005: the announce delivery counters (a private program M19B-G2 round 2, 2026-09-08).
+-- 0005: the announce delivery counters (bsv-low M19B-G2 round 2, 2026-09-08).
 -- ADDITIVE and idempotent under wrangler's migration ledger; apply with
 -- `npx wrangler d1 migrations apply rust-chaintracks --remote` BEFORE
 -- deploying the build that ships with it (that build reads both columns on

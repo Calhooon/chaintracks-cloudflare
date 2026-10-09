@@ -1,4 +1,4 @@
--- 0006: per-target announce deliveries and the claim clock (a private program M19B-G2
+-- 0006: per-target announce deliveries and the claim clock (bsv-low M19B-G2
 -- rounds 3 and 4, MED-2 / MED-1, 2026-09-08). ADDITIVE (a new table, one
 -- nullable column) and idempotent under wrangler's migration ledger; apply
 -- with `npx wrangler d1 migrations apply rust-chaintracks --remote` BEFORE

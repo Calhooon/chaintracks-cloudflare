@@ -432,7 +432,7 @@ async fn revalidation_gates_the_journal_and_the_legacy_webhook() {
 }
 
 #[tokio::test]
-async fn bulk_and_operator_replacements_emit_the_same_reorg_view() {
+async fn a_bulk_replacement_emits_the_reorg_and_an_operators_competitor_does_not() {
     let (db, params, h) = fixture();
     seed(&db, &params, &h[..2]).await;
     let before = events::head(&db).await.unwrap();
@@ -445,21 +445,21 @@ async fn bulk_and_operator_replacements_emit_the_same_reorg_view() {
         events::decode(&e.payload).unwrap().event,
         ChainEvent::Reorg { depth: 1, .. }
     )));
-    // An operator replaces a below-tip ancestor with a valid tied branch.
-    // Its old descendants must be disconnected as well.
-    storage::canonicalize_heights(&db, &h[1..2]).await.unwrap();
+    // #33: an operator's push of a below-tip header the stored child does
+    // not commit to is a competitor, stored inactive: no reorg, no event.
+    // (Before #33 the push was forced active and its descendants cut off.)
+    let out = storage::ingest_pushed(&db, &params, &h[1..2])
+        .await
+        .unwrap_or_else(|_| panic!("the push passes the rules"));
+    assert_eq!(out.outcome, "storedInactive");
     assert_eq!(
         storage::served_tip(&db).await.unwrap().unwrap().hash,
-        h[1].hash
+        h[3].hash
     );
-    assert!(storage::find_active_header_for_hash(&db, &h[3].hash)
-        .await
-        .unwrap()
-        .is_none());
     let after = events::read_page(&db, page.cursor, 100).await.unwrap();
-    assert!(after.events.iter().any(|e| matches!(
+    assert!(!after.events.iter().any(|e| matches!(
         events::decode(&e.payload).unwrap().event,
-        ChainEvent::Reorg { depth: 2, .. }
+        ChainEvent::Reorg { .. }
     )));
 }
 

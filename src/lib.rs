@@ -1,7 +1,7 @@
 use worker::*;
 
 /// Log to the worker console, or to stderr on a host build: the `cargo test`
-/// harness drives the real sync and storage paths (a private program M19B-G2), and the
+/// harness drives the real sync and storage paths (bsv-low M19B-G2), and the
 /// wasm-bindgen console import aborts when called off-wasm. Every log line on
 /// a path the host harness can reach goes through these two.
 #[cfg(target_arch = "wasm32")]
@@ -29,6 +29,8 @@ macro_rules! log_error {
     };
 }
 
+#[cfg(test)]
+mod canonicalize_tests;
 #[cfg(test)]
 mod chain_event_tests;
 mod consensus;

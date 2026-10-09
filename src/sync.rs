@@ -60,7 +60,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
 /// The courier ladder of this deploy, for one cron tick or one request:
 /// WhatsOnChain (its key a worker SECRET, with a var fallback for local dev;
 /// `env.var()` fails silently on secrets), Arcade and Bitails as each other's
-/// fallbacks, the start rotating per minute (a private program loop 10 D5: loop 9's
+/// fallbacks, the start rotating per minute (bsv-low loop 10 D5: loop 9's
 /// 965877 left the store 23 min behind on one courier's refusal). Rule 28:
 /// every path that reads a header from outside builds THIS ladder, the cron,
 /// the read-through (H12) and the operator's backfill (H13), so no path
@@ -105,7 +105,7 @@ pub(crate) fn chain_params(env: &Env, chain: &Chain) -> Result<ChainParams> {
     }
 }
 
-/// a private program loop 10 D5: the courier health the cron records (migration 0007),
+/// bsv-low loop 10 D5: the courier health the cron records (migration 0007),
 /// best-effort and LOUD: a missing column (the migration not applied) never
 /// stops the sync, and `/getInfo` names it (`syncSchemaFault`). Binds: ?1 the
 /// highest tip any courier answered this tick.
@@ -172,7 +172,7 @@ pub(crate) trait ChainSource {
     async fn chain_info(&self) -> Result<WocChainInfo>;
     async fn header_by_height(&self, height: u32) -> Result<BlockHeader>;
     async fn header_by_hash(&self, hash: &str) -> Result<BlockHeader>;
-    /// a private program loop 10 D5: the tick's per-courier tally for the log (the
+    /// bsv-low loop 10 D5: the tick's per-courier tally for the log (the
     /// ladder answers; a single source has nothing to report).
     fn report(&self) -> Option<String> {
         None
@@ -388,11 +388,9 @@ pub(crate) async fn run_cron(
             }
         }
         // Self-heal any dual-active debris the bulk path can leave (audit
-        // C3): exactly one active row may exist per height; keep the newest
-        // ingest, the live reorg walk corrects branch choice if needed.
-        crate::d1::Query::new(storage::SQL_DEDUPE_ACTIVE_HEIGHTS)
-            .run(db)
-            .await?;
+        // C3): exactly one active row may exist per height; keep the row
+        // the next height extends, and only then the newest ingest (#33).
+        storage::dedupe_active_heights(db).await?;
         storage::update_chain_tip_to_highest(db).await?;
     } else {
         // ─── Live: one-by-one from WoC with reorg detection ─────────────
@@ -506,7 +504,7 @@ pub(crate) async fn announce_tip(
     }
 }
 
-/// The cron's tail after a sync that moved the tip: the announce (a private program
+/// The cron's tail after a sync that moved the tip: the announce (bsv-low
 /// W2-P4: tell our consumers the tip moved so THEY push it to their clients
 /// as an event instead of every client polling `/tip`; keyed on the
 /// PERSISTED announce state, not this run's delta, because the read-through
@@ -654,7 +652,7 @@ pub(crate) async fn read_through(
         }
     }
     // The chain tip moved on a consumer's request, not the cron's: announce it
-    // here (a private program W2-P4 ; the cron alone left block 965076 unannounced).
+    // here (bsv-low W2-P4 ; the cron alone left block 965076 unannounced).
     announce_tip(db, hooks, None).await;
     Ok(Some(()))
 }
@@ -853,7 +851,7 @@ async fn fetch_headers_from_upstream(
     Ok(headers)
 }
 
-/// The atomic CLAIM that decides who announces (a private program M19 R2 round 2,
+/// The atomic CLAIM that decides who announces (bsv-low M19 R2 round 2,
 /// review H3; restored before the POST in M19B-G2 round 3, MED-1): the row
 /// changes when the tip's `(height, hash)` differs from the last CLAIMED
 /// pair, height OR hash. A same-height replacement (the common reorg shape)
@@ -956,7 +954,7 @@ pub(crate) fn tip_is_unannounced(
 }
 
 /// The tip webhook body: `{"height": n, "hash": "<64 hex, lower-case>"}`
-/// (the hash since a private program M19 round 2; consumers that read only `height`
+/// (the hash since bsv-low M19 round 2; consumers that read only `height`
 /// are unaffected).
 pub fn tip_webhook_body(height: u64, hash: &str, reorg_from: Option<u64>) -> String {
     let hash = hash.trim().to_ascii_lowercase();
@@ -1028,7 +1026,7 @@ pub(crate) async fn read_deliveries(db: &impl HeaderDb) -> Result<HashMap<String
 
 /// Announce the tip to the consumers, from WHICHEVER path moved the chain
 /// tip (the cron's live/bulk sync or a request's read-through ingest), on
-/// ANY tip change, height or hash (a private program M19 round 2: a same-height
+/// ANY tip change, height or hash (bsv-low M19 round 2: a same-height
 /// replacement is a reorg the consumers must hear), and to each target
 /// exactly until it accepts.
 ///
@@ -1254,7 +1252,7 @@ pub fn parse_webhook_targets(raw: &str) -> Vec<WebhookTarget> {
 /// `TIP_WEBHOOK_TOKEN` and sends over the named service binding, or a public
 /// fetch when the target names none (see `WebhookTarget`); the host harness
 /// records the posts instead, so `notify_if_tip_advanced` is driven end to end
-/// in `cargo test` and the body it sends is asserted (a private program M19B-G2).
+/// in `cargo test` and the body it sends is asserted (bsv-low M19B-G2).
 pub(crate) trait TipWebhooks {
     /// The targets, parsed from `TIP_WEBHOOK_URLS`; empty means no webhook.
     fn targets(&self) -> Vec<WebhookTarget>;
@@ -1421,7 +1419,7 @@ mod tip_webhook_tests {
         assert_eq!(v["height"], 965773);
     }
 
-    /// a private program M19 round 2 (review H3): the announce decision, executed as the
+    /// bsv-low M19 round 2 (review H3): the announce decision, executed as the
     /// SHIPPED statement on the shipped migrations under real SQLite. A
     /// same-height hash change FIRES (the 2026-09-07 reorg shape); the same
     /// tip again does NOT (the cron and the read-through never double-fire);
@@ -1496,7 +1494,7 @@ mod tip_webhook_tests {
         assert!(!sql.to_ascii_uppercase().contains("DROP "));
     }
 
-    /// a private program M19 R2 round 3 (review MED-1): `handle_reorg`'s pending-fork
+    /// bsv-low M19 R2 round 3 (review MED-1): `handle_reorg`'s pending-fork
     /// write MIN-accumulates, and the announce reads + clears it. Executed as
     /// the SHIPPED statements on the shipped migrations under real SQLite
     /// (the same tier the codebase pins its header logic at; `insert_header`

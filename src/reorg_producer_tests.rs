@@ -1,4 +1,4 @@
-//! The reorg producer driven through its REAL code path on the host (a private program
+//! The reorg producer driven through its REAL code path on the host (bsv-low
 //! M19B-G2, 2026-09-08): `storage::insert_header` (and the `handle_reorg` it
 //! runs) then `sync::notify_if_tip_advanced`, and since round 4 the cron
 //! itself (`sync::run_cron` on a scripted chain), on a real SQLite carrying
@@ -1384,7 +1384,7 @@ async fn no_premature_clear_while_a_target_has_not_heard_the_fork() {
 
 /// LOW-4 (round 5): an idle cron reads the tip ONCE (the height decides the
 /// sync mode, the competitor check compares its hash, the announce reuses
-/// it), the courier record once (a private program loop 10 D5; the seen height is
+/// it), the courier record once (bsv-low loop 10 D5; the seen height is
 /// written ONCE when the record is behind, see `courier_tests`), then the
 /// announce row and the deliveries, and writes nothing when the record is
 /// current and every target has the tip. #32 adds the durable age write and

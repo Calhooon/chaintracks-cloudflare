@@ -644,16 +644,16 @@ async fn the_start_rotates() {
 
 // ─── The checkpoint at 965000, derived ──────────────────────────────────────
 
-/// The owner's checkpoint entry in `wrangler.toml`, as `(height, hash)`.
-fn configured_checkpoint() -> (u32, String) {
-    let toml = include_str!("../wrangler.toml");
-    let line = toml
-        .lines()
-        .find(|l| l.starts_with("CHECKPOINTS"))
-        .expect("wrangler.toml carries CHECKPOINTS");
-    let spec = line.split('"').nth(1).expect("a quoted value");
-    let (height, hash) = spec.split_once(':').expect("height:hash");
-    (height.parse().unwrap(), hash.to_string())
+/// The checkpoint entry `wrangler.toml` carried on 2026-10-09, as
+/// `(height, hash)`: the hash the long pass below derived. The entry was
+/// retired the same day (`73a4d52`, #31): it had vouched unread for an orphan
+/// row at 956433, so the anchor is the node's own list again. The long pass
+/// still derives this hash; nothing configures it.
+fn derived_checkpoint() -> (u32, String) {
+    (
+        965_000,
+        "000000000000000004f9492052ec33c3fee0efaae1a5615bdbc91084202f7260".to_string(),
+    )
 }
 
 /// The long pass (Rule 28, the header service's seventh fix item): the hash
@@ -697,7 +697,7 @@ async fn the_long_pass_from_the_nodes_last_checkpoint_derives_the_hash_at_965000
 
     // CHECKPOINTS unset: the node's own list and nothing else.
     let params = ChainParams::main();
-    let (cp_height, cp_hash) = configured_checkpoint();
+    let (cp_height, cp_hash) = derived_checkpoint();
     let node_last = params.checkpoints.last().unwrap().0;
     assert_eq!(node_last, 530_359, "the node's last listed checkpoint");
     assert!(
@@ -770,20 +770,21 @@ async fn the_long_pass_from_the_nodes_last_checkpoint_derives_the_hash_at_965000
         tip.hash
     );
     eprintln!("long pass: DERIVED hash at {cp_height}: {by_pass}");
-    eprintln!("long pass: wrangler.toml entry  {cp_height}: {cp_hash}");
+    eprintln!("long pass: the retired entry    {cp_height}: {cp_hash}");
     assert_eq!(by_ingest, by_pass);
     assert_eq!(
         by_pass, cp_hash,
-        "the derived hash is not the configured checkpoint: STOP, the captain and the owner decide"
+        "the derived hash is not the retired entry's: STOP, the captain and the owner decide"
     );
     eprintln!("long pass: MATCH");
 }
 
-/// The entry the long pass derives is the owner's addition, not the node's:
-/// the node's list ends at 530359, which is where the derivation starts.
+/// The entry the long pass derives is above the node's list (which ends at
+/// 530359, where the derivation starts), and it is retired: `wrangler.toml`
+/// configures no `CHECKPOINTS`, and says why at the site (#31).
 #[test]
-fn the_configured_checkpoint_is_above_the_nodes_list_and_cites_its_derivation() {
-    let (height, hash) = configured_checkpoint();
+fn the_derived_checkpoint_is_above_the_nodes_list_and_the_entry_is_retired() {
+    let (height, hash) = derived_checkpoint();
     let node = crate::consensus::ChainParams::main();
     assert_eq!(node.checkpoints.last().unwrap().0, 530_359);
     assert!(height > 530_359 && node.checkpoint_at(height).is_none());
@@ -792,20 +793,17 @@ fn the_configured_checkpoint_is_above_the_nodes_list_and_cites_its_derivation() 
         .expect("the entry parses");
     assert_eq!(with.checkpoint_at(height), Some(hash.as_str()));
     let toml = include_str!("../wrangler.toml");
+    assert!(
+        !toml.lines().any(|l| l.starts_with("CHECKPOINTS")),
+        "the anchor is the node's own list: no CHECKPOINTS entry"
+    );
     let comment: String = toml
         .lines()
-        .take_while(|l| !l.starts_with("CHECKPOINTS"))
         .filter(|l| l.starts_with('#'))
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        comment.contains("OUR OWN DERIVATION") && comment.contains(&hash),
-        "the entry cites the run that derived it"
+        comment.contains("No CHECKPOINTS entry") && comment.contains("956433"),
+        "the retirement names its reason at the site"
     );
-    for explorer in ["JungleBus", "Bitails", "WhatsOnChain"] {
-        assert!(
-            !comment.contains(explorer),
-            "no explorer's word stands behind the entry: {explorer}"
-        );
-    }
 }

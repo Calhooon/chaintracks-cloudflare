@@ -213,7 +213,7 @@ age go to the host's spend/freshness guard; they do not alone write a mined
 word. Each host chooses its freshness threshold and treats an old or
 unreachable source as unable to verify.
 
-[D] a private program's app layer must consume and persist the cursor, rewrite affected
+[D] Zanaadu's app layer must consume and persist the cursor, rewrite affected
 stored heights after re-verifying their proofs, invalidate block-time and
 served-fact caches, withdraw stale confirmed views, and show only the
 tracker's checked word. `app_layer.reorg_done` and `app_layer.tip_stale` move

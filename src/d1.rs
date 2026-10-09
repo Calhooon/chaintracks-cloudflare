@@ -2,7 +2,7 @@
 //!
 //! Adapted from ~/bsv/rust-overlay/crates/overlay-cloudflare/src/d1/mod.rs.
 //!
-//! a private program M19B-G2 (2026-09-08): `HeaderDb` is the statement seam. Every read
+//! bsv-low M19B-G2 (2026-09-08): `HeaderDb` is the statement seam. Every read
 //! and write the storage layer runs is a `Query` (statement text + binds)
 //! handed to a `HeaderDb`, so the reorg producer (`insert_header`,
 //! `handle_reorg`, `notify_if_tip_advanced`) is driven on a host against real

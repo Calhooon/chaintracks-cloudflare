@@ -9,7 +9,7 @@ CHAIN = "main"
 # re-validated by the service's rules. The entry at 965000 of 2026-10-09 (two explorers agreeing, taken for time)
 # was retired the same day after the long pass from the node's checkpoint found an orphan row at 956433 that the
 # entry had vouched for unread (bsv-stack-lean docs/p0/rule-28-chaintracks.md; rust-chaintracks #31).
-# a private program loop 10 D5 (2026-09-08): the live path's courier ladder (WoC, Arcade,
+# bsv-low loop 10 D5 (2026-09-08): the live path's courier ladder (WoC, Arcade,
 # Bitails as each other's fallbacks; the 965877 lag of loop 9). The defaults
 # live in `couriers.rs`; these make them visible and overridable per deploy.
 ARCADE_URL = "https://arcade-v2-us-1.bsvblockchain.tech"
@@ -17,7 +17,7 @@ BITAILS_URL = "https://api.bitails.io"
 # Optional: base URL of an upstream chaintracks instance used for fast
 # catch-up (bulk getHeaders). Leave empty to sync directly from WhatsOnChain.
 UPSTREAM_CHAINTRACKS_URL = "https://api.calhouninfra.com"
-# a private program W2-P4 (2026-09-02): comma-separated POST targets told `{"height"}`
+# bsv-low W2-P4 (2026-09-02): comma-separated POST targets told `{"height"}`
 # after every synced tip (bearer secret TIP_WEBHOOK_TOKEN). Each entry is
 # `[BINDING=]URL`: a Worker on THIS account must be reached through the named
 # service binding below — Cloudflare refuses a plain fetch between two Workers
@@ -33,7 +33,7 @@ TIP_WEBHOOK_URLS = "APP_LAYER_BETA=https://your-worker.your-account.workers.dev/
 binding = "APP_LAYER_BETA"
 service = "low-app-layer-beta"
 
-# a private program promotion (2026-09-09): the PROD app-layer target of the tip webhook above.
+# bsv-low promotion (2026-09-09): the PROD app-layer target of the tip webhook above.
 [[services]]
 binding = "APP_LAYER"
 service = "low-app-layer"
@@ -57,7 +57,7 @@ bucket_name = "rust-chaintracks-headers"
 [triggers]
 crons = ["* * * * *"]
 
-# a private program loop 10 D5 (2026-09-08): the 23-minute lag of loop 9 left NO log
+# bsv-low loop 10 D5 (2026-09-08): the 23-minute lag of loop 9 left NO log
 # line to read (observability was never enabled). Every cron line, every
 # courier fault and the per-tick tally are worth their storage.
 [observability]

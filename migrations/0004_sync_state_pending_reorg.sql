@@ -1,4 +1,4 @@
--- 0004: the deepest pending reorg fork height (a private program M19 R2 round 3,
+-- 0004: the deepest pending reorg fork height (bsv-low M19 R2 round 3,
 -- review MED-1, 2026-09-08). ADDITIVE and idempotent under wrangler's
 -- migration ledger; apply with `npx wrangler d1 migrations apply
 -- rust-chaintracks --remote` before deploying the build that ships with it.

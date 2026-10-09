@@ -2,7 +2,7 @@
 //! `cargo test` through their real code, against a real SQLite carrying the
 //! real migrations, with the tip-webhook transport recorded instead of sent.
 //!
-//! a private program M19B-G2 (2026-09-08). Before this, `insert_header` and
+//! bsv-low M19B-G2 (2026-09-08). Before this, `insert_header` and
 //! `handle_reorg` took the D1 binding, so the reorg producer was pinned only at
 //! the statement tier (each SQL constant executed by hand under rusqlite) and
 //! the pure tier; the round-3 gate accepted that as a pre-existing gap (plan
@@ -621,7 +621,7 @@ pub(crate) struct ScriptedChain {
     by_height: RefCell<HashMap<u32, BlockHeader>>,
     by_hash: RefCell<HashMap<String, BlockHeader>>,
     unavailable: Cell<bool>,
-    /// Every call, answered or refused (a private program loop 10 D5: the ladder's
+    /// Every call, answered or refused (bsv-low loop 10 D5: the ladder's
     /// per-tick skip of a faulting rung is pinned on this count).
     calls: Cell<u32>,
 }

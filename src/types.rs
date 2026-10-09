@@ -71,7 +71,7 @@ impl BlockHeader {
     /// overflowing or above the chain's `powLimit`; the claimed hash must be
     /// the hash of the 80 bytes (the store keys rows by it); the hash, read as
     /// a 256-bit number, at most the target. P0-4 (2026-10-08) made this the
-    /// check every path runs before a header is bound or stored (a private program loop
+    /// check every path runs before a header is bound or stored (bsv-low loop
     /// 10 D5 had it on the courier ladder alone, with the claimed hash).
     pub fn check_pow(&self, params: &ChainParams) -> Result<(), HeaderFault> {
         consensus::checked_target(self.bits, params)?;
@@ -251,7 +251,7 @@ pub struct ChaintracksInfo {
     /// an earlier shape, or not at all), round 5 LOW-2. Absent when healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_announce_schema_fault: Option<String>,
-    /// a private program loop 10 D5 (2026-09-08): how many blocks the store trails the
+    /// bsv-low loop 10 D5 (2026-09-08): how many blocks the store trails the
     /// highest tip any courier answered on the last cron (`last_seen_height`
     /// minus the stored tip, floored at 0). 0 is healthy; 1 for more than a
     /// few minutes is the loop-9 shape (a parent no courier served); absent

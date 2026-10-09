@@ -226,6 +226,13 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
             admin_revalidate(&db, env, &chain, &url).await
         }
 
+        // Admin (#33): is the active chain linked, from the genesis (or
+        // ?from=) to the tip (or ?to=). One pass, no checkpoint, no write.
+        (Method::Get, "/admin/linkcheck") => {
+            let url = req.url()?;
+            admin_linkcheck(&db, &url).await
+        }
+
         // Admin: export headers from D1 to R2
         (Method::Get, "/admin/export-r2") => {
             let url = req.url()?;
@@ -593,8 +600,11 @@ async fn handle_v2(
 /// Admin endpoint: ingest operator-pushed headers.
 /// Usage: POST /admin/ingest?start=942761 with the body a hex string of
 /// concatenated 80-byte headers (heights assigned sequentially from start).
-/// Every header runs through P0-4's checks. An authoritative replacement
-/// disconnects the old suffix and emits its reorg before serving the new tip.
+/// Every header runs through P0-4's checks (a refusal answers 422). The
+/// answer says what the push did (`storage::ingest_pushed`, #33): `outcome`
+/// is `active`, `activated` (the stored row at the next height commits to
+/// the push, so it replaced the row that was active) or `storedInactive`
+/// (no stored child commits to it; `reason` says so).
 async fn admin_ingest(
     db: &worker::D1Database,
     env: &Env,
@@ -625,21 +635,20 @@ async fn admin_ingest(
     }
     // P0-4: the operator's push meets the node's rules like any courier's.
     let params = crate::sync::chain_params(env, chain)?;
-    let inserted = match storage::insert_headers_batch(db, &params, &headers).await {
-        Ok(n) => n,
-        Err(e) => return wrap_error(&format!("{e}"), 422),
+    let out = match storage::ingest_pushed(db, &params, &headers).await {
+        Ok(out) => out,
+        Err(storage::IngestError::Refused(e)) => return wrap_error(&format!("{e}"), 422),
+        Err(storage::IngestError::Store(e)) => return Err(e),
     };
-    // Ingest is an authoritative canonical statement for each height: the
-    // pushed header becomes the active row and any competing row at that
-    // height (stale reorg branch, wipe debris) is deactivated ; observed
-    // live: a stale 952854 stayed active and failed isValidRootForHeight
-    // for the TRUE root, so wallet-infra rejected valid BEEFs.
-    let canonicalized = storage::canonicalize_heights(db, &headers).await?;
     wrap_success(serde_json::json!({
         "start": start,
         "parsed": headers.len(),
-        "inserted": inserted,
-        "canonicalized": canonicalized,
+        "inserted": out.inserted,
+        "canonicalized": out.canonicalized,
+        "outcome": out.outcome,
+        "deactivated": out.deactivated,
+        "childRelinked": out.child_relinked,
+        "reason": out.reason,
     }))
 }
 
@@ -797,9 +806,7 @@ async fn admin_bulk_sync(
 
     // Self-heal dual-active debris this bulk path can create (review M-3 ;
     // the sweep otherwise only runs on cron catch-up, which may be never).
-    crate::d1::Query::new(storage::SQL_DEDUPE_ACTIVE_HEIGHTS_INGEST)
-        .run(db)
-        .await?;
+    storage::dedupe_active_heights(db).await?;
     // #32: choose and publish the tip after the old debris is deactivated.
     storage::update_chain_tip_to_highest(db).await?;
 
@@ -850,6 +857,25 @@ async fn admin_revalidate(
         "validationComplete": state.complete,
         "validationFault": state.fault,
     }))
+}
+
+/// Admin endpoint (#33): `/admin/linkcheck?from=H&to=T`. Every height in
+/// `[from, to)` whose active row the next height does not name as its
+/// parent (`storage::link_check`); `from` defaults to the genesis, `to` to
+/// the highest active row.
+async fn admin_linkcheck(db: &worker::D1Database, url: &url::Url) -> Result<Response> {
+    let q = |k: &str| url.query_pairs().find(|(key, _)| key == k).map(|(_, v)| v);
+    let from = match q("from").map(|v| v.parse::<u32>()) {
+        None => 0,
+        Some(Ok(h)) => h,
+        Some(Err(_)) => return wrap_error("from must be a height", 400),
+    };
+    let to = match q("to").map(|v| v.parse::<u32>()) {
+        None => None,
+        Some(Ok(h)) if h >= from => Some(h),
+        Some(_) => return wrap_error("to must be a height at or above from", 400),
+    };
+    wrap_success(storage::link_check(db, from, to).await?)
 }
 
 /// Admin endpoint: export headers from D1 to R2 as bulk binary files.

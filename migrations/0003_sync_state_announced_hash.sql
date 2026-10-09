@@ -1,4 +1,4 @@
--- 0003: the last ANNOUNCED tip hash (a private program M19 R2 round 2, review H3,
+-- 0003: the last ANNOUNCED tip hash (bsv-low M19 R2 round 2, review H3,
 -- 2026-09-08). ADDITIVE and idempotent under wrangler's migration ledger;
 -- apply with `npx wrangler d1 migrations apply rust-chaintracks --remote`
 -- before deploying the build that ships with it (the pre-0003 build never

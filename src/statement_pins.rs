@@ -1,5 +1,5 @@
 //! Every statement the worker hands D1, pinned against the literal main
-//! `d2317f2` ran (a private program M19B-G2, 2026-09-08), so the `HeaderDb` seam can
+//! `d2317f2` ran (bsv-low M19B-G2, 2026-09-08), so the `HeaderDb` seam can
 //! never drift the worker path and the host harness apart on the text they
 //! execute. The goldens below were extracted from main's source BYTES with a
 //! script (Rust string literals folded the way rustc folds a `\`
@@ -14,9 +14,8 @@ use crate::storage::{
     sql_active_headers_from_to, sql_chain_tip, sql_header_for_hash, sql_header_for_id,
     sql_highest_active_header, RECORD_PENDING_REORG_SQL, SELECT_HEADER, SQL_ACTIVATE_HASH,
     SQL_CANONICALIZE_HEIGHT, SQL_CLEAR_CHAIN_TIP, SQL_COUNT_ACTIVE_ABOVE, SQL_COUNT_HEADERS,
-    SQL_DEACTIVATE_ABOVE, SQL_DEDUPE_ACTIVE_HEIGHTS, SQL_DEDUPE_ACTIVE_HEIGHTS_INGEST,
-    SQL_INSERT_HEADER, SQL_RELINK_HEADER, SQL_SET_CHAIN_TIP, SQL_SET_CHAIN_TIP_ACTIVE,
-    SQL_SET_CHAIN_WORK, SQL_SYNC_FRESHNESS,
+    SQL_DEACTIVATE_ABOVE, SQL_INSERT_HEADER, SQL_RELINK_HEADER, SQL_SET_CHAIN_TIP,
+    SQL_SET_CHAIN_TIP_ACTIVE, SQL_SET_CHAIN_WORK, SQL_SYNC_FRESHNESS,
 };
 use crate::storage::{SQL_ANNOUNCE_COUNTERS, SQL_ANNOUNCE_SCHEMA_PROBE, SQL_COUNT_DELIVERIES};
 use crate::sync::{
@@ -112,11 +111,13 @@ pub(crate) const MAIN_SET_CHAIN_WORK: &str =
 pub(crate) const MAIN_CANONICALIZE_HEIGHT: &str =
     "UPDATE headers SET is_active = CASE WHEN hash = ? THEN 1 ELSE 0 END WHERE height = ?";
 
-/// main d2317f2, sync.rs.
+/// main d2317f2, sync.rs. Retired by #33 (`CT33_DEDUPE_HEIGHT`): it kept the
+/// newest ingest whatever the next height extended. Kept here as the record
+/// of what main ran.
 pub(crate) const MAIN_DEDUPE_ACTIVE_HEIGHTS: &str =
     "UPDATE headers SET is_active = 0 WHERE is_active = 1 AND header_id NOT IN              (SELECT MAX(header_id) FROM headers WHERE is_active = 1 GROUP BY height)";
 
-/// main d2317f2, routes.rs.
+/// main d2317f2, routes.rs. Retired by #33 with its twin above.
 pub(crate) const MAIN_DEDUPE_ACTIVE_HEIGHTS_INGEST: &str =
     "UPDATE headers SET is_active = 0 WHERE is_active = 1 AND header_id NOT IN (SELECT MAX(header_id) FROM headers WHERE is_active = 1 GROUP BY height)";
 
@@ -272,8 +273,9 @@ fn the_header_reads_are_the_literals_main_ran() {
 }
 
 /// The header writes: the insert, the tip moves, the reorg's deactivate and
-/// activate, the orphan relink, the work repair, the operator canonicalize,
-/// the two dual-active self-heals (whitespace apart, both kept byte-exact).
+/// activate, the orphan relink, the work repair, the operator canonicalize.
+/// (The two dual-active self-heals main ran were retired by #33; see
+/// `the_ct33_statements_are_the_new_literals`.)
 #[test]
 fn the_header_writes_are_the_literals_main_ran() {
     assert_eq!(SQL_INSERT_HEADER, MAIN_INSERT_HEADER);
@@ -285,15 +287,6 @@ fn the_header_writes_are_the_literals_main_ran() {
     assert_eq!(SQL_RELINK_HEADER, MAIN_RELINK_HEADER);
     assert_eq!(SQL_SET_CHAIN_WORK, MAIN_SET_CHAIN_WORK);
     assert_eq!(SQL_CANONICALIZE_HEIGHT, MAIN_CANONICALIZE_HEIGHT);
-    assert_eq!(SQL_DEDUPE_ACTIVE_HEIGHTS, MAIN_DEDUPE_ACTIVE_HEIGHTS);
-    assert_eq!(
-        SQL_DEDUPE_ACTIVE_HEIGHTS_INGEST,
-        MAIN_DEDUPE_ACTIVE_HEIGHTS_INGEST
-    );
-    assert_ne!(
-        SQL_DEDUPE_ACTIVE_HEIGHTS, SQL_DEDUPE_ACTIVE_HEIGHTS_INGEST,
-        "two statements on main, whitespace apart; unify only by choosing one on purpose"
-    );
 }
 
 /// The sync_state statements: the announce decision, the pending-reorg
@@ -372,14 +365,14 @@ pub(crate) const ROUND4_VOCABULARY: [&str; 1] = [ROUND4_TIP_ANNOUNCE];
 pub(crate) const ROUND5_VOCABULARY: [&str; 2] =
     [ROUND5_ANNOUNCE_SCHEMA_PROBE, ROUND5_COUNT_DELIVERIES];
 
-/// a private program loop 10 D5 (2026-09-08), storage.rs: the courier health, read by /getInfo and by the idle cron (one read a tick).
+/// bsv-low loop 10 D5 (2026-09-08), storage.rs: the courier health, read by /getInfo and by the idle cron (one read a tick).
 pub(crate) const D5_COURIER_HEALTH: &str =
     "SELECT last_seen_height, last_seen_at, last_error, last_error_at FROM sync_state WHERE id = 1";
 
-/// a private program loop 10 D5, sync.rs: the highest courier tip of the tick, recorded on every cron.
+/// bsv-low loop 10 D5, sync.rs: the highest courier tip of the tick, recorded on every cron.
 pub(crate) const D5_RECORD_SEEN: &str =
     "UPDATE sync_state SET last_seen_height = ?1, last_seen_at = datetime('now') WHERE id = 1";
-/// a private program loop 10 D5, sync.rs: the last poll fault, recorded and never cleared.
+/// bsv-low loop 10 D5, sync.rs: the last poll fault, recorded and never cleared.
 pub(crate) const D5_RECORD_FAULT: &str =
     "UPDATE sync_state SET last_error = ?1, last_error_at = datetime('now') WHERE id = 1";
 /// The statements new in D5 (the cron's two records, the /getInfo read).
@@ -440,6 +433,56 @@ fn the_p04_statements_are_the_four_new_literals() {
             !MAIN_VOCABULARY.contains(&s)
                 && !ROUND5_VOCABULARY.contains(&s)
                 && !D5_VOCABULARY.contains(&s),
+            "{s}"
+        );
+    }
+}
+
+/// #33 (2026-10-09), storage.rs: the operator ingest sets the parent link of
+/// the stored child that commits to the pushed header.
+pub(crate) const CT33_LINK_CHILD: &str =
+    "UPDATE headers SET previous_header_id = (SELECT header_id FROM headers WHERE hash = ?1) WHERE hash = ?2";
+/// #33, storage.rs: the sweep's one read, the dual-active heights from the top.
+pub(crate) const CT33_DUAL_ACTIVE_HEIGHTS: &str =
+    "SELECT height FROM headers WHERE is_active = 1 GROUP BY height HAVING COUNT(*) > 1 ORDER BY height DESC LIMIT ?1";
+/// #33, storage.rs: one height's sweep, the extended row and only then the newest.
+pub(crate) const CT33_DEDUPE_HEIGHT: &str =
+    "UPDATE headers SET is_active = 0 WHERE height = ?1 AND is_active = 1 AND header_id != COALESCE((SELECT MAX(e.header_id) FROM headers e WHERE e.height = ?1 AND e.is_active = 1 AND EXISTS (SELECT 1 FROM headers c WHERE c.height = ?1 + 1 AND c.is_active = 1 AND c.previous_hash = e.hash)), (SELECT MAX(n.header_id) FROM headers n WHERE n.height = ?1 AND n.is_active = 1))";
+/// #33, storage.rs: the link check's read, the children whose parent by height is not the row they name.
+pub(crate) const CT33_BROKEN_LINKS: &str =
+    "SELECT c.height AS height, c.hash AS hash, c.previous_hash AS previous_hash, p.hash AS below FROM headers c LEFT JOIN headers p ON p.is_active = 1 AND p.height = c.height - 1 WHERE c.is_active = 1 AND c.height > ?1 AND c.height <= ?2 AND (p.hash IS NULL OR p.hash != c.previous_hash) ORDER BY c.height ASC LIMIT ?3";
+/// #33, storage.rs: the link check's count of active rows in its range.
+pub(crate) const CT33_COUNT_ACTIVE_BETWEEN: &str =
+    "SELECT COUNT(*) as cnt FROM headers WHERE is_active = 1 AND height >= ?1 AND height <= ?2";
+/// The statements new in #33.
+pub(crate) const CT33_VOCABULARY: [&str; 5] = [
+    CT33_LINK_CHILD,
+    CT33_DUAL_ACTIVE_HEIGHTS,
+    CT33_DEDUPE_HEIGHT,
+    CT33_BROKEN_LINKS,
+    CT33_COUNT_ACTIVE_BETWEEN,
+];
+
+/// The #33 statements are the literals above and nothing in any earlier vocabulary.
+#[test]
+fn the_ct33_statements_are_the_new_literals() {
+    assert_eq!(crate::storage::SQL_LINK_CHILD, CT33_LINK_CHILD);
+    assert_eq!(
+        crate::storage::SQL_DUAL_ACTIVE_HEIGHTS,
+        CT33_DUAL_ACTIVE_HEIGHTS
+    );
+    assert_eq!(crate::storage::SQL_DEDUPE_HEIGHT, CT33_DEDUPE_HEIGHT);
+    assert_eq!(crate::storage::SQL_BROKEN_LINKS, CT33_BROKEN_LINKS);
+    assert_eq!(
+        crate::storage::SQL_COUNT_ACTIVE_BETWEEN,
+        CT33_COUNT_ACTIVE_BETWEEN
+    );
+    for s in CT33_VOCABULARY {
+        assert!(
+            !MAIN_VOCABULARY.contains(&s)
+                && !ROUND5_VOCABULARY.contains(&s)
+                && !D5_VOCABULARY.contains(&s)
+                && !P04_VOCABULARY.contains(&s),
             "{s}"
         );
     }

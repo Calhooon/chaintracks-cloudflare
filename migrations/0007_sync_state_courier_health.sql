@@ -1,4 +1,4 @@
--- a private program loop 10 D5 (2026-09-08): the courier health the cron records on
+-- bsv-low loop 10 D5 (2026-09-08): the courier health the cron records on
 -- every pass, served on /getInfo. `last_seen_height` is the highest tip any
 -- courier answered (with its time); `last_error` the LAST poll fault, with its
 -- time, never cleared (a reader judges it by its age). The 965877 same-height

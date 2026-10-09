@@ -1,4 +1,4 @@
--- 0002: the composite (is_active, height) index (a private program M19-5, issue #428,
+-- 0002: the composite (is_active, height) index (bsv-low M19-5, issue #428,
 -- 2026-09-08). ADDITIVE and idempotent; apply with
 -- `npx wrangler d1 migrations apply rust-chaintracks --remote` before or after
 -- deploying the build that ships with it (the queries are unchanged in shape).

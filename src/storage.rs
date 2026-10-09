@@ -123,7 +123,7 @@ pub(crate) fn sql_active_headers_between() -> String {
     )
 }
 
-// ─── The writes and the sync_state reads, named (a private program M19B-G2, 2026-09-08) ─
+// ─── The writes and the sync_state reads, named (bsv-low M19B-G2, 2026-09-08) ─
 // Each is the literal its call site carried inline before; naming them changed
 // no byte of any statement, and `statement_pins.rs` holds every one against
 // the literal main `d2317f2` ran, so the worker path and the host harness can
@@ -136,7 +136,7 @@ pub(crate) const SQL_COUNT_HEADERS: &str = "SELECT COUNT(*) as cnt FROM headers"
 pub(crate) const SQL_SYNC_FRESHNESS: &str =
     "SELECT last_synced_height, updated_at FROM sync_state WHERE id = 1";
 
-/// a private program loop 10 D5: the courier health (migration 0007) on `/getInfo`.
+/// bsv-low loop 10 D5: the courier health (migration 0007) on `/getInfo`.
 pub(crate) const SQL_COURIER_HEALTH: &str =
     "SELECT last_seen_height, last_seen_at, last_error, last_error_at FROM sync_state WHERE id = 1";
 
@@ -188,21 +188,31 @@ pub(crate) const SQL_RELINK_HEADER: &str =
 /// Rewrite one header's cumulative work (the repair walk).
 pub(crate) const SQL_SET_CHAIN_WORK: &str = "UPDATE headers SET chain_work = ? WHERE header_id = ?";
 
+/// Set a row's parent link to the row with the parent's hash (the operator
+/// ingest, #33). Binds: ?1 the parent's hash, ?2 the child's hash.
+pub(crate) const SQL_LINK_CHILD: &str =
+    "UPDATE headers SET previous_header_id = (SELECT header_id FROM headers WHERE hash = ?1) \
+     WHERE hash = ?2";
+
 /// Make one hash the single active row at its height (operator ingest).
 pub(crate) const SQL_CANONICALIZE_HEIGHT: &str =
     "UPDATE headers SET is_active = CASE WHEN hash = ? THEN 1 ELSE 0 END \
      WHERE height = ?";
 
-/// Keep the newest ingest where two rows are active at one height (the cron's
-/// catch-up self-heal, audit C3). The ingest route's copy below differs in
-/// whitespace only; both are kept byte-exact.
-pub(crate) const SQL_DEDUPE_ACTIVE_HEIGHTS: &str =
-    "UPDATE headers SET is_active = 0 WHERE is_active = 1 AND header_id NOT IN              (SELECT MAX(header_id) FROM headers WHERE is_active = 1 GROUP BY height)";
+/// The heights that carry more than one active row, highest first (the
+/// sweep's one read; seeks `idx_headers_active_height`). Bind: the limit.
+pub(crate) const SQL_DUAL_ACTIVE_HEIGHTS: &str =
+    "SELECT height FROM headers WHERE is_active = 1 GROUP BY height HAVING COUNT(*) > 1 \
+     ORDER BY height DESC LIMIT ?1";
 
-/// The same self-heal as run by the operator ingest route (review M-3).
-pub(crate) const SQL_DEDUPE_ACTIVE_HEIGHTS_INGEST: &str =
-    "UPDATE headers SET is_active = 0 WHERE is_active = 1 AND header_id NOT IN \
-     (SELECT MAX(header_id) FROM headers WHERE is_active = 1 GROUP BY height)";
+/// One height's sweep (#33): keep the row an active row at the next height
+/// names as its parent; only when no row there is so named, the newest
+/// ingest. Bind: ?1 the height.
+pub(crate) const SQL_DEDUPE_HEIGHT: &str =
+    "UPDATE headers SET is_active = 0 WHERE height = ?1 AND is_active = 1 AND header_id != COALESCE(\
+     (SELECT MAX(e.header_id) FROM headers e WHERE e.height = ?1 AND e.is_active = 1 AND EXISTS \
+     (SELECT 1 FROM headers c WHERE c.height = ?1 + 1 AND c.is_active = 1 AND c.previous_hash = e.hash)), \
+     (SELECT MAX(n.header_id) FROM headers n WHERE n.height = ?1 AND n.is_active = 1))";
 
 // ─── Reads ──────────────────────────────────────────────────────────────────
 
@@ -384,7 +394,7 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
         }
     }
 
-    // a private program loop 10 D5: the courier health, loud on a read fault like the
+    // bsv-low loop 10 D5: the courier health, loud on a read fault like the
     // freshness read (a missing column names itself; the tip sync itself never
     // depends on these columns, so a deploy before the migration still syncs).
     #[derive(serde::Deserialize)]
@@ -785,7 +795,7 @@ pub(crate) async fn handle_reorg(
     for hash in &branch_hashes {
         batch.add(SQL_ACTIVATE_HASH, vec![QVal::Text(hash.clone())]);
     }
-    // a private program M19 R2 round 3 (review MED-1): record the lowest CHANGED height
+    // bsv-low M19 R2 round 3 (review MED-1): record the lowest CHANGED height
     // (ancestor_height + 1) so the next winning tip announce can carry it as
     // `reorgFrom`. MIN-accumulate: several reorgs between two announces keep
     // the deepest fork. The overlay's targeted re-verify then covers the
@@ -1161,33 +1171,148 @@ pub async fn insert_headers_batch(
     Ok(inserted)
 }
 
-/// Make each pushed header the single active row at its height: activate the
-/// row with the matching hash, deactivate any competitor. Used by the
-/// operator ingest path to repair stale-branch/wipe debris.
-pub async fn canonicalize_heights(
+/// What `POST /admin/ingest` did with a push (#33): the answer the route serves.
+#[derive(Debug, Default)]
+pub struct IngestOutcome {
+    /// The writer's count, as before #33: rows written on the path that
+    /// selects a branch; on the batch path every header of the push, a header
+    /// already stored included (`INSERT OR IGNORE` writes nothing for it).
+    pub inserted: u32,
+    /// Pushed heights whose single active row is the pushed header after the call.
+    pub canonicalized: u32,
+    /// `"active"`: the pushed rows are the active rows and no other row is
+    /// active at their heights (a tip extension, a gap filled, a push of what
+    /// the store already serves). `"activated"`: a stored child commits to
+    /// the push, so it replaced what was active. `"storedInactive"`: no
+    /// stored child commits to it, so it is a competitor and nothing else.
+    pub outcome: &'static str,
+    /// The hashes this call took off the active chain.
+    pub deactivated: Vec<String>,
+    /// The hash of the row at the next height whose parent link was set.
+    pub child_relinked: Option<String>,
+    /// Why the push is `"storedInactive"`.
+    pub reason: Option<String>,
+}
+
+/// A push the rules refused (the route's 422; nothing was written) or a
+/// store fault after them (the route's 500).
+#[derive(Debug)]
+pub enum IngestError {
+    Refused(worker::Error),
+    Store(worker::Error),
+}
+
+/// The most headers one push may activate: the activation is one D1
+/// transaction, bounded like the reorg walk's (`find_common_ancestor`).
+pub(crate) const MAX_ACTIVATION: usize = 400;
+
+/// The operator's push (`POST /admin/ingest`), #33.
+///
+/// 1. Every header meets the node's rules through `insert_headers_batch`
+///    (proof of work, the difficulty rule, the checkpoints, the run linked to
+///    a stored parent); a refusal writes nothing. Where an active row already
+///    stands at a pushed height the rows go through `insert_header`, the live
+///    branch selection: a push that outworks the tip reorgs to it like any
+///    courier's header, with its events.
+/// 2. Pushed rows that are the only active rows at their heights: `"active"`.
+/// 3. Otherwise the stored chain decides, never the operator's word: when
+///    the active row at the next height names the last pushed header as its
+///    parent, and the push stands on the active row below it, the pushed rows
+///    become the active rows at their heights, every other row there
+///    inactive, the child's `previous_header_id` set, in one transaction. The
+///    tip and every row above are untouched (they committed to the push all
+///    along); `pending_reorg_from` records the lowest height whose served row
+///    changed, so the next tip announce tells consumers to re-verify from it.
+/// 4. When no stored child commits to the push it stays as the insert left
+///    it, inactive, and the answer says why.
+///
+/// Before #33 the route forced the push active through the reorg walk from
+/// the pushed header: more than 400 below the tip the walk found no ancestor
+/// and the route answered 500 after the insert (production, 956433,
+/// 2026-10-09); nearer the tip it deactivated every block above the push.
+pub async fn ingest_pushed(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> Result<IngestOutcome, IngestError> {
+    let inserted = insert_headers_batch(db, params, headers)
+        .await
+        .map_err(IngestError::Refused)?;
+    canonicalize_pushed(db, headers, inserted)
+        .await
+        .map_err(IngestError::Store)
+}
+
+async fn canonicalize_pushed(
     db: &impl HeaderDb,
     headers: &[BlockHeader],
-) -> worker::Result<u32> {
-    // An authoritative replacement disconnects the old suffix. Keeping its
-    // descendants active after replacing their ancestor leaves false roots
-    // below an unrelated tip, and no truthful reorg view can describe that.
-    if let (Some(last), Some(tip)) = (headers.last(), find_chain_tip(db).await?) {
-        let mut replaces = false;
-        for header in headers {
-            #[derive(serde::Deserialize)]
-            struct Count {
-                cnt: f64,
-            }
-            let count: Option<Count> = Query::new("SELECT COUNT(*) AS cnt FROM headers WHERE height = ? AND is_active = 1 AND hash != ?")
-                .bind(header.height).bind(&*header.hash).first(db).await?;
-            replaces |= count.is_some_and(|c| c.cnt > 0.0);
-        }
-        if replaces {
-            handle_reorg(db, last, &tip).await?;
+    inserted: u32,
+) -> worker::Result<IngestOutcome> {
+    let mut out = IngestOutcome {
+        inserted,
+        outcome: "active",
+        ..Default::default()
+    };
+    let (Some(first), Some(last)) = (headers.first(), headers.last()) else {
+        return Ok(out);
+    };
+    let pushed = |r: &BlockHeader| headers.iter().any(|h| h.hash.eq_ignore_ascii_case(&r.hash));
+    let active: Vec<BlockHeader> = Query::new(sql_active_headers_between())
+        .bind(first.height)
+        .bind(last.height + 1)
+        .all::<HeaderRow>(db)
+        .await?
+        .into_iter()
+        .map(HeaderRow::into_block_header)
+        .collect();
+    let rivals: Vec<&BlockHeader> = active
+        .iter()
+        .filter(|r| r.height <= last.height && !pushed(r))
+        .collect();
+    let sole_active = |h: &BlockHeader| {
+        active
+            .iter()
+            .filter(|r| r.height == h.height)
+            .all(|r| r.hash.eq_ignore_ascii_case(&h.hash))
+            && active.iter().any(|r| r.hash.eq_ignore_ascii_case(&h.hash))
+    };
+    out.canonicalized = headers.iter().filter(|h| sole_active(h)).count() as u32;
+    if out.canonicalized as usize == headers.len() {
+        // The batch writer sets no tip; a push that extended the chain does here.
+        update_chain_tip_to_highest(db).await?;
+        return Ok(out);
+    }
+
+    out.outcome = "storedInactive";
+    let child = active
+        .iter()
+        .find(|r| r.height == last.height + 1 && r.previous_hash.eq_ignore_ascii_case(&last.hash));
+    let Some(child) = child else {
+        out.reason = Some(format!(
+            "the active row at height {} does not name the pushed header {} as its parent",
+            last.height + 1,
+            last.hash
+        ));
+        return Ok(out);
+    };
+    if first.height > 0 {
+        let parent = find_header_for_hash(db, &first.previous_hash).await?;
+        if parent.is_some_and(|p| !p.is_active) {
+            out.reason = Some(format!(
+                "the parent {} of the pushed header at height {} is not the active row below it",
+                first.previous_hash, first.height
+            ));
+            return Ok(out);
         }
     }
+    if headers.len() > MAX_ACTIVATION {
+        out.reason = Some(format!(
+            "an activation is one transaction of at most {MAX_ACTIVATION} headers; push the run in parts, the highest part first"
+        ));
+        return Ok(out);
+    }
+
     let mut batch = BatchCollector::new(db);
-    let mut n = 0u32;
     for header in headers {
         batch.add(
             SQL_CANONICALIZE_HEIGHT,
@@ -1196,17 +1321,207 @@ pub async fn canonicalize_heights(
                 QVal::Int(header.height as i64),
             ],
         );
-        n += 1;
-        if batch.len() >= 100 {
-            batch.execute().await?;
-            batch = BatchCollector::new(db);
+    }
+    batch.add(
+        SQL_LINK_CHILD,
+        vec![
+            QVal::Text(last.hash.clone()),
+            QVal::Text(child.hash.clone()),
+        ],
+    );
+    if let Some(lowest) = rivals.iter().map(|r| r.height).min() {
+        batch.add(RECORD_PENDING_REORG_SQL, vec![QVal::Int(lowest as i64)]);
+    }
+    batch.execute_atomic().await?;
+
+    out.outcome = "activated";
+    out.canonicalized = headers.len() as u32;
+    out.deactivated = rivals.iter().map(|r| r.hash.clone()).collect();
+    out.child_relinked = Some(child.hash.clone());
+    Ok(out)
+}
+
+/// The most dual-active heights one sweep settles (ten D1 batches); a
+/// store with more is finished by the next sweep, from where this one stopped.
+pub(crate) const DEDUPE_HEIGHTS_PER_SWEEP: u32 = 1000;
+
+/// The self-heal of dual-active heights (the bulk paths can leave two active
+/// rows at one height; audit C3, review M-3): exactly one active row may
+/// stand per height. #33: the row kept is the one the active row at the next
+/// height names as its parent, and only where no row is so named the newest
+/// ingest. The heights are settled from the top down, each in the batch
+/// after the one above it, so a height asks which of its rows the next
+/// height extends only once that height holds one row.
+///
+/// Before #33 this was one statement that kept the highest `header_id` per
+/// height: at 956433 on 2026-07-02 the orphan was inserted after the chain's
+/// block and stayed the served row for three months.
+///
+/// Answers the rows deactivated. A store with no dual-active height costs
+/// the one read.
+pub async fn dedupe_active_heights(db: &impl HeaderDb) -> worker::Result<u32> {
+    #[derive(serde::Deserialize)]
+    struct Height {
+        height: f64,
+    }
+    let heights: Vec<Height> = Query::new(SQL_DUAL_ACTIVE_HEIGHTS)
+        .bind(DEDUPE_HEIGHTS_PER_SWEEP + 1)
+        .all(db)
+        .await?;
+    if heights.len() as u32 > DEDUPE_HEIGHTS_PER_SWEEP {
+        log!(
+            "dedupe: more than {DEDUPE_HEIGHTS_PER_SWEEP} dual-active heights; settling the highest {DEDUPE_HEIGHTS_PER_SWEEP}, the next sweep continues"
+        );
+    }
+    let mut swept = 0u32;
+    for h in heights.iter().take(DEDUPE_HEIGHTS_PER_SWEEP as usize) {
+        // One statement a height, in order: the next height is settled first.
+        swept += Query::new(SQL_DEDUPE_HEIGHT)
+            .bind(h.height as u32)
+            .run_changes(db)
+            .await?;
+    }
+    Ok(swept)
+}
+
+// ─── #33: the link check ────────────────────────────────────────────────────
+
+/// One height whose active row the next height does not name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokenLink {
+    /// The height whose active row is not the parent the next height names.
+    pub height: u32,
+    /// The active row's hash at `height`; `None` when no row is active there.
+    pub active: Option<String>,
+    /// The parent the active row at `height + 1` commits to.
+    pub next_names: String,
+    /// The hash of that row at `height + 1`.
+    pub next: String,
+}
+
+/// The answer of `GET /admin/linkcheck`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkReport {
+    pub from: u32,
+    pub to: u32,
+    /// Active rows in `[from, to]`: `to - from + 1` on a store with one row a height.
+    pub rows: u64,
+    /// No broken link in `[from, to]`, and the walk reached `to`.
+    pub linked: bool,
+    pub broken: Vec<BrokenLink>,
+    /// The walk stopped at `LINK_MAX_BROKEN` entries; ask again from `checked_through`.
+    pub truncated: bool,
+    /// Every link below this height was examined (`to` when not truncated).
+    pub checked_through: u32,
+}
+
+/// The children in `(?1, ?2]` whose parent by height is not the row they
+/// name: the active row at `height - 1` carries another hash, or no row is
+/// active there. Seeks `idx_headers_active_height` for the range and again
+/// for each parent. Binds: ?1 the floor, ?2 the last height, ?3 the limit.
+pub(crate) const SQL_BROKEN_LINKS: &str =
+    "SELECT c.height AS height, c.hash AS hash, c.previous_hash AS previous_hash, p.hash AS below \
+     FROM headers c LEFT JOIN headers p ON p.is_active = 1 AND p.height = c.height - 1 \
+     WHERE c.is_active = 1 AND c.height > ?1 AND c.height <= ?2 \
+     AND (p.hash IS NULL OR p.hash != c.previous_hash) ORDER BY c.height ASC LIMIT ?3";
+
+/// The active rows in `[?1, ?2]` (read from the index alone).
+pub(crate) const SQL_COUNT_ACTIVE_BETWEEN: &str =
+    "SELECT COUNT(*) as cnt FROM headers WHERE is_active = 1 AND height >= ?1 AND height <= ?2";
+
+/// Heights one read of the link check covers.
+pub(crate) const LINK_SPAN: u32 = 50_000;
+
+/// The most broken links one answer carries.
+pub(crate) const LINK_MAX_BROKEN: usize = 1000;
+
+/// The link check (`GET /admin/linkcheck?from=H&to=T`, #33): is the active
+/// chain linked. It walks the active rows from `from` (the genesis when not
+/// given) to `to` (the highest active row when not given) and reports every
+/// height whose active row the next height does not name as its parent: a
+/// row the chain does not extend (956433 on production until 2026-10-09), a
+/// height with no active row under an active one, the second active row of a
+/// dual-active height. One pass, no checkpoint, no rule but the link, and no
+/// write: the fast question. Whether every header passes the node's rules is
+/// the re-validation's slow one (`revalidate_step`), which anchors at a
+/// checkpoint and stops at its first fault.
+pub async fn link_check(
+    db: &impl HeaderDb,
+    from: u32,
+    to: Option<u32>,
+) -> worker::Result<LinkReport> {
+    link_check_spans(db, from, to, LINK_SPAN).await
+}
+
+pub(crate) async fn link_check_spans(
+    db: &impl HeaderDb,
+    from: u32,
+    to: Option<u32>,
+    span: u32,
+) -> worker::Result<LinkReport> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        height: f64,
+        hash: String,
+        previous_hash: String,
+        below: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Count {
+        cnt: f64,
+    }
+    let to = match to {
+        Some(to) => to,
+        None => Query::new(sql_highest_active_header())
+            .first::<HeaderRow>(db)
+            .await?
+            .map_or(from, |r| r.into_block_header().height),
+    }
+    .max(from);
+    let rows = Query::new(SQL_COUNT_ACTIVE_BETWEEN)
+        .bind(from)
+        .bind(to)
+        .first::<Count>(db)
+        .await?
+        .map_or(0, |c| c.cnt as u64);
+    let mut report = LinkReport {
+        from,
+        to,
+        rows,
+        linked: false,
+        broken: Vec::new(),
+        truncated: false,
+        checked_through: to,
+    };
+    let mut lo = from;
+    while lo < to {
+        let hi = lo.saturating_add(span.max(1)).min(to);
+        let room = LINK_MAX_BROKEN - report.broken.len();
+        let found: Vec<Row> = Query::new(SQL_BROKEN_LINKS)
+            .bind(lo)
+            .bind(hi)
+            .bind(room as u32 + 1)
+            .all(db)
+            .await?;
+        report.truncated = found.len() > room;
+        report
+            .broken
+            .extend(found.into_iter().take(room).map(|r| BrokenLink {
+                height: r.height as u32 - 1,
+                active: r.below,
+                next_names: r.previous_hash,
+                next: r.hash,
+            }));
+        if report.truncated {
+            report.checked_through = report.broken.last().map_or(lo, |b| b.height);
+            break;
         }
+        lo = hi;
     }
-    if !batch.is_empty() {
-        batch.execute().await?;
-    }
-    update_chain_tip_to_highest(db).await?;
-    Ok(n)
+    report.linked = report.broken.is_empty();
+    Ok(report)
 }
 
 // ─── P0-4: the node's context rules on the store ────────────────────────────
@@ -1823,6 +2138,48 @@ mod tests {
             // The tip itself keeps its own one-row index.
             let tip = plan(&db, &sql_chain_tip(), &[]);
             assert!(tip.contains("idx_headers_tip"), "{tip}");
+        }
+
+        /// #33: the sweep's read walks the composite index in height order
+        /// (the active set once, no sort), and one height's sweep seeks its
+        /// height in every branch, never the active set.
+        #[test]
+        fn the_sweep_reads_the_index_in_order_and_seeks_each_height() {
+            let db = migrated_db();
+            let read = plan(&db, SQL_DUAL_ACTIVE_HEIGHTS, &[&1001u32]);
+            assert!(read.contains("idx_headers_active_height"), "{read}");
+            assert!(!read.contains("TEMP B-TREE"), "{read}");
+            let sweep = plan(&db, SQL_DEDUPE_HEIGHT, &[&956_433u32]);
+            assert!(!sweep.contains("SCAN"), "{sweep}");
+            assert!(
+                sweep
+                    .matches("idx_headers_active_height (is_active=? AND height=?)")
+                    .count()
+                    >= 4,
+                "the row, the extended row, its child and the newest each seek a height:\n{sweep}"
+            );
+        }
+
+        /// #33: the link check reads the range from the composite index and
+        /// seeks each parent by height; the count reads the index alone.
+        #[test]
+        fn the_link_check_seeks_the_range_and_each_parent() {
+            let db = migrated_db();
+            let p = plan(&db, SQL_BROKEN_LINKS, &[&0u32, &50_000u32, &1001u32]);
+            assert!(
+                p.contains("idx_headers_active_height (is_active=? AND height>? AND height<?)"),
+                "{p}"
+            );
+            assert!(
+                p.contains("idx_headers_active_height (is_active=? AND height=?)"),
+                "{p}"
+            );
+            assert!(!p.contains("SCAN") && !p.contains("TEMP B-TREE"), "{p}");
+            let c = plan(&db, SQL_COUNT_ACTIVE_BETWEEN, &[&0u32, &50_000u32]);
+            assert!(
+                c.contains("COVERING INDEX idx_headers_active_height"),
+                "{c}"
+            );
         }
 
         /// The RED side on the same fixture: without the composite index the

@@ -1,4 +1,4 @@
-//! a private program loop 10 D5 (2026-09-08): the courier ladder for the LIVE sync path.
+//! bsv-low loop 10 D5 (2026-09-08): the courier ladder for the LIVE sync path.
 //!
 //! Loop 9 (2026-09-08 15:53Z): a same-height competition at 965877 left this
 //! store 23 min behind the network. ONE courier (WhatsOnChain) fed the live

@@ -262,7 +262,7 @@ without acknowledging the cursor or silently reconnecting; a client with
 no feed polls only the heights of the proofs it holds."
 
 [D] Tracker `ChainEvent` must map the six kinds, target the affected proof
-heights/hash, mark them suspect/stale and re-ask. a private program must re-verify and
+heights/hash, mark them suspect/stale and re-ask. Zanaadu must re-verify and
 rewrite stored heights, invalidate block-time/served-fact caches, withdraw
 stale confirmed views, and display the tracker's checked word. Tip age feeds
 its freshness guard. Wallet/overlay consumers need their own targeted proof
@@ -274,7 +274,7 @@ move `headers_proofs.wire_change` unknown -> rule,
 `headers_proofs.tip_stale` gap -> rule with these proofs. Keep
 `headers_proofs.proof_stale` gap and `wallet.reorg_done` gap until proof
 holders consume and re-check; keep `app_layer.reorg_done` unknown and
-`app_layer.tip_stale` unknown until a private program runs. No matrix file was edited.
+`app_layer.tip_stale` unknown until Zanaadu runs. No matrix file was edited.
 
 [D] Rollback: drop the six named 0009 triggers as shown in CHAIN-EVENTS.md,
 restore the P0-4 Worker, and retain the journal/cursors for investigation.

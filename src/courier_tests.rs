@@ -1,4 +1,4 @@
-//! a private program loop 10 D5 (2026-09-08): the same-height competition at 965877
+//! bsv-low loop 10 D5 (2026-09-08): the same-height competition at 965877
 //! (loop 9) left chaintracks' header store 23 min behind the network while
 //! nothing recorded why (no observability, and a poll fault aborted the cron
 //! on `?` before its tail). The cron on the host, RED-first: a courier fault
