@@ -26,6 +26,11 @@ UPSTREAM_CHAINTRACKS_URL = "https://api.calhouninfra.com"
 # `APP_LAYER=https://your-worker.your-account.workers.dev/internal/tip-changed`
 # (+ its binding) at promotion.
 TIP_WEBHOOK_URLS = "APP_LAYER_BETA=https://your-worker.your-account.workers.dev/internal/tip-changed,APP_LAYER=https://your-worker.your-account.workers.dev/internal/tip-changed"
+# E5 (bsv-stack-lean LINE.md step 6, the owner's deploy number of 2026-10-11): the
+# quiet window behind a live stream that pushed nothing is one minute, not the
+# code's ten (TIP_STREAM_QUIET_S default 600): a peer alive but silent leaves the
+# tip at most a minute behind before the poll asks.
+TIP_STREAM_QUIET_S = "60"
 
 # Service binding for the tip webhook above. `service` is a worker name, not
 # a secret.
