@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+### L2: the readable build and isolated beta
+
+- **The build.** `GET /health` answers the service, status and build revision,
+  dirty flag, UTC build time and `crates`: this crate's own version, and the
+  lockfile's `bsv-rs` only when the lock carries it (this service has no such
+  dependency today, so the key is absent, never a guess). An export without
+  git answers `unknown` for the revision. `/getInfo` stays as it is.
+- **The beta.** Its own D1, R2 and `TipStream`, the minute cron, no tip webhook
+  or app-layer service binding. Resource and endpoint placeholders are rendered
+  privately by the captain; `docs/BETA.md` records bootstrap and deploy steps.
+- **The proof.** A host shape test and a compiled-Worker health check without
+  a database binding or outbound access.
+
 
 ### E5: the push source (Rule 28), 2026-10-09
 

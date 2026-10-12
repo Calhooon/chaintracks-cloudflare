@@ -82,3 +82,34 @@ crons = ["* * * * *"]
 [observability]
 enabled = true
 head_sampling_rate = 1
+
+# Beta is isolated: never push tips into LOW's production app layers.
+# Services are not inherited; deliberately no env.beta.services.
+[env.beta]
+name = "rust-chaintracks-beta"
+
+[env.beta.vars]
+CHAIN = "main"
+ARCADE_URL = "<your-arcade-url>"
+BITAILS_URL = "<your-bitails-url>"
+UPSTREAM_CHAINTRACKS_URL = "<your-upstream-chaintracks-url>"
+TIP_WEBHOOK_URLS = ""
+TIP_STREAM_QUIET_S = "60"
+
+[[env.beta.d1_databases]]
+binding = "DB"
+database_name = "rust-chaintracks-beta"
+database_id = "<your-d1-database-id>"
+
+[[env.beta.r2_buckets]]
+binding = "BULK_HEADERS"
+bucket_name = "<your-bulk-headers-beta-bucket>"
+
+# Migrations inherit the top-level e5-tip-stream tag; bindings do not.
+# No script_name: this class belongs to the beta Worker, not production.
+[[env.beta.durable_objects.bindings]]
+name = "TIP_STREAM"
+class_name = "TipStream"
+
+[env.beta.triggers]
+crons = ["* * * * *"]

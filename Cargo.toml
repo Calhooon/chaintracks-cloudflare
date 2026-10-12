@@ -1,6 +1,6 @@
 [package]
 name = "rust-chaintracks"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
@@ -27,3 +27,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # Dev-only: the header query shapes are planned on a real SQLite with the real
 # migrations (storage.rs plan pins). Never compiled into the worker.
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[build-dependencies]
+chrono = "0.4"

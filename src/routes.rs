@@ -75,6 +75,10 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         return cors_preflight();
     }
 
+    if method == Method::Get && path == "/health" {
+        return Response::from_json(&crate::health::health()).map(add_cors);
+    }
+
     let chain = match env
         .var("CHAIN")
         .map(|v| v.to_string())

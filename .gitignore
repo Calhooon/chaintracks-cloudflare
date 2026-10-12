@@ -11,7 +11,7 @@ Cargo.lock
 .dev.vars
 
 # Node
-node_modules/
+/node_modules
 
 # Seed data (large binary files)
 /seed/*.sql
