@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1
+
+- Fix bulk bootstrap across a legacy retarget: load the stored ancestry
+  needed by every header in the batch, accounting for ancestors supplied
+  by the batch itself. The span at 100000 now reaches the stored interval
+  needed at 100800. Proof of work, difficulty and checkpoint rules are
+  unchanged; a truly missing ancestor still refuses the entire batch.
+- Add a compiled-Worker Miniflare witness with the two cached public
+  100,000-header files, plus host tests for split retarget windows and a
+  missing stored ancestor. No migration or caller change.
+
 ## 0.3.0
 
 ### L2: the readable build and isolated beta

@@ -297,6 +297,57 @@ async fn real_mainnet_emergency_adjustments_and_a_retarget_pass_under_the_node_c
     );
 }
 
+/// The retarget at 479808 reads stored ancestry back to 477792 even when
+/// the batch opens between retargets. Bulk rows have no parent IDs; their
+/// active hash-linked run must provide the same window as one whole batch.
+#[tokio::test]
+async fn a_bulk_span_crossing_a_retarget_reads_the_stored_interval() {
+    let chain = run(MAIN_477792, 477_792);
+    let params = ChainParams::main();
+    for start in [479_000, 479_800, 479_808] {
+        let db = SqliteDb::migrated();
+        let split = (start - 477_792) as usize;
+        insert_headers_batch(&db, &params, &chain[..split])
+            .await
+            .unwrap();
+        crate::storage::update_chain_tip_to_highest(&db)
+            .await
+            .unwrap();
+        insert_headers_batch(&db, &params, &chain[split..])
+            .await
+            .unwrap();
+        assert_eq!(count_rows(&db).await, chain.len() as i64);
+    }
+}
+
+/// Loading the larger window cannot invent an ancestor: a real hole at
+/// the retarget's lower bound refuses the entire following span.
+#[tokio::test]
+async fn a_bulk_span_crossing_a_retarget_refuses_a_stored_hole() {
+    let chain = run(MAIN_477792, 477_792);
+    let params = ChainParams::main();
+    let db = SqliteDb::migrated();
+    let split = (479_000 - 477_792) as usize;
+    insert_headers_batch(&db, &params, &chain[..split])
+        .await
+        .unwrap();
+    crate::storage::update_chain_tip_to_highest(&db)
+        .await
+        .unwrap();
+    db.conn()
+        .execute("DELETE FROM headers WHERE height = 477792", [])
+        .unwrap();
+    let before = count_rows(&db).await;
+    let e = insert_headers_batch(&db, &params, &chain[split..])
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{e}").contains("at 479808: ancestry-missing: no stored ancestor at 477792"),
+        "{e}"
+    );
+    assert_eq!(count_rows(&db).await, before, "a refusal writes no rows");
+}
+
 /// Mainnet 501984..=504031: anchored at 502000, so 502001..=504031 are
 /// checked: the two-week retarget at 504000 (its window reaches back to
 /// 501984) and the node's checkpoint 504031, the DAA activation block.

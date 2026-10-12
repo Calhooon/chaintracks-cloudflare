@@ -1006,7 +1006,19 @@ pub async fn insert_headers_batch(
                     first.height, p.hash, p.height
                 )));
             }
-            load_window(db, p, params.window_depth(p.height)).await?
+            // Later headers may need a deeper window (a legacy retarget).
+            // Subtract the ancestors supplied by this linked batch, then
+            // load enough stored ancestry for every context check below.
+            let depth = headers
+                .iter()
+                .map(|h| {
+                    params
+                        .window_depth(h.height - 1)
+                        .saturating_sub(h.height - first.height)
+                })
+                .max()
+                .unwrap_or(1);
+            load_window(db, p, depth).await?
         }
         None => {
             if first.height == 0 || first.previous_hash == "0".repeat(64) {
