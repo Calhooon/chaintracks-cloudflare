@@ -73,6 +73,9 @@ jobs:
     - run: cargo install worker-build@0.7.5 --locked
     - run: worker-build --release
   worker:
+    env:
+      # the bootstrap witness caches its two bulk files under the target dir (tests/worker_bootstrap.mjs)
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     name: worker
     runs-on: ubuntu-latest
     steps:
