@@ -26,10 +26,14 @@ use crate::types::BlockHeader;
 /// on a stored row: the live path's bound (`sync::insert_with_parent_backfill`,
 /// the TS reference's `addLiveRecursionLimit`). A pushed tip further than
 /// this above the store is refused; the minute poll's catch-up covers it.
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) const PARENT_WALK_LIMIT: usize = 36;
 
 /// What the door did with one pushed header.
 #[derive(Debug)]
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) struct Announced {
     /// `"known"`: the pushed header is already the active row at its height
     /// (a stream's opening tip after a reconnect); nothing was written.
@@ -45,6 +49,8 @@ pub(crate) struct Announced {
     pub reason: Option<String>,
 }
 
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl Announced {
     /// The push changed the store (a header written, or a row activated).
     pub fn stored(&self) -> bool {
@@ -61,6 +67,8 @@ impl Announced {
 /// (`sync_state.last_error`, `/getInfo`). After a write the announced height
 /// is recorded as the couriers' is (`/getPresentHeight`) and the tip is
 /// announced to the consumers (`sync::announce_tip`).
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) async fn ingest_announced(
     db: &impl HeaderDb,
     params: &ChainParams,
@@ -131,6 +139,8 @@ pub(crate) async fn ingest_announced(
     answer(db, out.outcome, walked, out.reason).await
 }
 
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 async fn answer(
     db: &impl HeaderDb,
     outcome: &'static str,

@@ -28,6 +28,8 @@ use crate::types::BlockHeader;
 
 /// One dispatched event, or a comment (the peer's heartbeat).
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) enum Item {
     Comment,
     Event {
@@ -41,6 +43,8 @@ pub(crate) enum Item {
 
 /// The bytes of a stream, fed in the chunks they arrive in.
 #[derive(Debug, Default)]
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) struct Parser {
     pending: Vec<u8>,
     data: Vec<String>,
@@ -52,8 +56,12 @@ pub(crate) struct Parser {
 /// A line longer than this with no end is a peer fault, not a header: the
 /// reader drops the stream rather than grow without bound. A tip event is
 /// about 400 bytes.
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) const MAX_LINE: usize = 64 * 1024;
 
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 impl Parser {
     /// The items completed by `chunk`, in order. A line split across chunks
     /// is held until its end arrives.
@@ -119,6 +127,8 @@ impl Parser {
 /// (a fork, a reorg, a tip's age: the header of the new tip arrives as its
 /// own `tip`). The claimed hash must be the hash of the fields; the door
 /// checks everything else.
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn tip_header(data: &str) -> Result<Option<BlockHeader>, String> {
     let value: serde_json::Value =
         serde_json::from_str(data).map_err(|e| format!("tip event: not JSON: {e}"))?;

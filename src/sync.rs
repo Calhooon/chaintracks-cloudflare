@@ -195,6 +195,8 @@ async fn record_seen(db: &impl HeaderDb, height: u32) {
 /// (`/getPresentHeight` serves the larger of it and the served tip), only
 /// when it is above what stands, so a push of an older header never lowers
 /// the record. A read fault is loud and skips the write, as below.
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) async fn note_seen(db: &impl HeaderDb, height: u32) {
     #[derive(serde::Deserialize)]
     struct SeenRow {
@@ -1456,10 +1458,32 @@ async fn notify_tip_webhooks(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_catch_up_threshold() {
-        assert!(11 > 10, "gap > 10 triggers catch-up from production");
-        assert!(!(10 > 10), "gap == 10 uses live WoC mode");
+    #[tokio::test]
+    async fn test_catch_up_threshold() {
+        use crate::host_harness::{regtest, RecordedWebhooks, ScriptedChain, SqliteDb};
+
+        // With no headers available, live sync records the missing header as a
+        // fault; bulk catch-up ends its span without recording that fault.
+        // Exercise the actual cron branch on both sides of its boundary.
+        for (gap, live) in [(10, true), (11, false)] {
+            let db = SqliteDb::migrated();
+            let source = ScriptedChain::new();
+            source.tip(gap, &"0".repeat(64));
+            let hooks = RecordedWebhooks::new("", "");
+            super::run_cron(&db, regtest(), &source, None, &hooks)
+                .await
+                .unwrap();
+            let fault: Option<String> = db
+                .conn()
+                .query_row("SELECT last_error FROM sync_state WHERE id = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(fault.is_some(), live, "sync mode for gap {gap}: {fault:?}");
+            if let Some(fault) = fault {
+                assert!(fault.contains("header at 1:"), "{fault}");
+            }
+        }
     }
 
     #[test]

@@ -967,6 +967,48 @@ fn add_cors(mut response: Response) -> Response {
     response
 }
 
+async fn event_response(
+    db: worker::D1Database,
+    req: &Request,
+    view: crate::events::View,
+    streaming: bool,
+) -> Result<Response> {
+    let url = req.url()?;
+    let last_id = req.headers().get("Last-Event-ID")?;
+    let cursor = match crate::events::parse_cursor(
+        &url,
+        if streaming { last_id.as_deref() } else { None },
+    ) {
+        Ok(cursor) => cursor,
+        Err(e) => return wrap_error(&e.to_string(), 400),
+    };
+    let since = match (cursor, view) {
+        (Some(cursor), _) => cursor,
+        (None, crate::events::View::Envelope) => 0,
+        (None, _) => crate::events::head(&db).await?,
+    };
+    let head = crate::events::head(&db).await?;
+    if since > head {
+        return wrap_error("cursorAhead: cursor belongs to another journal", 409);
+    }
+    if streaming {
+        let mut initial = String::new();
+        if cursor.is_none() && matches!(view, crate::events::View::Tip) {
+            if let Some(tip) = storage::served_tip(&db).await? {
+                initial = crate::events::initial_tip(&tip);
+            }
+        }
+        crate::events::stream(db, since, view, initial).await
+    } else {
+        let page = crate::events::read_page(&db, since, crate::events::PAGE_SIZE).await?;
+        let headers = Headers::new();
+        headers.set("Content-Type", "application/json")?;
+        headers.set("Cache-Control", "no-store")?;
+        headers.set("X-Chain-Event-Version", "1")?;
+        Ok(Response::ok(page.json())?.with_headers(headers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1015,47 +1057,5 @@ mod tests {
         let expected = "Chaintracks mainNet Block Header Service";
         assert!(expected.contains("Chaintracks"));
         assert!(expected.contains("mainNet"));
-    }
-}
-
-async fn event_response(
-    db: worker::D1Database,
-    req: &Request,
-    view: crate::events::View,
-    streaming: bool,
-) -> Result<Response> {
-    let url = req.url()?;
-    let last_id = req.headers().get("Last-Event-ID")?;
-    let cursor = match crate::events::parse_cursor(
-        &url,
-        if streaming { last_id.as_deref() } else { None },
-    ) {
-        Ok(cursor) => cursor,
-        Err(e) => return wrap_error(&e.to_string(), 400),
-    };
-    let since = match (cursor, view) {
-        (Some(cursor), _) => cursor,
-        (None, crate::events::View::Envelope) => 0,
-        (None, _) => crate::events::head(&db).await?,
-    };
-    let head = crate::events::head(&db).await?;
-    if since > head {
-        return wrap_error("cursorAhead: cursor belongs to another journal", 409);
-    }
-    if streaming {
-        let mut initial = String::new();
-        if cursor.is_none() && matches!(view, crate::events::View::Tip) {
-            if let Some(tip) = storage::served_tip(&db).await? {
-                initial = crate::events::initial_tip(&tip);
-            }
-        }
-        crate::events::stream(db, since, view, initial).await
-    } else {
-        let page = crate::events::read_page(&db, since, crate::events::PAGE_SIZE).await?;
-        let headers = Headers::new();
-        headers.set("Content-Type", "application/json")?;
-        headers.set("Cache-Control", "no-store")?;
-        headers.set("X-Chain-Event-Version", "1")?;
-        Ok(Response::ok(page.json())?.with_headers(headers))
     }
 }

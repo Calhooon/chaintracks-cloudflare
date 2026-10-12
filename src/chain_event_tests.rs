@@ -396,7 +396,7 @@ async fn revalidation_gates_the_journal_and_the_legacy_webhook() {
     let db = SqliteDb::migrated_through("0008");
     seed(&db, &params, &h[..2]).await;
     let a2 = header(102, "A2", &h[1].hash);
-    seed(&db, &params, &[a2.clone()]).await;
+    seed(&db, &params, std::slice::from_ref(&a2)).await;
     db.conn()
         .execute(storage::SQL_RESTART_VALIDATION, [])
         .unwrap();

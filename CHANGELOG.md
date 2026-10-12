@@ -2,6 +2,10 @@
 
 ## 0.3.1
 
+- Keep host all-target clippy clean: document Worker helpers retained for host
+  tests and simplify test assertions, borrowing and item order. Worker behavior
+  and validation rules are unchanged.
+
 - Fix bulk bootstrap across a legacy retarget: load the stored ancestry
   needed by every header in the batch, accounting for ancestors supplied
   by the batch itself. The span at 100000 now reaches the stored interval
