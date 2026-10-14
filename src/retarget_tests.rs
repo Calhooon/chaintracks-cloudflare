@@ -137,7 +137,7 @@ pub(crate) fn regtest_genesis() -> BlockHeader {
         ..Default::default()
     };
     BlockHeader {
-        hash: crate::types::compute_block_hash(&h.to_bytes()),
+        hash: h.computed_hash(),
         ..h
     }
 }

@@ -19,7 +19,6 @@ use std::pin::Pin;
 use rusqlite::types::{ToSqlOutput, Value, ValueRef};
 use rusqlite::ToSql;
 use serde::de::DeserializeOwned;
-use sha2::Digest;
 
 use crate::consensus::ChainParams;
 use crate::d1::{HeaderDb, QVal, Query};
@@ -390,7 +389,7 @@ impl TipWebhooks for RecordedWebhooks {
 /// fixture chain's root links to one) and for merkle roots; a fixture's own
 /// hash is the real hash of its fields (`header_with_bits`).
 pub(crate) fn block_hash(label: &str) -> String {
-    let digest = hex::encode(sha2::Sha256::digest(label.as_bytes()));
+    let digest = hex::encode(bsv_rs::primitives::sha256(label.as_bytes()));
     format!("{}{}", "0".repeat(16), &digest[16..])
 }
 
@@ -500,7 +499,7 @@ pub(crate) fn header_at(
         ..Default::default()
     };
     loop {
-        h.hash = crate::types::compute_block_hash(&h.to_bytes());
+        h.hash = h.computed_hash();
         if h.check_pow(mining()).is_ok() {
             return h;
         }

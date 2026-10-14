@@ -62,7 +62,9 @@ pub async fn export_bulk_file(
     // active header AT start_height.
     if let Some(first_chunk) = bytes.chunks(80).next() {
         if first_chunk.len() == 80 {
-            let first_hash = crate::types::compute_block_hash(first_chunk);
+            let first_hash = bsv_rs::block::BlockHeader::from_binary(first_chunk)
+                .map(|h| h.id())
+                .map_err(|e| worker::Error::RustError(format!("export {file_index}: {e}")))?;
             match storage::find_header_for_height(db, start_height).await? {
                 Some(expected) if expected.hash.eq_ignore_ascii_case(&first_hash) => {}
                 Some(expected) => {

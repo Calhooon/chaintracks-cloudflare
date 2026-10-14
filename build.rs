@@ -57,7 +57,7 @@ fn main() {
         "cargo:rustc-env=CHAINTRACKS_BUILT_AT={}",
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     );
-    // Only a dependency the lock carries is named; this service has none today.
+    // Only a dependency the lock carries is named (bsv-rs, from 0.4.0).
     if let Some(version) = version {
         println!("cargo:rustc-env=CHAINTRACKS_BSV_RS={version}");
     }
