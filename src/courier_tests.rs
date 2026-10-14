@@ -334,7 +334,7 @@ async fn a_rung_faulting_three_times_in_a_tick_is_skipped_and_counted() {
 /// `check_proof_of_work`, flip the compare.
 #[test]
 fn a_header_must_meet_its_own_target() {
-    use crate::types::{compute_block_hash, BlockHeader};
+    use crate::types::BlockHeader;
     // 965900 (WoC + Bitails, probed 2026-09-08): hash 000000000000000008e2c789…, bits 0x18276a19
     let raw = hex::decode("0000072938e95d6a6237317b6a920cb75bb617ac25f43a9487fd2b140000000000000000bc2c282b23ad996ccf001d93f614aaea6738ed8cb38bb80741e7a9e013b314614d62a06a196a27188eac2e26").unwrap();
     let h = BlockHeader::from_bytes(&raw, 965_900).unwrap();
@@ -343,11 +343,12 @@ fn a_header_must_meet_its_own_target() {
         "000000000000000008e2c789ff129d58d71db0f545fa6d713289e3518b780d66"
     );
     assert_eq!(h.bits, 0x18276a19);
-    assert_eq!(compute_block_hash(&h.to_bytes()), h.hash);
+    assert_eq!(h.computed_hash(), h.hash);
     let main = crate::consensus::ChainParams::main();
     assert_eq!(h.check_pow(&main), Ok(()), "a real header meets its target");
     // target 0x076a19… below the hash 0x08e2c7…
-    let hash = crate::consensus::from_hex(&h.hash).unwrap();
+    // (the hash in internal order, as bsv-rs 0.6.0 reads it)
+    let hash = h.wire().hash();
     assert_eq!(
         crate::consensus::check_proof_of_work(&hash, 0x18076a19, &main),
         Err(crate::consensus::HeaderFault::HighHash { bits: 0x18076a19 }),
@@ -375,7 +376,7 @@ fn a_header_must_meet_its_own_target() {
         is_active: true,
         is_chain_tip: false,
     };
-    assert_eq!(compute_block_hash(&genesis.to_bytes()), genesis.hash);
+    assert_eq!(genesis.computed_hash(), genesis.hash);
     assert_eq!(genesis.check_pow(&main), Ok(()));
 }
 
@@ -392,7 +393,7 @@ async fn a_courier_serving_a_header_without_proof_of_work_is_a_faulting_rung() {
     let mut fake = good.clone();
     fake.bits = 0x0100_0001; // a target of 1: nothing meets it
     fake.chain_work = crate::types::calculate_work(fake.bits);
-    fake.hash = crate::types::compute_block_hash(&fake.to_bytes());
+    fake.hash = fake.computed_hash();
     let liar = ScriptedChain::new();
     let honest = ScriptedChain::new();
     for h in [&t.x, &t.y, &t.a] {

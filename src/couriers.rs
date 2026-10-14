@@ -66,7 +66,7 @@ use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::consensus::ChainParams;
 use crate::sync::ChainSource;
-use crate::types::{calculate_work, compute_block_hash, BlockHeader, Chain};
+use crate::types::{calculate_work, BlockHeader, Chain};
 use crate::woc::{WocChainInfo, WocClient};
 
 /// A rung faulting this many times in one tick is skipped for the rest of it.
@@ -143,7 +143,7 @@ impl ArcadeHeader {
             is_active: true,
             is_chain_tip: false,
         };
-        let computed = compute_block_hash(&header.to_bytes());
+        let computed = header.computed_hash();
         if !computed.eq_ignore_ascii_case(&header.hash) {
             return Err(rust_err(format!(
                 "Arcade header integrity failure at height {}: claimed hash {} but fields hash to {}",

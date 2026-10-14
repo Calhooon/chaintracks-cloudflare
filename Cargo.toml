@@ -19,7 +19,9 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 hex = "0.4"
 url = "2"
-sha2 = "0.10"
+# The chain primitives (the header frame, the compact target, chain work,
+# sha256d) are bsv-rs's; exact, as the fleet pins.
+bsv-rs = { version = "=0.6.0", default-features = false, features = ["block"] }
 futures-util = "0.3"
 
 [dev-dependencies]

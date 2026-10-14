@@ -70,7 +70,7 @@ impl WocBlockHeader {
             is_chain_tip: false,
         };
 
-        let computed = crate::types::compute_block_hash(&header.to_bytes());
+        let computed = header.computed_hash();
         if !computed.eq_ignore_ascii_case(&header.hash) {
             return Err(worker::Error::RustError(format!(
                 "WoC header integrity failure at height {}: claimed hash {} but fields hash to {}",

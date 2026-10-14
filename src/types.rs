@@ -2,8 +2,8 @@
 //!
 //! Based on bsv-wallet-toolbox-rs/src/chaintracks/types.rs.
 
+use bsv_rs::block::ChainWork;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::consensus::{self, ChainParams, HeaderFault};
 
@@ -72,135 +72,132 @@ impl BlockHeader {
     /// the hash of the 80 bytes (the store keys rows by it); the hash, read as
     /// a 256-bit number, at most the target. P0-4 (2026-10-08) made this the
     /// check every path runs before a header is bound or stored (bsv-low loop
-    /// 10 D5 had it on the courier ladder alone, with the claimed hash).
+    /// 10 D5 had it on the courier ladder alone, with the claimed hash). The
+    /// rule is bsv-rs 0.6.0's (`bsv_rs::block::check_proof_of_work`); the
+    /// claimed-hash comparison is this store's.
     pub fn check_pow(&self, params: &ChainParams) -> Result<(), HeaderFault> {
-        consensus::checked_target(self.bits, params)?;
-        let computed = compute_block_hash(&self.to_bytes());
+        consensus::check_bits(self.bits, params)?;
+        let wire = self.wire();
+        let computed = wire.id();
         if !computed.eq_ignore_ascii_case(&self.hash) {
             return Err(HeaderFault::HashMismatch {
                 claimed: self.hash.clone(),
                 computed,
             });
         }
-        let hash = consensus::from_hex(&computed).unwrap_or(consensus::ZERO);
-        consensus::check_proof_of_work(&hash, self.bits, params)
+        consensus::check_proof_of_work(&wire.hash(), self.bits, params)
     }
 
-    /// Serialize header to 80-byte array (Bitcoin wire format).
-    ///
-    /// Hashes are stored in display format (big-endian, reversed from wire) to
-    /// match the production ChaintracksService. This method reverses them back
-    /// to internal byte order (little-endian) for the wire format.
+    /// The 80-byte frame as bsv-rs types it (`bsv_rs::block::BlockHeader`,
+    /// bitcoin-sv v1.2.3 src/primitives/block.h:23-65). The row stores the
+    /// hashes in display order; the frame holds them in internal order. A
+    /// stored hash that is not 64 hex digits frames as zeros, as `to_bytes`
+    /// always has (its claimed hash then cannot match, and `check_pow` refuses
+    /// it). The version's bits are the same as an `i32`'s (the node's type).
+    pub fn wire(&self) -> bsv_rs::block::BlockHeader {
+        bsv_rs::block::BlockHeader {
+            version: self.version as i32,
+            prev_hash: internal_order(&self.previous_hash),
+            merkle_root: internal_order(&self.merkle_root),
+            time: self.time,
+            bits: self.bits,
+            nonce: self.nonce,
+        }
+    }
+
+    /// The header's own hash in display order (`bsv_rs::block::BlockHeader::id`).
+    pub fn computed_hash(&self) -> String {
+        self.wire().id()
+    }
+
+    /// Serialize header to 80-byte array (Bitcoin wire format), through
+    /// `bsv_rs::block::BlockHeader::to_binary`.
     pub fn to_bytes(&self) -> [u8; 80] {
-        let mut bytes = [0u8; 80];
-        bytes[0..4].copy_from_slice(&self.version.to_le_bytes());
-
-        // previous_hash: stored in display format, must reverse for wire format
-        if let Ok(mut prev) = hex::decode(&self.previous_hash) {
-            if prev.len() == 32 {
-                prev.reverse();
-                bytes[4..36].copy_from_slice(&prev);
-            }
-        }
-
-        // merkle_root: stored in display format, must reverse for wire format
-        if let Ok(mut merkle) = hex::decode(&self.merkle_root) {
-            if merkle.len() == 32 {
-                merkle.reverse();
-                bytes[36..68].copy_from_slice(&merkle);
-            }
-        }
-
-        bytes[68..72].copy_from_slice(&self.time.to_le_bytes());
-        bytes[72..76].copy_from_slice(&self.bits.to_le_bytes());
-        bytes[76..80].copy_from_slice(&self.nonce.to_le_bytes());
-        bytes
+        self.wire().to_binary()
     }
 
-    /// Parse a block header from 80 bytes at a given height.
+    /// Parse a block header from exactly 80 bytes at a given height
+    /// (`bsv_rs::block::BlockHeader::from_binary`, the sibling's `decode`).
+    /// Every caller hands it one 80-byte chunk; a longer slice is refused
+    /// (until bsv-rs 0.6.0 the bytes past 80 were ignored).
     ///
     /// Stores hashes in display format (big-endian, reversed from wire) to
     /// match the production ChaintracksService and WoC API format.
-    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8], height: u32) -> Option<Self> {
-        if bytes.len() < 80 {
-            return None;
-        }
-
-        let version = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
-        // Wire format is internal byte order — reverse for display format
-        let mut prev_bytes = bytes[4..36].to_vec();
-        prev_bytes.reverse();
-        let previous_hash = hex::encode(&prev_bytes);
-        let mut merkle_bytes = bytes[36..68].to_vec();
-        merkle_bytes.reverse();
-        let merkle_root = hex::encode(&merkle_bytes);
-        let time = u32::from_le_bytes(bytes[68..72].try_into().ok()?);
-        let bits = u32::from_le_bytes(bytes[72..76].try_into().ok()?);
-        let nonce = u32::from_le_bytes(bytes[76..80].try_into().ok()?);
-        let hash = compute_block_hash(&bytes[0..80]);
-        let chain_work = calculate_work(bits);
-
+        let wire = bsv_rs::block::BlockHeader::from_binary(bytes).ok()?;
         Some(Self {
             header_id: None,
             previous_header_id: None,
-            version,
-            previous_hash,
-            merkle_root,
-            time,
-            bits,
-            nonce,
+            version: wire.version as u32,
+            previous_hash: wire.prev_id(),
+            merkle_root: wire.merkle_root_hex(),
+            time: wire.time,
+            bits: wire.bits,
+            nonce: wire.nonce,
             height,
-            hash,
-            chain_work,
+            hash: wire.id(),
+            chain_work: calculate_work(wire.bits),
             is_active: true,
             is_chain_tip: false,
         })
     }
 }
 
-/// Double SHA-256 hash of header bytes, returned as hex (reversed for display).
-#[allow(dead_code)]
-pub fn compute_block_hash(header_bytes: &[u8]) -> String {
-    let first = Sha256::digest(header_bytes);
-    let second = Sha256::digest(first);
-    let mut reversed = second.to_vec();
-    reversed.reverse();
-    hex::encode(reversed)
+/// A display-order hash as the frame carries it (internal order); zeros when
+/// it is not 64 hex digits.
+fn internal_order(display: &str) -> bsv_rs::primitives::Hash32 {
+    let mut out = [0u8; 32];
+    if let Ok(bytes) = hex::decode(display) {
+        if bytes.len() == 32 {
+            out.copy_from_slice(&bytes);
+            out.reverse();
+        }
+    }
+    out
 }
 
 // ─── Work ────────────────────────────────────────────────────────────────────
 //
-// The 256-bit arithmetic and the compact decode are the node's, ported in
-// `consensus` (P0-4, 2026-10-08). The decode here used to answer the MAXIMUM
+// The 256-bit arithmetic and the compact decode are bsv-rs 0.6.0's
+// (`bsv_rs::block::ChainWork`, `CompactTarget`; until 0.4.0 the node's port in
+// `consensus`, P0-4, 2026-10-08). The decode here used to answer the MAXIMUM
 // target for an exponent past 256 bits ("treat as max target (work ≈ 1)",
 // f86752b:280-285), so a header carrying such bits met its target with any
-// hash; `SetCompact` flags it as an overflow and `CheckProofOfWork` refuses it.
+// hash; `SetCompact` flags it and `CheckProofOfWork` refuses it.
+//
+// The store keeps chain work as 64 hex digits; these three read and write that
+// form. A stored value that is not 64 hex digits reads as zero: the legacy
+// rows' tolerance stays here, at the store, and bsv-rs's `ChainWork::from_hex`
+// refuses (the ruling of 2026-10-12, Q5).
+
+/// A stored chain work; zero when it is not 64 hex digits.
+fn stored_work(hex: &str) -> ChainWork {
+    if hex.len() != 64 {
+        return ChainWork::ZERO;
+    }
+    ChainWork::from_hex(hex).unwrap_or(ChainWork::ZERO)
+}
 
 /// PER-BLOCK work from difficulty bits: `GetBlockProof` exactly
-/// (`consensus::block_proof`), as a 64-char big-endian hex string; zero for a
+/// (`ChainWork::from_bits`), as a 64-char big-endian hex string; zero for a
 /// negative, overflowing or zero target, so a malformed header can never win
 /// tip selection. Genesis bits 0x1d00ffff → 0x…0100010001 (vector-tested).
 pub fn calculate_work(bits: u32) -> String {
-    consensus::to_hex(&consensus::block_proof(bits))
+    ChainWork::from_bits(bits).to_hex()
 }
 
 /// Sum two 64-char hex work values (cumulative chain work accumulation,
-/// TS addWork parity). Malformed inputs are treated as zero so legacy rows
-/// (which stored a garbage per-block constant) degrade harmlessly.
+/// TS addWork parity), modulo 2^256 as the node's `nChainWork`. Malformed
+/// inputs are treated as zero so legacy rows (which stored a garbage
+/// per-block constant) degrade harmlessly.
 pub fn add_work(a_hex: &str, b_hex: &str) -> String {
-    let a = consensus::from_hex(a_hex).unwrap_or(consensus::ZERO);
-    let b = consensus::from_hex(b_hex).unwrap_or(consensus::ZERO);
-    consensus::to_hex(&consensus::add(&a, &b))
+    stored_work(a_hex).wrapping_add(stored_work(b_hex)).to_hex()
 }
 
-/// True if work `a` is strictly more than `b` (both 64-char hex, fixed
-/// width ⇒ lexicographic compare is numeric compare; TS isMoreWork parity).
-/// Malformed values compare as zero.
+/// True if work `a` is strictly more than `b` (numeric, `ChainWork`'s `Ord`;
+/// TS isMoreWork parity). Malformed values compare as zero.
 pub fn is_more_work(a_hex: &str, b_hex: &str) -> bool {
-    let a = consensus::from_hex(a_hex).unwrap_or(consensus::ZERO);
-    let b = consensus::from_hex(b_hex).unwrap_or(consensus::ZERO);
-    consensus::cmp(&a, &b) == std::cmp::Ordering::Greater
+    stored_work(a_hex) > stored_work(b_hex)
 }
 
 /// Result of inserting a header into storage.
@@ -318,9 +315,7 @@ mod tests {
     #[test]
     fn test_genesis_block_hash() {
         let header = genesis_header();
-        let bytes = header.to_bytes();
-        let hash = compute_block_hash(&bytes);
-        assert_eq!(hash, GENESIS_HASH);
+        assert_eq!(header.computed_hash(), GENESIS_HASH);
     }
 
     #[test]
@@ -342,6 +337,11 @@ mod tests {
     fn test_from_bytes_too_short() {
         let short = [0u8; 79];
         assert!(BlockHeader::from_bytes(&short, 0).is_none());
+        // Amended at 0.4.0: the frame is exactly 80 bytes (bsv-rs 0.6.0
+        // `BlockHeader::from_binary`, the sibling's `decode`); a longer slice
+        // is refused where the bytes past 80 used to be ignored.
+        let long = [0u8; 81];
+        assert!(BlockHeader::from_bytes(&long, 0).is_none());
     }
 
     #[test]
@@ -474,9 +474,11 @@ mod tests {
     #[test]
     fn test_block1_hash_vector() {
         let header = block1_header();
-        let bytes = header.to_bytes();
-        let hash = compute_block_hash(&bytes);
-        assert_eq!(hash, BLOCK1_HASH, "Block 1 hash must match production");
+        assert_eq!(
+            header.computed_hash(),
+            BLOCK1_HASH,
+            "Block 1 hash must match production"
+        );
     }
 
     #[test]

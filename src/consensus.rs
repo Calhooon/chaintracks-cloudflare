@@ -7,10 +7,10 @@
 //! function it ports and the lines it was read from with
 //! `git show v1.2.3:<path>`.
 //!
-//! - `set_compact`: `arith_uint256::SetCompact`, src/arith_uint256.cpp:182-201.
-//! - `get_compact`: `arith_uint256::GetCompact`, src/arith_uint256.cpp:203-225.
-//! - `check_proof_of_work`: `CheckProofOfWork`, src/pow.cpp:150-171.
-//! - `block_proof`: `GetBlockProof`, src/block_index.cpp:114-127.
+//! - the compact encoding (`SetCompact`, `GetCompact`, src/arith_uint256.cpp:182-225),
+//!   `CheckProofOfWork` (src/pow.cpp:150-171) and `GetBlockProof`
+//!   (src/block_index.cpp:114-127) are bsv-rs 0.6.0's (`bsv_rs::block`), read at
+//!   the same pin; `check_proof_of_work` here names its refusals as `HeaderFault`.
 //! - the `powLimit` of each chain: src/chainparams.cpp:1047-1048 (main),
 //!   :1343-1344 (testnet), :1471-1472 (regtest).
 //! - `next_work_required`: `GetNextWorkRequired` with its three regimes,
@@ -23,216 +23,24 @@
 //!   the checkpoint lists of src/chainparams.cpp:1124-1160 (main), :1419-1428
 //!   (testnet), :1530-1533 (regtest).
 
-use std::cmp::Ordering;
 use std::fmt;
 
-// ─── 256-bit arithmetic, as `base_uint<256>` computes it ────────────────────
+use bsv_rs::block::{ChainWork, CompactTarget, PowError};
+use bsv_rs::primitives::{Hash32, U256};
+
+// ─── The primitives ─────────────────────────────────────────────────────────
 //
-// Little-endian `[u64; 4]` limbs. Every operation is modulo 2^256, as the
-// node's `base_uint` is (its `<<=` drops the bits shifted past the top,
-// arith_uint256.cpp:20-33, which is what makes an overflowing compact decode
-// to a truncated value rather than a large one).
+// The 256-bit arithmetic, the compact encoding (`SetCompact`, `GetCompact`),
+// `CheckProofOfWork`, `GetBlockProof` and the pow limits are bsv-rs 0.6.0's
+// (`bsv_rs::primitives::U256`, `bsv_rs::block`), read at the same node pin and
+// the sibling's #63 and #64. Until 0.4.0 they were ported here; the node's
+// tables that tested the port run in bsv-rs's own suite. The difficulty rule
+// below stays this service's, on the bsv-rs types (the ruling of 2026-10-12,
+// Q2: it moves into bsv-rs with the chain parameters at 0.7.0).
 
-pub(crate) type U256 = [u64; 4];
-
-pub(crate) const ZERO: U256 = [0; 4];
-pub(crate) const ONE: U256 = [1, 0, 0, 0];
-
-pub(crate) fn is_zero(a: &U256) -> bool {
-    a.iter().all(|&x| x == 0)
-}
-
-pub(crate) fn cmp(a: &U256, b: &U256) -> Ordering {
-    for i in (0..4).rev() {
-        match a[i].cmp(&b[i]) {
-            Ordering::Equal => continue,
-            ord => return ord,
-        }
-    }
-    Ordering::Equal
-}
-
-pub(crate) fn not(a: &U256) -> U256 {
-    [!a[0], !a[1], !a[2], !a[3]]
-}
-
-pub(crate) fn add(a: &U256, b: &U256) -> U256 {
-    let mut out = [0u64; 4];
-    let mut carry = 0u64;
-    for i in 0..4 {
-        let (s1, c1) = a[i].overflowing_add(b[i]);
-        let (s2, c2) = s1.overflowing_add(carry);
-        out[i] = s2;
-        carry = (c1 as u64) + (c2 as u64);
-    }
-    out
-}
-
-pub(crate) fn sub(a: &U256, b: &U256) -> U256 {
-    let mut out = [0u64; 4];
-    let mut borrow = 0u64;
-    for i in 0..4 {
-        let (d1, b1) = a[i].overflowing_sub(b[i]);
-        let (d2, b2) = d1.overflowing_sub(borrow);
-        out[i] = d2;
-        borrow = (b1 as u64) + (b2 as u64);
-    }
-    out
-}
-
-/// `-a`, two's complement (`base_uint::operator-()`, arith_uint256.h:78).
-pub(crate) fn neg(a: &U256) -> U256 {
-    add(&not(a), &ONE)
-}
-
-pub(crate) fn shl(a: &U256, shift: u32) -> U256 {
-    if shift >= 256 {
-        return ZERO;
-    }
-    let limbs = (shift / 64) as usize;
-    let bits = shift % 64;
-    let mut out = [0u64; 4];
-    for i in (limbs..4).rev() {
-        out[i] = a[i - limbs] << bits;
-        if bits > 0 && i > limbs {
-            out[i] |= a[i - limbs - 1] >> (64 - bits);
-        }
-    }
-    out
-}
-
-pub(crate) fn shr(a: &U256, shift: u32) -> U256 {
-    if shift >= 256 {
-        return ZERO;
-    }
-    let limbs = (shift / 64) as usize;
-    let bits = shift % 64;
-    let mut out = [0u64; 4];
-    for i in 0..(4 - limbs) {
-        out[i] = a[i + limbs] >> bits;
-        if bits > 0 && i + limbs + 1 < 4 {
-            out[i] |= a[i + limbs + 1] << (64 - bits);
-        }
-    }
-    out
-}
-
-/// `a * b` modulo 2^256 (`base_uint::operator*=(uint32_t)`,
-/// arith_uint256.cpp:52-60: the carry out of the top word is dropped). The
-/// node's retarget multiplies by an `int64_t` timespan, which overload
-/// resolution converts to `uint32_t` (a standard conversion beats the
-/// `base_uint(uint64_t)` constructor); every timespan it multiplies by is
-/// clamped positive and far below 2^32, so the two agree.
-pub(crate) fn mul_u32(a: &U256, b: u32) -> U256 {
-    let mut out = [0u64; 4];
-    let mut carry = 0u128;
-    for i in 0..4 {
-        let n = (a[i] as u128) * (b as u128) + carry;
-        out[i] = n as u64;
-        carry = n >> 64;
-    }
-    out
-}
-
-/// floor(n / d) (`base_uint::operator/=`, arith_uint256.cpp:78-105). The
-/// node throws on a zero divisor; every caller here divides by a value it
-/// has shown non-zero, and a zero divisor answers zero rather than panic.
-pub(crate) fn div(n: &U256, d: &U256) -> U256 {
-    if is_zero(d) {
-        return ZERO;
-    }
-    let mut quotient = [0u64; 4];
-    let mut remainder = [0u64; 4];
-    for bit in (0..256).rev() {
-        remainder = shl(&remainder, 1);
-        remainder[0] |= (n[bit / 64] >> (bit % 64)) & 1;
-        if cmp(&remainder, d) != Ordering::Less {
-            remainder = sub(&remainder, d);
-            quotient[bit / 64] |= 1u64 << (bit % 64);
-        }
-    }
-    quotient
-}
-
-/// The position of the highest set bit plus one (`base_uint::bits`,
-/// arith_uint256.cpp:152-162).
-pub(crate) fn bits(a: &U256) -> u32 {
-    for i in (0..4).rev() {
-        if a[i] != 0 {
-            return 64 * i as u32 + (64 - a[i].leading_zeros());
-        }
-    }
-    0
-}
-
-pub(crate) fn from_u64(v: u64) -> U256 {
-    [v, 0, 0, 0]
-}
-
-pub(crate) fn to_hex(a: &U256) -> String {
-    format!("{:016x}{:016x}{:016x}{:016x}", a[3], a[2], a[1], a[0])
-}
-
-/// A 64-hex big-endian number (a block hash in display order, a stored
-/// chain work). Anything else is `None`.
-pub(crate) fn from_hex(s: &str) -> Option<U256> {
-    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0u64; 4];
-    for (i, limb) in out.iter_mut().enumerate() {
-        let start = 64 - (i + 1) * 16;
-        *limb = u64::from_str_radix(&s[start..start + 16], 16).ok()?;
-    }
-    Some(out)
-}
-
-// ─── The compact encoding ───────────────────────────────────────────────────
-
-/// A decoded compact `bits`: the value and the node's two flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Compact {
-    pub value: U256,
-    pub negative: bool,
-    pub overflow: bool,
-}
-
-/// `arith_uint256::SetCompact` (src/arith_uint256.cpp:182-201), exactly:
-/// the 23-bit word shifted by `8 * (size - 3)` modulo 2^256; negative when
-/// the sign bit 0x00800000 is set on a non-zero word; overflow when a
-/// non-zero word reaches past 256 bits.
-pub(crate) fn set_compact(compact: u32) -> Compact {
-    let size = compact >> 24;
-    let mut word = compact & 0x007f_ffff;
-    let value = if size <= 3 {
-        word >>= 8 * (3 - size);
-        from_u64(word as u64)
-    } else {
-        shl(&from_u64(word as u64), 8 * (size - 3))
-    };
-    let negative = word != 0 && (compact & 0x0080_0000) != 0;
-    let overflow =
-        word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
-    Compact {
-        value,
-        negative,
-        overflow,
-    }
-}
-
-/// `arith_uint256::GetCompact(fNegative = false)` (src/arith_uint256.cpp:203-225).
-pub(crate) fn get_compact(a: &U256) -> u32 {
-    let mut size = bits(a).div_ceil(8);
-    let mut compact: u32 = if size <= 3 {
-        (a[0] << (8 * (3 - size))) as u32
-    } else {
-        shr(a, 8 * (size - 3))[0] as u32
-    };
-    if compact & 0x0080_0000 != 0 {
-        compact >>= 8;
-        size += 1;
-    }
-    compact | (size << 24)
+/// Exactly 64 hex digits: a block hash in display order, a stored chain work.
+fn is_hash_hex(s: &str) -> bool {
+    s.len() == 64 && U256::from_hex(s).is_ok()
 }
 
 // ─── The chain parameters ───────────────────────────────────────────────────
@@ -263,9 +71,9 @@ pub struct ChainParams {
 }
 
 /// `uint256S("00000000ffff…ff")`: mainnet's and testnet's `powLimit`.
-const POW_LIMIT_MAIN: U256 = [u64::MAX, u64::MAX, u64::MAX, 0x0000_0000_ffff_ffff];
+const POW_LIMIT_MAIN: U256 = bsv_rs::block::POW_LIMIT_MAIN;
 /// `uint256S("7fff…ff")`: regtest's `powLimit`.
-const POW_LIMIT_REGTEST: U256 = [u64::MAX, u64::MAX, u64::MAX, 0x7fff_ffff_ffff_ffff];
+const POW_LIMIT_REGTEST: U256 = bsv_rs::block::POW_LIMIT_REGTEST;
 
 /// Two weeks, `14 * 24 * 60 * 60` (every chain, src/chainparams.cpp:1050, 1346, 1474).
 const TWO_WEEKS: i64 = 14 * 24 * 60 * 60;
@@ -443,7 +251,7 @@ impl ChainParams {
                 .parse()
                 .map_err(|e| format!("checkpoint {entry:?}: height: {e}"))?;
             let hash = hash.trim().to_ascii_lowercase();
-            if from_hex(&hash).is_none() {
+            if !is_hash_hex(&hash) {
                 return Err(format!("checkpoint {entry:?}: hash is not 64 hex digits"));
             }
             match self.checkpoints.iter_mut().find(|(ch, _)| *ch == height) {
@@ -462,7 +270,7 @@ impl ChainParams {
 
     /// `GetCompact(powLimit)`: the bits of a minimum-difficulty header.
     pub fn pow_limit_bits(&self) -> u32 {
-        get_compact(&self.pow_limit)
+        self.pow_limit.to_compact()
     }
 
     /// The checkpoint at `height`, if the list has one.
@@ -608,49 +416,43 @@ impl fmt::Display for HeaderFault {
 
 // ─── Proof of work ──────────────────────────────────────────────────────────
 
-/// The target `bits` encode, refused exactly where `CheckProofOfWork` refuses
-/// it (src/pow.cpp:156-163): negative, zero, overflowing, or above `powLimit`.
-/// The node refuses all four alike; the fault names the first that holds, the
-/// overflow before the zero (an exponent past 256 bits shifts the word out and
-/// decodes to zero BECAUSE it overflowed).
-pub(crate) fn checked_target(bits: u32, params: &ChainParams) -> Result<U256, HeaderFault> {
-    let c = set_compact(bits);
-    if c.negative {
-        return Err(HeaderFault::BitsNegative { bits });
+/// A bsv-rs refusal as this service names it. Every one is the node's
+/// `high-hash` (the node does not tell them apart). bsv-rs names them in the
+/// node's test order (src/pow.cpp:159-160: negative, zero, overflow, above the
+/// limit), so an exponent past 256 bits, whose word truncates to zero, comes
+/// back as a zero target; the service names the overflow before the zero, as
+/// it always has, so the refusal it records and serves reads the same.
+fn pow_fault(fault: PowError, bits: u32) -> HeaderFault {
+    match fault {
+        PowError::BitsNegative { bits } => HeaderFault::BitsNegative { bits },
+        PowError::BitsZero { bits } if CompactTarget::from_bits(bits).overflow => {
+            HeaderFault::BitsOverflow { bits }
+        }
+        PowError::BitsZero { bits } => HeaderFault::BitsZero { bits },
+        PowError::BitsOverflow { bits } => HeaderFault::BitsOverflow { bits },
+        PowError::BitsAboveLimit { bits } => HeaderFault::BitsAboveLimit { bits },
+        PowError::HighHash { bits } => HeaderFault::HighHash { bits },
+        _ => HeaderFault::HighHash { bits },
     }
-    if c.overflow {
-        return Err(HeaderFault::BitsOverflow { bits });
-    }
-    if is_zero(&c.value) {
-        return Err(HeaderFault::BitsZero { bits });
-    }
-    if cmp(&c.value, &params.pow_limit) == Ordering::Greater {
-        return Err(HeaderFault::BitsAboveLimit { bits });
-    }
-    Ok(c.value)
 }
 
-/// `CheckProofOfWork(hash, nBits)` (src/pow.cpp:150-171).
+/// The `bits` alone, refused exactly where `CheckProofOfWork` refuses them
+/// (src/pow.cpp:156-163): negative, zero, overflowing, or above `powLimit`.
+/// The zero hash meets every target the bits may carry, so a refusal here is
+/// the bits', never the hash's.
+pub(crate) fn check_bits(bits: u32, params: &ChainParams) -> Result<(), HeaderFault> {
+    check_proof_of_work(&[0u8; 32], bits, params)
+}
+
+/// `CheckProofOfWork(hash, nBits)` (src/pow.cpp:150-171), through
+/// `bsv_rs::block::check_proof_of_work`; `hash` in internal order.
 pub(crate) fn check_proof_of_work(
-    hash: &U256,
+    hash: &Hash32,
     bits: u32,
     params: &ChainParams,
 ) -> Result<(), HeaderFault> {
-    let target = checked_target(bits, params)?;
-    if cmp(hash, &target) == Ordering::Greater {
-        return Err(HeaderFault::HighHash { bits });
-    }
-    Ok(())
-}
-
-/// `GetBlockProof` (src/block_index.cpp:114-127): `~target / (target + 1) + 1`,
-/// and zero for a negative, overflowing or zero target.
-pub(crate) fn block_proof(bits: u32) -> U256 {
-    let c = set_compact(bits);
-    if c.negative || c.overflow || is_zero(&c.value) {
-        return ZERO;
-    }
-    add(&div(&not(&c.value), &add(&c.value, &ONE)), &ONE)
+    bsv_rs::block::check_proof_of_work(hash, bits, &params.pow_limit)
+        .map_err(|fault| pow_fault(fault, bits))
 }
 
 // ─── Checkpoints ────────────────────────────────────────────────────────────
@@ -674,6 +476,23 @@ pub(crate) fn check_checkpoint(
 }
 
 // ─── The difficulty rule ────────────────────────────────────────────────────
+
+/// `a * b` modulo 2^256 (`base_uint::operator*=(uint32_t)`,
+/// arith_uint256.cpp:52-60: the carry out of the top word is dropped). The
+/// node's retarget multiplies by an `int64_t` timespan, which overload
+/// resolution converts to `uint32_t` (a standard conversion beats the
+/// `base_uint(uint64_t)` constructor); every timespan it multiplies by is
+/// clamped positive and far below 2^32, so the two agree.
+fn mul_u32(a: U256, b: u32) -> U256 {
+    a.wrapping_mul_u64(b as u64)
+}
+
+/// floor(n / d) (`base_uint::operator/=`, arith_uint256.cpp:78-105). The
+/// node throws on a zero divisor; every caller here divides by a value it
+/// has shown non-zero, and a zero divisor answers zero rather than panic.
+fn div(n: U256, d: U256) -> U256 {
+    n.checked_div(d).unwrap_or(U256::ZERO)
+}
 
 /// What the rule reads of a header: its height, time and bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,16 +521,16 @@ impl From<&crate::types::BlockHeader> for Link {
 pub(crate) struct Window {
     links: Vec<Link>,
     /// `work[i]` = the proofs of `links[1..=i]`.
-    work: Vec<U256>,
+    work: Vec<ChainWork>,
 }
 
 impl Window {
     pub fn new(links: Vec<Link>) -> Self {
         let mut work = Vec::with_capacity(links.len());
-        let mut sum = ZERO;
+        let mut sum = ChainWork::ZERO;
         for (i, l) in links.iter().enumerate() {
             if i > 0 {
-                sum = add(&sum, &block_proof(l.bits));
+                sum = sum.wrapping_add(ChainWork::from_bits(l.bits));
             }
             work.push(sum);
         }
@@ -720,8 +539,8 @@ impl Window {
 
     pub fn push(&mut self, link: Link) {
         let sum = match self.work.last() {
-            Some(last) => add(last, &block_proof(link.bits)),
-            None => ZERO,
+            Some(last) => last.wrapping_add(ChainWork::from_bits(link.bits)),
+            None => ChainWork::ZERO,
         };
         self.links.push(link);
         self.work.push(sum);
@@ -758,7 +577,7 @@ impl Window {
     fn work_between(&self, first: i64, last: i64) -> Result<U256, HeaderFault> {
         let a = self.work[self.index(first)?];
         let b = self.work[self.index(last)?];
-        Ok(sub(&b, &a))
+        Ok(b.as_u256().wrapping_sub(*a.as_u256()))
     }
 }
 
@@ -822,12 +641,12 @@ fn next_eda_work_required(
     if mtp6 < 12 * 3600 {
         return Ok(prev.bits);
     }
-    let mut pow = set_compact(prev.bits).value;
-    pow = add(&pow, &shr(&pow, 2));
-    if cmp(&pow, &params.pow_limit) == Ordering::Greater {
+    let mut pow = CompactTarget::from_bits(prev.bits).target;
+    pow = pow.wrapping_add(pow.shr(2));
+    if pow > params.pow_limit {
         pow = params.pow_limit;
     }
-    Ok(get_compact(&pow))
+    Ok(pow.to_compact())
 }
 
 /// `CalculateNextWorkRequired` (src/pow.cpp:119-148): the two-week retarget,
@@ -842,13 +661,13 @@ pub(crate) fn calculate_next_work_required(
     }
     let timespan = params.pow_target_timespan;
     let actual = (prev.time as i64 - first_block_time).clamp(timespan / 4, timespan * 4);
-    let mut target = set_compact(prev.bits).value;
-    target = mul_u32(&target, actual as u32);
-    target = div(&target, &from_u64(timespan as u64));
-    if cmp(&target, &params.pow_limit) == Ordering::Greater {
+    let mut target = CompactTarget::from_bits(prev.bits).target;
+    target = mul_u32(target, actual as u32);
+    target = div(target, U256::from_u64(timespan as u64));
+    if target > params.pow_limit {
         target = params.pow_limit;
     }
-    get_compact(&target)
+    target.to_compact()
 }
 
 /// `GetSuitableBlock` (src/pow.cpp:214-245): the median by time of the block
@@ -876,11 +695,11 @@ fn compute_target(
     params: &ChainParams,
 ) -> Result<U256, HeaderFault> {
     let mut work = w.work_between(first.height as i64, last.height as i64)?;
-    work = mul_u32(&work, params.pow_target_spacing as u32);
+    work = mul_u32(work, params.pow_target_spacing as u32);
     let spacing = params.pow_target_spacing;
     let actual = (last.time as i64 - first.time as i64).clamp(72 * spacing, 288 * spacing);
-    work = div(&work, &from_u64(actual as u64));
-    Ok(div(&neg(&work), &work))
+    work = div(work, U256::from_u64(actual as u64));
+    Ok(div(work.wrapping_neg(), work))
 }
 
 /// `GetNextCashWorkRequired` (src/pow.cpp:256-297): the DAA over the last
@@ -907,10 +726,10 @@ fn next_cash_work_required(
     let last = suitable_block(w, height)?;
     let first = suitable_block(w, height - 144)?;
     let target = compute_target(w, first, last, params)?;
-    if cmp(&target, &params.pow_limit) == Ordering::Greater {
+    if target > params.pow_limit {
         return Ok(params.pow_limit_bits());
     }
-    Ok(get_compact(&target))
+    Ok(target.to_compact())
 }
 
 /// The node's context checks for a header whose parent is at `prev_height`
@@ -936,139 +755,62 @@ pub(crate) fn check_context(
 mod tests {
     use super::*;
 
+    use std::cmp::Ordering;
+
     fn hex(s: &str) -> U256 {
-        from_hex(&format!("{s:0>64}")).unwrap()
+        U256::from_hex(s).unwrap()
     }
 
-    /// The node's own table, `setcompact_test`
-    /// (src/test/arith_uint256_tests.cpp:501-538 at v1.2.3): input, negative,
-    /// overflow, value.
-    #[test]
-    fn set_compact_matches_the_node_table() {
-        let rows: &[(u32, bool, bool, &str)] = &[
-            (0x00123456, false, false, "0"),
-            (0x01123456, false, false, "12"),
-            (0x02123456, false, false, "1234"),
-            (0x03123456, false, false, "123456"),
-            (0x04123456, false, false, "12345600"),
-            (
-                0x20123456,
-                false,
-                false,
-                "1234560000000000000000000000000000000000000000000000000000000000",
-            ),
-            (
-                0x21123456,
-                false,
-                true,
-                "3456000000000000000000000000000000000000000000000000000000000000",
-            ),
-            (0x00923456, false, false, "0"),
-            (0x01923456, true, false, "12"),
-            (0x02923456, true, false, "1234"),
-            (0x03923456, true, false, "123456"),
-            (0x04923456, true, false, "12345600"),
-            (
-                0x20923456,
-                true,
-                false,
-                "1234560000000000000000000000000000000000000000000000000000000000",
-            ),
-            (
-                0x21923456,
-                true,
-                true,
-                "3456000000000000000000000000000000000000000000000000000000000000",
-            ),
-        ];
-        for &(input, negative, overflow, value) in rows {
-            let c = set_compact(input);
-            assert_eq!(
-                (c.negative, c.overflow, c.value),
-                (negative, overflow, hex(value)),
-                "{input:#010x}"
-            );
+    // The node's names for the bsv-rs calls the difficulty vectors below read
+    // (`SetCompact`, `GetCompact`, `base_uint`'s operators), so each vector
+    // reads as the node's test does. The node's tables for these primitives
+    // (`setcompact_test`, `bignum_SetCompact`, `GetBlockProof`, the arithmetic)
+    // tested the port this module carried until 0.4.0; they run in bsv-rs
+    // 0.6.0's suite now (`tests/chain_primitives.rs`).
+    struct Compact {
+        value: U256,
+    }
+    fn set_compact(bits: u32) -> Compact {
+        Compact {
+            value: CompactTarget::from_bits(bits).target,
         }
     }
-
-    /// The node's `bignum_SetCompact` (src/test/arith_uint256_tests.cpp:540-703):
-    /// value, the round trip through `GetCompact`, and the flags.
-    #[test]
-    fn set_and_get_compact_match_bignum_set_compact() {
-        let rows: &[(u32, &str, u32, bool, bool)] = &[
-            (0, "0", 0, false, false),
-            (0x00123456, "0", 0, false, false),
-            (0x01003456, "0", 0, false, false),
-            (0x02000056, "0", 0, false, false),
-            (0x03000000, "0", 0, false, false),
-            (0x04000000, "0", 0, false, false),
-            (0x00923456, "0", 0, false, false),
-            (0x01803456, "0", 0, false, false),
-            (0x02800056, "0", 0, false, false),
-            (0x03800000, "0", 0, false, false),
-            (0x04800000, "0", 0, false, false),
-            (0x01123456, "12", 0x01120000, false, false),
-            (0x02123456, "1234", 0x02123400, false, false),
-            (0x03123456, "123456", 0x03123456, false, false),
-            (0x04123456, "12345600", 0x04123456, false, false),
-            (0x05009234, "92340000", 0x05009234, false, false),
-            (
-                0x20123456,
-                "1234560000000000000000000000000000000000000000000000000000000000",
-                0x20123456,
-                false,
-                false,
-            ),
-        ];
-        for &(input, value, round_trip, negative, overflow) in rows {
-            let c = set_compact(input);
-            assert_eq!(c.value, hex(value), "{input:#010x} value");
-            assert_eq!(
-                get_compact(&c.value),
-                round_trip,
-                "{input:#010x} GetCompact"
-            );
-            assert_eq!(
-                (c.negative, c.overflow),
-                (negative, overflow),
-                "{input:#010x} flags"
-            );
-        }
-        // The negative rows whose GetCompact(true) keeps the sign: the value
-        // and the flags (the sign is the flag; this service never encodes one).
-        let c = set_compact(0x01fedcba);
-        assert_eq!((c.value, c.negative, c.overflow), (hex("7e"), true, false));
-        let c = set_compact(0x04923456);
-        assert_eq!(
-            (c.value, c.negative, c.overflow),
-            (hex("12345600"), true, false)
-        );
-        // "Make sure that we don't generate compacts with the 0x00800000 bit set".
-        assert_eq!(get_compact(&from_u64(0x80)), 0x02008000);
-        let c = set_compact(0xff123456);
-        assert_eq!((c.negative, c.overflow), (false, true));
+    fn get_compact(a: &U256) -> u32 {
+        a.to_compact()
+    }
+    fn shr(a: &U256, shift: u32) -> U256 {
+        a.shr(shift)
+    }
+    fn add(a: &U256, b: &U256) -> U256 {
+        a.wrapping_add(*b)
+    }
+    fn sub(a: &U256, b: &U256) -> U256 {
+        a.wrapping_sub(*b)
+    }
+    fn cmp(a: &U256, b: &U256) -> Ordering {
+        a.cmp(b)
     }
 
     #[test]
     fn the_pow_limits_are_the_node_values() {
         assert_eq!(
-            to_hex(&ChainParams::main().pow_limit),
+            ChainParams::main().pow_limit.to_hex(),
             "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
         assert_eq!(ChainParams::test().pow_limit, ChainParams::main().pow_limit);
         assert_eq!(
-            to_hex(&ChainParams::regtest().pow_limit),
+            ChainParams::regtest().pow_limit.to_hex(),
             "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
         // GetCompact of the limits: the bits a min-difficulty header carries.
-        assert_eq!(get_compact(&ChainParams::main().pow_limit), 0x1d00ffff);
-        assert_eq!(get_compact(&ChainParams::regtest().pow_limit), 0x207fffff);
+        assert_eq!(ChainParams::main().pow_limit_bits(), 0x1d00ffff);
+        assert_eq!(ChainParams::regtest().pow_limit_bits(), 0x207fffff);
     }
 
     #[test]
     fn check_proof_of_work_refuses_each_range_the_node_refuses() {
         let main = ChainParams::main();
-        let any = hex("1");
+        let any = hex("1").to_le_bytes();
         assert_eq!(
             check_proof_of_work(&any, 0x1d80ffff, &main),
             Err(HeaderFault::BitsNegative { bits: 0x1d80ffff })
@@ -1076,6 +818,10 @@ mod tests {
         assert_eq!(
             check_proof_of_work(&any, 0x407fffff, &main),
             Err(HeaderFault::BitsOverflow { bits: 0x407fffff })
+        );
+        assert_eq!(
+            check_proof_of_work(&any, 0x21123456, &main),
+            Err(HeaderFault::BitsOverflow { bits: 0x21123456 })
         );
         assert_eq!(
             check_proof_of_work(&any, 0x1d000000, &main),
@@ -1093,20 +839,18 @@ mod tests {
         );
         // the hash exactly at the target passes; one above fails.
         let target = set_compact(0x1d00ffff).value;
-        assert_eq!(check_proof_of_work(&target, 0x1d00ffff, &main), Ok(()));
         assert_eq!(
-            check_proof_of_work(&add(&target, &ONE), 0x1d00ffff, &main),
+            check_proof_of_work(&target.to_le_bytes(), 0x1d00ffff, &main),
+            Ok(())
+        );
+        assert_eq!(
+            check_proof_of_work(&add(&target, &U256::ONE).to_le_bytes(), 0x1d00ffff, &main),
             Err(HeaderFault::HighHash { bits: 0x1d00ffff })
         );
-    }
-
-    #[test]
-    fn block_proof_is_get_block_proof() {
-        // genesis bits: 2^256 / (0xffff << 208 + 1) = 0x100010001.
-        assert_eq!(block_proof(0x1d00ffff), hex("100010001"));
-        for bad in [0x1d80ffff, 0x407fffff, 0x1d000000, 0] {
-            assert_eq!(block_proof(bad), ZERO, "{bad:#010x}");
+        for bits in [0x1d80ffff, 0x407fffff, 0x21123456, 0x1d000000, 0x1d010000] {
+            assert_eq!(check_bits(bits, &main).unwrap_err().reason(), "high-hash");
         }
+        assert_eq!(check_bits(0x1d00ffff, &main), Ok(()));
     }
 
     // ─── The node's own vectors for the difficulty rule ─────────────────────
@@ -1374,17 +1118,5 @@ mod tests {
             1001,
             "the walk back, never past genesis"
         );
-    }
-
-    #[test]
-    fn the_arithmetic_agrees_with_itself() {
-        let a = hex("123456789abcdef0fedcba9876543210");
-        assert_eq!(shr(&shl(&a, 77), 77), a);
-        assert_eq!(shl(&a, 256), ZERO);
-        assert_eq!(div(&mul_u32(&a, 600), &from_u64(600)), a);
-        assert_eq!(add(&neg(&a), &a), ZERO);
-        assert_eq!(bits(&ONE), 1);
-        assert_eq!(bits(&shl(&ONE, 200)), 201);
-        assert_eq!(bits(&ZERO), 0);
     }
 }
