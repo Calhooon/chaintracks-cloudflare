@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0] - 2026-10-14
+
+- **The primitives from bsv-rs 0.6.0.** `bsv-rs = "=0.6.0"` (default features
+  off, `block`) is the home of the 80-byte header frame and its hash, the
+  compact target, the proof-of-work check, the per-block and cumulative chain
+  work, `U256` and the pow limits. The service's own copies are deleted (the
+  256-bit arithmetic, `SetCompact` and `GetCompact`, `compute_block_hash`, the
+  hand-written frame) and `sha2` is no longer a direct dependency. The
+  difficulty rule (the legacy retarget, the emergency adjustment, the DAA)
+  stays here, on the bsv-rs types. Stored and served hashes, the 64-hex chain
+  work and the refusal texts are unchanged; `/health` now names `bsv-rs` in
+  `build.crates`, as the lock carries it. One stricter edge: a header frame is
+  exactly 80 bytes (every caller already hands it an 80-byte chunk).
+- **The deny file.** `deny.toml` is the stack's template byte for byte;
+  `cargo deny check` passes advisories, bans, licenses and sources.
+
 ## 0.3.1
 
 - Keep host all-target clippy clean: document Worker helpers retained for host
