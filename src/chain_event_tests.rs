@@ -98,7 +98,9 @@ async fn scenario_announced_nobody_hears_has_a_versioned_reorg() {
         // the P0-4 copy and sha256 are in src/testdata/README.md.
         let raw = include_bytes!("testdata/main_886001_888000.bin");
         let real: Vec<_> = raw[..240]
-            .chunks_exact(80)
+            .as_chunks::<80>()
+            .0
+            .iter()
             .enumerate()
             .map(|(i, bytes)| {
                 let mut h =
