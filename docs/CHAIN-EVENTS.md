@@ -7,13 +7,12 @@ existing kinds below retain their version-1 envelopes and meanings. Readers
 accept both versions; each envelope selects its schema. The poll-page
 carrier stays version 1 and the feed advertises envelope version 2.
 
-[D] This is the Worker contract selected by R1 section 2a of the lane's
+[D] The version-1 Worker contract was selected by R1 section 2a of the lane's
 `docs/RULINGS-2026-10.md`, and the tracker input contract in
 `docs/charters/tracker.md` section 3. The implementation is in `src/events.rs`
-and migration `0009_chain_events.sql`. P0-4 is the base, `461dc39` on
-`f86752b`; the Worker is unpublished, version `0.1.0`. This is an additive
-HTTP capability with a minor-version contract impact. No deployment is part
-of the lane.
+and migrations `0009_chain_events.sql` and `0010_rung_tips.sql`. P0-4 was the
+original base, `461dc39` on `f86752b`. Version 2 adds the split observation
+contract in 0.4.1. No deployment is part of this change.
 
 ## Schema and version rule
 

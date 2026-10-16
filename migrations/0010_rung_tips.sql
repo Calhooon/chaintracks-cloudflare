@@ -21,13 +21,13 @@ LEFT JOIN headers h ON h.hash = r.hash AND h.height = r.height
 -- The store already bounds its branch walks at 400. Missing ancestry is
 -- unknown, never evidence that a previously observed split has resolved.
 CREATE VIEW chain_rung_ancestry AS
-WITH RECURSIVE ancestry(name, hash, previous_header_id, height, distance) AS (
-    SELECT r.name, h.hash, h.previous_header_id, h.height, 0
+WITH RECURSIVE ancestry(name, hash, previous_hash, height, distance) AS (
+    SELECT r.name, h.hash, h.previous_hash, h.height, 0
     FROM sync_rung_headers r JOIN headers h ON h.hash = r.hash
     WHERE r.chain_work IS NOT NULL
     UNION ALL
-    SELECT a.name, p.hash, p.previous_header_id, p.height, a.distance + 1
-    FROM ancestry a JOIN headers p ON p.header_id = a.previous_header_id
+    SELECT a.name, p.hash, p.previous_hash, p.height, a.distance + 1
+    FROM ancestry a JOIN headers p ON p.hash = a.previous_hash
     WHERE a.distance < 400 AND p.height + 1 = a.height
 )
 SELECT * FROM ancestry;

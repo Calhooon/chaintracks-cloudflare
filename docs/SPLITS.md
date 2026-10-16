@@ -101,7 +101,9 @@ resolve it. One lifecycle is retained per fork point, so a later recurrence
 of an already resolved fork does not emit another `split` for that key.
 
 Detection walks stored parent links, at most 400 per rung, and never scans
-the chain or calls a provider. Missing ancestry or a verification ceiling
+the chain or calls a provider. It follows parent hashes, including across
+rows imported in bulk whose numeric parent links are absent. Missing
+ancestry or a verification ceiling
 can leave a pair unclassified; it cannot resolve an open split. Complete
 coverage of a split beyond the bounded ancestry window is not inferred.
 The snapshot updates, split state and journal inserts share one D1 batch.
