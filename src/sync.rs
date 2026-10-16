@@ -136,6 +136,10 @@ pub(crate) fn courier_ladder(
         var("BITAILS_URL"),
         minute,
     )
+    .with_configuration(
+        &crate::rungs::configured(env, chain),
+        env.var("SPLIT_DEPTH").ok().map(|v| v.to_string()),
+    )
 }
 
 /// The deploy's chain from the `CHAIN` var (`"test"`, else main), as the
@@ -261,6 +265,13 @@ pub(crate) trait ChainSource {
     async fn chain_info(&self) -> Result<WocChainInfo>;
     async fn header_by_height(&self, height: u32) -> Result<BlockHeader>;
     async fn header_by_hash(&self, hash: &str) -> Result<BlockHeader>;
+    async fn finish_observations(
+        &self,
+        _db: &impl HeaderDb,
+        _params: &ChainParams,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     /// bsv-low loop 10 D5: the tick's per-courier tally for the log (the
     /// ladder answers; a single source has nothing to report).
     fn report(&self) -> Option<String> {
@@ -284,6 +295,25 @@ impl ChainSource for WocClient {
 
 /// The cron's body, on any store, chain source and webhook consumer.
 pub(crate) async fn run_cron(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    upstream_url: Option<&str>,
+    hooks: &impl TipWebhooks,
+) -> Result<()> {
+    let result = run_cron_inner(db, params, source, upstream_url, hooks).await;
+    match source.finish_observations(db, params).await {
+        Ok(true) => announce_tip(db, hooks, None).await,
+        Ok(false) => {}
+        Err(e) => {
+            record_fault(db, &format!("rung observations: {e}")).await;
+            return Err(e);
+        }
+    }
+    result
+}
+
+async fn run_cron_inner(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,

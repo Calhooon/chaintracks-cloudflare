@@ -268,7 +268,7 @@ async fn unknown_version_kind_or_shape_is_reported_and_not_acknowledged() {
     let (db, params, h) = fixture();
     seed(&db, &params, &h[..1]).await;
     for (bad, expected) in [
-        ("{\"v\":2,\"kind\":\"tip\"}", "unknownVersion"),
+        ("{\"v\":3,\"kind\":\"tip\"}", "unknownVersion"),
         ("{\"v\":1,\"kind\":\"future\"}", "unknownKind"),
         ("{\"v\":1,\"kind\":\"tip\"}", "unknownShape"),
     ] {
@@ -281,7 +281,7 @@ async fn unknown_version_kind_or_shape_is_reported_and_not_acknowledged() {
     db.conn()
         .execute(
             "INSERT INTO chain_events(payload) VALUES (?)",
-            ["{\"v\":2,\"kind\":\"future\"}"],
+            ["{\"v\":3,\"kind\":\"future\"}"],
         )
         .unwrap();
     let error = events::read_page(&db, before, 100).await.err().unwrap();

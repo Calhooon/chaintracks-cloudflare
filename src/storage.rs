@@ -434,6 +434,14 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
             None
         }
     };
+    let rung_tips = match crate::rungs::read(db).await {
+        Ok(tips) => tips,
+        Err(e) => {
+            log_error!("get_info: rung tips unavailable (migration 0010 applied?): {e}");
+            sync_schema_fault.get_or_insert_with(|| format!("{e}"));
+            Vec::new()
+        }
+    };
     Ok(ChaintracksInfo {
         chain: chain.as_str().to_string(),
         height_live: tip_height,
@@ -454,6 +462,7 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
         tip_announce_schema_fault: schema_fault,
         live_lag_blocks,
         last_seen_height,
+        rung_tips,
         last_seen_at: health.as_ref().and_then(|r| r.last_seen_at.clone()),
         last_sync_error: health.as_ref().and_then(|r| r.last_error.clone()),
         last_sync_error_at: health.as_ref().and_then(|r| r.last_error_at.clone()),

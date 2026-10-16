@@ -55,6 +55,9 @@ mod retarget_tests;
 mod routes;
 #[cfg(test)]
 mod rule28_tests;
+mod rungs;
+#[cfg(test)]
+mod split_tests;
 mod sse;
 #[cfg(test)]
 mod statement_pins;
