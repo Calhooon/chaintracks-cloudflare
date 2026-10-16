@@ -76,7 +76,8 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
     }
 
     if method == Method::Get && path == "/health" {
-        return Response::from_json(&crate::health::health()).map(add_cors);
+        let rungs = crate::rungs::configured(env, &crate::sync::chain_of(env));
+        return Response::from_json(&crate::health::health(&rungs)).map(add_cors);
     }
 
     let chain = match env
@@ -165,7 +166,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
 
         // Info & chain
         (Method::Get, "/getChain") => wrap_success(chain.as_str()),
-        (Method::Get, "/getInfo") => get_info(&db, &chain).await,
+        (Method::Get, "/getInfo") => get_info(&db, &chain, env).await,
         (Method::Get, "/currentHeight") => current_height(&db).await,
         // TS ChaintracksService wire parity: the toolbox client and
         // rust-overlay probe /getPresentHeight. Answered from the store
@@ -257,8 +258,10 @@ fn health(chain: &Chain) -> Result<Response> {
     Response::ok(format!("Chaintracks {chain}Net Block Header Service"))
 }
 
-async fn get_info(db: &worker::D1Database, chain: &Chain) -> Result<Response> {
-    let info = storage::get_info(db, chain).await?;
+async fn get_info(db: &worker::D1Database, chain: &Chain, env: &Env) -> Result<Response> {
+    let mut info = storage::get_info(db, chain).await?;
+    info.rung_tips =
+        crate::rungs::for_config(&crate::rungs::configured(env, chain), info.rung_tips);
     wrap_success(&info)
 }
 
@@ -1004,7 +1007,7 @@ async fn event_response(
         let headers = Headers::new();
         headers.set("Content-Type", "application/json")?;
         headers.set("Cache-Control", "no-store")?;
-        headers.set("X-Chain-Event-Version", "1")?;
+        headers.set("X-Chain-Event-Version", "2")?;
         Ok(Response::ok(page.json())?.with_headers(headers))
     }
 }

@@ -4,6 +4,11 @@ compatibility_date = "2024-01-01"
 account_id = "<your-account-id>"
 
 [vars]
+# The chain implementation each rung follows; override for your providers.
+WOC_IMPLEMENTATION = "reference"
+ARCADE_IMPLEMENTATION = "teranode"
+BITAILS_IMPLEMENTATION = "reference"
+SPLIT_DEPTH = "3"
 CHAIN = "main"
 # No CHECKPOINTS entry: the anchor is the node's own list (the last at 530359), and every stored row above it is
 # re-validated by the service's rules. The entry at 965000 of 2026-10-09 (two explorers agreeing, taken for time)
@@ -89,6 +94,10 @@ head_sampling_rate = 1
 name = "rust-chaintracks-beta"
 
 [env.beta.vars]
+WOC_IMPLEMENTATION = "reference"
+ARCADE_IMPLEMENTATION = "teranode"
+BITAILS_IMPLEMENTATION = "reference"
+SPLIT_DEPTH = "3"
 CHAIN = "main"
 ARCADE_URL = "<your-arcade-url>"
 BITAILS_URL = "<your-bitails-url>"

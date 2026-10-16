@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.1] - 2026-10-16
+
+- Add `rungTips` to `/getInfo`: each configured courier's latest highest tip,
+  implementation label, observation time, and current stored work and active
+  membership. Polls ingest advertised competing tips through the existing
+  validation path, including tips below the highest provider's height.
+- Add version-2 `split` and `splitResolved` chain events, keyed by the common
+  ancestor hash. Both branches must reach `SPLIT_DEPTH` (default 3); the D1
+  snapshot and event commit atomically, once per fork point. Existing
+  version-1 events and transport shapes stay readable. Strict consumers must
+  support version 2 before deployment. See `docs/SPLITS.md` for the schema,
+  bounded ancestry walk, lifecycle, migration 0010 and replay implications.
+- Add the critical `checks.rungSpan` configuration check to `/health`, with
+  the labels present and `warn` unless `reference` and `teranode` or `peer`
+  are represented. Label overrides use Worker vars. Warnings keep serving.
+- Keep the store's most-work tip rule and the crate version unchanged in
+  this change; the release commit sets the version.
+
 ## [0.4.0] - 2026-10-14
 
 - **The primitives from bsv-rs 0.6.0.** `bsv-rs = "=0.6.0"` (default features

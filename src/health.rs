@@ -1,5 +1,5 @@
 //! Build identity, independent of chain storage and readiness.
-pub(crate) fn health() -> serde_json::Value {
+pub(crate) fn health(rungs: &[crate::rungs::Definition]) -> serde_json::Value {
     // The crates the Worker carries: its own, and bsv-rs only when the lock
     // names it (a key for an absent dependency would read as drift).
     let mut crates = serde_json::Map::new();
@@ -13,6 +13,7 @@ pub(crate) fn health() -> serde_json::Value {
     serde_json::json!({
         "service": "chaintracks",
         "status": "ok",
+        "checks": { "rungSpan": rung_span(rungs) },
         "build": {
             "lib_rev": option_env!("CHAINTRACKS_LIB_REV").unwrap_or("unknown"),
             "dirty": option_env!("CHAINTRACKS_DIRTY").unwrap_or("false") == "true",
@@ -22,14 +23,62 @@ pub(crate) fn health() -> serde_json::Value {
     })
 }
 
+pub(crate) fn rung_span(rungs: &[crate::rungs::Definition]) -> serde_json::Value {
+    let mut labels: Vec<_> = rungs.iter().map(|r| r.implementation.as_str()).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    let spans =
+        labels.contains(&"reference") && (labels.contains(&"teranode") || labels.contains(&"peer"));
+    let known = labels
+        .iter()
+        .all(|l| matches!(*l, "reference" | "teranode" | "peer"));
+    serde_json::json!({
+        "critical": true,
+        "status": if spans && known { "ok" } else { "warn" },
+        "labels": labels,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rung_span_has_both_allowed_spans_and_warns_on_missing_labels() {
+        let check = |labels: &[&str]| {
+            super::rung_span(
+                &labels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| crate::rungs::Definition {
+                        name: i.to_string(),
+                        implementation: (*label).into(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(check(&["reference", "teranode"])["status"], "ok");
+        assert_eq!(check(&["reference", "peer"])["status"], "ok");
+        for labels in [
+            &["reference"][..],
+            &["peer", "teranode"][..],
+            &[][..],
+            &["reference", "unknown"][..],
+        ] {
+            let value = check(labels);
+            assert_eq!(value["status"], "warn");
+            assert_eq!(value["critical"], true);
+            assert!(value["labels"].is_array());
+        }
+    }
+
+    #[test]
     fn health_shape() {
-        let value = super::health();
+        let value = super::health(&crate::rungs::definitions(
+            &crate::types::Chain::Main,
+            |_| None,
+        ));
         assert_eq!(value["service"], "chaintracks");
         assert_eq!(value["status"], "ok");
-        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value.as_object().unwrap().len(), 4);
         let build = &value["build"];
         assert_eq!(build.as_object().unwrap().len(), 4);
         let rev = build["lib_rev"].as_str().unwrap();

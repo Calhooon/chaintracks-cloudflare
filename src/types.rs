@@ -257,6 +257,8 @@ pub struct ChaintracksInfo {
     pub live_lag_blocks: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_height: Option<u32>,
+    #[serde(default)]
+    pub rung_tips: Vec<crate::rungs::RungTip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
     /// The LAST poll fault (a courier refusal, an ingest fault), with its time;

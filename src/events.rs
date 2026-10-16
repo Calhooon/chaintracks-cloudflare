@@ -48,6 +48,15 @@ pub struct Outpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SplitTip {
+    pub hash: String,
+    pub height: u32,
+    pub chain_work: String,
+    pub rungs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum ChainEvent {
     #[serde(rename = "tip")]
@@ -83,6 +92,19 @@ pub enum ChainEvent {
     Frozen { outpoint: Outpoint },
     #[serde(rename = "tipAge")]
     TipAge { seconds: u64, tip: EventHeader },
+    #[serde(rename = "split")]
+    Split {
+        key: String,
+        #[serde(rename = "forkHeight")]
+        fork_height: u32,
+        tips: Vec<SplitTip>,
+    },
+    #[serde(rename = "splitResolved")]
+    SplitResolved {
+        key: String,
+        #[serde(rename = "forkHeight")]
+        fork_height: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -107,17 +129,19 @@ pub fn decode(payload: &str) -> Result<Envelope> {
     let version = record
         .remove("v")
         .ok_or_else(|| fault("unknownVersion: missing v"))?;
-    if version.as_u64() != Some(1) {
+    if !matches!(version.as_u64(), Some(1 | 2)) {
         return Err(fault(format!("unknownVersion: {version}")));
     }
     let kind = record
         .get("kind")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    if !matches!(
+    let split_kind = matches!(kind, "split" | "splitResolved");
+    if !(matches!(
         kind,
         "tip" | "fork" | "reorg" | "invalidated" | "frozen" | "tipAge"
-    ) {
+    ) || (version.as_u64() == Some(2) && split_kind))
+    {
         return Err(fault(format!("unknownKind: {kind}")));
     }
     let event: ChainEvent =
@@ -129,6 +153,11 @@ pub fn decode(payload: &str) -> Result<Envelope> {
             && valid_hash(&h.previous_hash)
             && valid_hash(&h.merkle_root)
             && valid_hash(&h.chain_work)
+    };
+    let valid_split_key = |key: &str, height: u32| {
+        height > 0
+            && height <= i32::MAX as u32
+            && key.strip_prefix("split:").is_some_and(valid_hash)
     };
     let valid = match &event {
         ChainEvent::Tip {
@@ -178,11 +207,37 @@ pub fn decode(payload: &str) -> Result<Envelope> {
         ChainEvent::Invalidated { block_hash } => valid_hash(block_hash),
         ChainEvent::Frozen { outpoint } => valid_hash(&outpoint.txid),
         ChainEvent::TipAge { tip, .. } => valid_header(tip),
+        ChainEvent::Split {
+            key,
+            fork_height,
+            tips,
+        } => {
+            valid_split_key(key, *fork_height)
+                && tips.len() == 2
+                && tips.iter().all(|tip| {
+                    valid_hash(&tip.hash)
+                        && valid_hash(&tip.chain_work)
+                        && tip.height >= *fork_height
+                        && tip.height <= i32::MAX as u32
+                        && !tip.rungs.is_empty()
+                        && tip.rungs.iter().all(|name| !name.is_empty())
+                        && tip.rungs.windows(2).all(|names| names[0] < names[1])
+                })
+                && tips[0].hash != tips[1].hash
+                && tips[0]
+                    .rungs
+                    .iter()
+                    .all(|name| !tips[1].rungs.contains(name))
+        }
+        ChainEvent::SplitResolved { key, fork_height } => valid_split_key(key, *fork_height),
     };
     if !valid {
         return Err(fault("unknownShape: inconsistent chain event"));
     }
-    Ok(Envelope { v: 1, event })
+    Ok(Envelope {
+        v: version.as_u64().unwrap() as u8,
+        event,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -466,7 +521,7 @@ pub async fn stream(
     let headers = worker::Headers::new();
     headers.set("Content-Type", "text/event-stream")?;
     headers.set("Cache-Control", "no-store")?;
-    headers.set("X-Chain-Event-Version", "1")?;
+    headers.set("X-Chain-Event-Version", "2")?;
     headers.set("Access-Control-Expose-Headers", "X-Chain-Event-Version")?;
     headers.set("Access-Control-Allow-Origin", "*")?;
     worker::Response::from_stream(body).map(|r| r.with_headers(headers))

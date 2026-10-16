@@ -284,7 +284,9 @@ impl ChainSource for Courier {
 
 struct Rung<S> {
     name: &'static str,
+    implementation: String,
     source: S,
+    observed: RefCell<Option<(WocChainInfo, u64)>>,
     ok: Cell<u32>,
     faults: Cell<u32>,
 }
@@ -305,6 +307,7 @@ pub struct CourierLadder<S> {
     faults: RefCell<Vec<String>>,
     /// The chain's rules every answer is bound to (P0-4).
     params: ChainParams,
+    split_depth: Option<String>,
 }
 
 impl CourierLadder<Courier> {
@@ -351,7 +354,9 @@ impl<S: ChainSource> CourierLadder<S> {
                 .into_iter()
                 .map(|(name, source)| Rung {
                     name,
+                    implementation: crate::rungs::default_implementation(name).into(),
                     source,
+                    observed: RefCell::new(None),
                     ok: Cell::new(0),
                     faults: Cell::new(0),
                 })
@@ -360,7 +365,22 @@ impl<S: ChainSource> CourierLadder<S> {
             preferred: Cell::new(None),
             faults: RefCell::new(Vec::new()),
             params,
+            split_depth: None,
         }
+    }
+
+    pub fn with_configuration(
+        mut self,
+        definitions: &[crate::rungs::Definition],
+        split_depth: Option<String>,
+    ) -> Self {
+        for rung in &mut self.rungs {
+            if let Some(d) = definitions.iter().find(|d| d.name == rung.name) {
+                rung.implementation.clone_from(&d.implementation);
+            }
+        }
+        self.split_depth = split_depth;
+        self
     }
 
     /// The rungs to ask, in order: the tick's preferred rung first, then the
@@ -460,9 +480,17 @@ impl<S: ChainSource> ChainSource for CourierLadder<S> {
     async fn chain_info(&self) -> worker::Result<WocChainInfo> {
         let mut best: Option<(usize, WocChainInfo)> = None;
         for i in self.order() {
+            let observed_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
             match self.rungs[i].source.chain_info().await {
                 Ok(info) => {
                     self.note_ok(i);
+                    *self.rungs[i].observed.borrow_mut() = Some((
+                        WocChainInfo {
+                            blocks: info.blocks,
+                            best_block_hash: info.best_block_hash.clone(),
+                        },
+                        observed_at,
+                    ));
                     if best.as_ref().is_none_or(|(_, b)| info.blocks > b.blocks) {
                         best = Some((i, info));
                     }
@@ -537,5 +565,102 @@ impl<S: ChainSource> ChainSource for CourierLadder<S> {
 
     fn report(&self) -> Option<String> {
         Some(self.summary())
+    }
+
+    async fn finish_observations(
+        &self,
+        db: &impl crate::d1::HeaderDb,
+        params: &ChainParams,
+    ) -> worker::Result<bool> {
+        use crate::rungs::{Definition, Observation};
+        let depth = crate::rungs::split_depth(self.split_depth.as_deref())?;
+        let before = crate::storage::find_chain_tip(db).await?.map(|h| h.hash);
+        let mut observations = Vec::with_capacity(self.rungs.len());
+        for (i, rung) in self.rungs.iter().enumerate() {
+            let observed = rung
+                .observed
+                .borrow()
+                .as_ref()
+                .map(|(info, at)| (info.blocks, info.best_block_hash.clone(), *at));
+            let mut observation = None;
+            if let Some((height, hash, observed_at)) = observed {
+                let valid_hash = hash
+                    .as_ref()
+                    .is_none_or(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+                if height > i32::MAX as u32 || !valid_hash {
+                    self.note_fault(i, "tip observation", &rust_err("malformed tip".into()));
+                } else {
+                    let hash = hash.map(|h| h.to_ascii_lowercase());
+                    let stored = match &hash {
+                        Some(h) => crate::storage::find_header_for_hash(db, h).await?,
+                        None => None,
+                    };
+                    let checked = stored.as_ref().is_some_and(|h| {
+                        h.height == height && (h.is_active || h.previous_header_id.is_some())
+                    });
+                    let mut served_hash = hash.clone();
+                    if !checked && !rung.skipped() {
+                        let answer = match &hash {
+                            Some(h) => rung.source.header_by_hash(h).await,
+                            None => rung.source.header_by_height(height).await,
+                        }
+                        .and_then(|h| {
+                            if h.height != height
+                                || hash
+                                    .as_ref()
+                                    .is_some_and(|want| !h.hash.eq_ignore_ascii_case(want))
+                            {
+                                return Err(rust_err(
+                                    "tip header does not match the rung's announcement".into(),
+                                ));
+                            }
+                            self.bind(rung.name, h, "advertised tip")
+                        });
+                        match answer {
+                            Ok(header) => {
+                                self.note_ok(i);
+                                served_hash = Some(header.hash.to_ascii_lowercase());
+                                if let Err(e) = crate::sync::insert_with_parent_backfill(
+                                    db, params, self, header,
+                                )
+                                .await
+                                {
+                                    crate::sync::record_fault(
+                                        db,
+                                        &format!("{} tip ingest: {e}", rung.name),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => {
+                                self.note_fault(i, "advertised tip", &e);
+                                crate::sync::record_fault(db, &format!("{} tip: {e}", rung.name))
+                                    .await;
+                            }
+                        }
+                    }
+                    if let Some(hash) = served_hash {
+                        observation = Some(Observation {
+                            hash,
+                            height,
+                            observed_at,
+                        });
+                    }
+                }
+            }
+            observations.push((
+                Definition {
+                    name: rung.name.into(),
+                    implementation: rung.implementation.clone(),
+                },
+                observation,
+            ));
+        }
+        let after = crate::storage::find_chain_tip(db).await?.map(|h| h.hash);
+        if before != after {
+            crate::sync::revalidate(db, params).await;
+        }
+        crate::rungs::record(db, &observations, depth).await?;
+        Ok(before != after)
     }
 }

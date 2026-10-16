@@ -1,4 +1,11 @@
-# Chain events, version 1 (#32)
+# Chain events, versions 1 and 2
+
+Version 2 adds `split` and `splitResolved` for persistent disagreement among
+the configured rungs. Their common-ancestor key, depth rule, per-rung tips,
+health check and migration are specified in [SPLITS.md](SPLITS.md). The
+existing kinds below retain their version-1 envelopes and meanings. Readers
+accept both versions; each envelope selects its schema. The poll-page
+carrier stays version 1 and the feed advertises envelope version 2.
 
 [D] This is the Worker contract selected by R1 section 2a of the lane's
 `docs/RULINGS-2026-10.md`, and the tracker input contract in
@@ -92,7 +99,7 @@ data: {"v":1,"kind":"invalidated","blockHash":"000000000000000000000000000000000
 replays the journal, checks D1 every 15 seconds when caught up, and sends
 comment heartbeats during quiet intervals. Dropping the response cancels its
 timer. Pages and streams use `Cache-Control: no-store` and
-`X-Chain-Event-Version: 1`. A journal/decoder fault before the stream opens
+`X-Chain-Event-Version: 2`. A journal/decoder fault before the stream opens
 is an HTTP error; after opening it is an SSE `event: error` with a reported
 `feedUnavailable` body and no id, followed by EOF. That fault is not a chain
 envelope and cannot acknowledge the failed record.
@@ -205,7 +212,8 @@ at the heights of proofs it holds, rechecks their roots, and reports lookup
 failures as unable to verify. It performs no transaction, address, output or
 chain scan.
 
-[D] Tracker `ChainEvent` maps directly onto all six kinds. On a fork it marks
+[D] The version-1 tracker `ChainEvent` maps onto the six original kinds;
+version-2 split handling requires a consumer upgrade. On a fork it marks
 only proofs at or above `height` suspect. On a reorg it marks only those at
 or above `forkHeight` stale and schedules a re-ask; on invalidation it targets
 the checked block hash. A tip rechecks the suspect set. Frozen inputs and tip
