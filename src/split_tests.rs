@@ -265,7 +265,25 @@ async fn configured_depth_and_shared_tip_rung_names_reach_the_feed() {
     ];
     crate::rungs::record(&db, &snapshot, 3).await.unwrap();
     assert!(splits(&db).is_empty());
-    crate::rungs::record(&db, &snapshot, 2).await.unwrap();
+    let ladder = CourierLadder::new(
+        vec![
+            ("woc", source(&a[..=2])),
+            ("arcade", source(&b[..=2])),
+            ("bitails", source(&a[..=2])),
+        ],
+        0,
+        regtest().clone(),
+    )
+    .with_configuration(&[], Some("2".into()));
+    run_cron(
+        &db,
+        regtest(),
+        &ladder,
+        None,
+        &RecordedWebhooks::new("", ""),
+    )
+    .await
+    .unwrap();
     let event = splits(&db).pop().unwrap();
     let tip = event["tips"]
         .as_array()
@@ -326,4 +344,44 @@ async fn configured_depth_and_shared_tip_rung_names_reach_the_feed() {
             .to_string()
             .contains("unknownShape"));
     }
+}
+
+#[tokio::test]
+async fn split_walk_follows_bulk_parent_hashes_without_numeric_links() {
+    let (db, a, b) = stored_fork().await;
+    // The bulk importer can leave active rows without previous_header_id.
+    db.conn()
+        .execute(
+            "UPDATE headers SET previous_header_id = NULL WHERE is_active = 1",
+            [],
+        )
+        .unwrap();
+    crate::rungs::record(
+        &db,
+        &[
+            observed("woc", Some(&a[3]), 1),
+            observed("arcade", Some(&b[3]), 1),
+        ],
+        3,
+    )
+    .await
+    .unwrap();
+    let events = splits(&db);
+    assert_eq!(
+        events.len(),
+        1,
+        "stored parent hashes must establish the fork across bulk rows"
+    );
+    assert_eq!(events[0]["key"], format!("split:{}", a[0].hash));
+    crate::rungs::record(
+        &db,
+        &[
+            observed("woc", Some(&a[3]), 2),
+            observed("arcade", Some(&a[2]), 2),
+        ],
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(splits(&db)[1]["kind"], "splitResolved");
 }

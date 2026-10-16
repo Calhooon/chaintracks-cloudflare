@@ -79,6 +79,7 @@ print(json.dumps(statements))
       .bind(h.previousHash, h.previousHash, h.height, a.includes(h) ? 1 : 0, h === a[4] ? 1 : 0,
         h.hash, (BigInt(h.height - root.height + 1) * 2n).toString(16).padStart(64, '0'), h.version, h.merkleRoot, h.time, h.bits, h.nonce).run()
   }
+  await db.prepare('UPDATE headers SET previous_header_id = NULL WHERE is_active = 1').run()
   await db.prepare('UPDATE sync_state SET validation_complete = 1 WHERE id = 1').run()
   const worker = await mf.getWorker()
   const cron = () => worker.scheduled({cron: '* * * * *'})
@@ -124,7 +125,7 @@ print(json.dumps(statements))
   assert.deepEqual(JSON.parse(closed[1].payload), {v: 2, kind: 'splitResolved', key: event.key, forkHeight: event.forkHeight})
   assert.ok(delivered.includes(closed[1].payload))
   assert.equal((await (await get('/currentHeight')).json()).value, a[4].height)
-  console.log('Local compiled Worker GREEN (split): depth 2/3, per-rung tips, config labels, failed rung, shared key, poll/SSE/webhook bytes, resolution; outbound intercepted')
+  console.log('Local compiled Worker GREEN (split): depth 2/3, bulk parent hashes, per-rung tips, config labels, failed rung, shared key, poll/SSE/webhook bytes, resolution; outbound intercepted')
 } finally {
   await mf.dispose()
 }
