@@ -3,6 +3,7 @@
 name: ci
 'on':
   pull_request: null
+  workflow_call: null
   push:
     branches:
     - main

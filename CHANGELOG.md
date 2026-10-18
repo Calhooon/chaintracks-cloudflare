@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.3] - 2026-10-18
+
+- Publishable to crates.io as `bsv-chaintracks-cloudflare`; the library keeps
+  `rust_chaintracks`, so no `use` path moves. The manifest gains the
+  description, repository, readme and an `include` list (the sources and
+  their header fixtures, the migrations, `wrangler.toml`, the docs, the
+  README, the licence and this changelog).
+- `.github/workflows/release.yml` publishes on a `v*` tag through crates.io
+  trusted publishing: the tag must equal the manifest version and sit on
+  `main`, the CI gate runs (`ci.yml` is now callable), and the package is
+  verified with `cargo publish --dry-run` on the host before the publish.
+- README refreshed to the code at this tag, with a Releases section. The
+  Worker's behaviour, routes, bindings and wrangler config are unchanged.
+
 ## [0.4.2] - 2026-10-18
 
 - The page and stream routes deliver every stored chain event at its cursor.
