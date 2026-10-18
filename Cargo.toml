@@ -1,10 +1,31 @@
 [package]
-name = "rust-chaintracks"
-version = "0.4.2"
+name = "bsv-chaintracks-cloudflare"
+version = "0.4.3"
+description = "A BSV block-header service on Cloudflare Workers: D1 header storage, R2 bulk export, a chain-event feed."
 license = "MIT"
+repository = "https://github.com/Calhooon/chaintracks-cloudflare"
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "chaintracks", "cloudflare", "wasm"]
+categories = ["cryptography::cryptocurrencies"]
 edition = "2021"
+# The sources with their test fixtures (each under a megabyte), the migrations
+# and wrangler.toml the tests read, the docs the README links, the records.
+include = [
+    "src/**/*.rs",
+    "src/testdata/*",
+    "build.rs",
+    "migrations/*.sql",
+    "wrangler.toml",
+    "docs/*.md",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [lib]
+# The crates.io name is bsv-chaintracks-cloudflare; the library keeps its
+# identifier so no `use` path moves.
+name = "rust_chaintracks"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
