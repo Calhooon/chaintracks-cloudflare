@@ -10,7 +10,8 @@ carrier stays version 1 and the feed advertises envelope version 2.
 [D] The version-1 Worker contract was selected by R1 section 2a of the lane's
 `docs/RULINGS-2026-10.md`, and the tracker input contract in
 `docs/charters/tracker.md` section 3. The implementation is in `src/events.rs`
-and migrations `0009_chain_events.sql` and `0010_rung_tips.sql`. P0-4 was the
+and migrations `0009_chain_events.sql`, `0010_rung_tips.sql` and
+`0011_fork_depth.sql`. P0-4 was the
 original base, `461dc39` on `f86752b`. Version 2 adds the split observation
 contract in 0.4.1. No deployment is part of this change.
 
@@ -34,9 +35,15 @@ type ChainEvent =
   | { v: 1; kind: 'invalidated'; blockHash: string }
   | { v: 1; kind: 'frozen'; outpoint: { txid: string; vout: number } }
   | { v: 1; kind: 'tipAge'; seconds: number; tip: H }
+  | { v: 1; kind: 'unreadable'; cursor: number; fault: string }
 ```
 
-[D] Version 1 has exactly these kinds and fields. Changing a kind, field,
+[D] Version 1 has exactly these kinds and fields. `unreadable` (0.4.2,
+chaintracks-cloudflare #8) is not a chain fact: the service writes it on
+delivery, never in the journal, in the place of a stored row that its own
+`decode` refuses; `cursor` is that row's cursor and `fault` the decoder's
+refusal. A version-1 reader built before 0.4.2 reads it as an unknown kind
+and stops at its cursor, which is the expected behavior of every reader. Changing a kind, field,
 meaning, or accepted shape requires another version and a release note.
 Unknown versions, kinds and malformed known shapes are reported errors.
 `src/events.rs::decode` implements this rule and validates the relationships
@@ -46,7 +53,10 @@ roots; parsing a shape is not proof of inclusion.
 [D] `fork.height` and `reorg.forkHeight` are the lowest affected height,
 one above the common ancestor. A fork carries the currently served tip and
 the checked competitor, including their competing work; its depth is the
-current tip height minus the ancestor height. A reorg's depth counts removed
+current tip height minus the ancestor height, at least 1: a competitor whose
+nearest active ancestor stands at or above the served tip is above what was
+served and journals no fork (migration 0011; a bulk span's rows are active
+before the tip flag moves, and 0009 wrote depth 0 or -1 there). A reorg's depth counts removed
 headers; they run from the prior served tip down to the fork height, with
 no gaps. `newTip` is the verified new tip. A tied competitor emits `fork`
 before the winner emits `reorg`, `tip`, and `tipAge`. The existing 400-step
@@ -83,6 +93,16 @@ opaque decimal strings, scoped to one chain/database, within D1's exact
 integer range; skipped numbers are allowed. A malformed cursor is HTTP 400;
 a cursor ahead of this journal is HTTP 409 `cursorAhead`, an incident the
 client reports. No retention deletion is implemented in this migration.
+
+[D] Every stored row is delivered at its cursor, in order. A stored row the
+service cannot decode itself is delivered in its place as
+`{"v":1,"kind":"unreadable","cursor":<n>,"fault":"<the decode fault>"}`, on
+the page, the stream and the webhook alike; the page's `cursor` and
+`hasMore` count it like any row, and the route never answers 500 for it.
+The reader stops at that cursor and reports it, as for any envelope it
+cannot interpret (bsv-tracker's gate: `UnknownKind`); the operator reads the
+stored row by its cursor. The compatibility views send its `id:` line with
+no data, like a kind they do not match.
 
 [D] `GET /events/stream?since=<cursor>` is a long-lived SSE stream:
 
@@ -203,8 +223,8 @@ the same wallet package. See the lane report for commands and tails.
 
 ## Client contract and consumers
 
-[D] An unknown version or kind, or a malformed known shape, is an error the
-client reports through a status, metric, or error to its listener. It stops
+[D] An unknown version or kind, or a malformed known shape, and an
+`unreadable` envelope, is an error the client reports through a status, metric, or error to its listener. It stops
 processing at the offending cursor, with no acknowledgment, skip, or silent
 reconnect. A client with no chain-event feed polls the header service only
 at the heights of proofs it holds, rechecks their roots, and reports lookup
@@ -241,6 +261,12 @@ this branch only on the owner's beta go. Configure canonical webhook targets
 and their token only when consumers implement the contract. Existing height
 webhook targets retain `{height, hash, reorgFrom?}`. The schema is additive;
 0009 starts its journal from the verified served tip and retains all events.
+
+[D] 0.4.2 applies migration 0011 after 0010: it drops and recreates the two
+fork triggers, writes no row and rewrites none. Rows 0009 already stored
+with depth 0 or below stay in the journal and are delivered `unreadable`
+(chaintracks-cloudflare #8). Rolling 0011 back is re-running the two
+`CREATE TRIGGER chain_event_fork_*` statements of 0009 after dropping them.
 
 [D] To roll back, disable the 0009 triggers (the SQL below), then restore the
 P0-4 Worker. Keep the journal and delivery tables for investigation or replay;

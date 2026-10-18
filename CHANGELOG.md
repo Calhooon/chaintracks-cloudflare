@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.2] - 2026-10-18
+
+- The page and stream routes deliver every stored chain event at its cursor.
+  A stored row the service cannot decode goes out in its place as
+  `{"v":1,"kind":"unreadable","cursor":<n>,"fault":"<the decode fault>"}`
+  (poll page, SSE stream and webhook body alike), never dropped and never an
+  HTTP 500 for the page that holds it; `hasMore`, `cursorAhead` and
+  `feedUnavailable` are unchanged. A version-1 reader stops at that cursor.
+  The compatibility views send its `id:` line alone (chaintracks-cloudflare
+  #8: ten such rows on the beta answered 500 to every page holding them).
+- Migration 0011 rewrites the two fork triggers of 0009 with one condition:
+  no fork is journaled when the competitor's nearest active ancestor stands
+  at or above the served tip. A bulk span writes its rows active before it
+  moves the tip flag, so the cron's next header landed inactive above a
+  lagging tip and 0009 wrote `fork` with depth -1 or 0, which the decoder
+  refuses. Existing rows are not rewritten.
+
 ## [0.4.1] - 2026-10-16
 
 - Add `rungTips` to `/getInfo`: each configured courier's latest highest tip,
