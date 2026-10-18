@@ -100,7 +100,29 @@ print(json.dumps(statements))
   await heartbeat.read()
   assert.equal(new TextDecoder().decode((await heartbeat.read()).value), ': heartbeat\n\n')
   await heartbeat.cancel()
-  console.log('Local compiled Worker GREEN: D1 migrations/triggers, poll/SSE byte equality, both TS route aliases, Last-Event-ID, live delivery, 15 s heartbeat, bad/future cursor statuses')
+  // chaintracks-cloudflare #8: a stored row the Worker cannot decode (the
+  // beta's fork shape, depth -1) is delivered unreadable at its cursor.
+  const beta = {v: 1, kind: 'fork', height: reorg.event.newTip.height + 1, depth: -1, competingTips: [reorg.event.deactivatedHeaders[0], reorg.event.newTip]}
+  await db.prepare('INSERT INTO chain_events(payload) VALUES (?)').bind(JSON.stringify(beta)).run()
+  const held = await get('/events?since=' + since.cursor)
+  assert.equal(held.status, 200)
+  const heldPage = JSON.parse(await held.text())
+  assert.equal(heldPage.events.length, 1)
+  const bad = heldPage.events[0]
+  assert.equal(heldPage.cursor, bad.cursor)
+  assert.equal(heldPage.hasMore, false)
+  assert.deepEqual(Object.keys(bad.event), ['v', 'kind', 'cursor', 'fault'])
+  assert.equal(bad.event.v, 1)
+  assert.equal(bad.event.kind, 'unreadable')
+  assert.equal(String(bad.event.cursor), bad.cursor)
+  assert(bad.event.fault.startsWith('unknownShape: invalid value: integer `-1`'), bad.event.fault)
+  const framed = (await get('/events/stream?since=' + since.cursor)).body.getReader()
+  assert(new TextDecoder().decode((await framed.read()).value).includes(`id: ${bad.cursor}\ndata: ${JSON.stringify(bad.event)}\n\n`))
+  await framed.cancel()
+  const viewed = (await get('/v2/reorg/stream?since=' + since.cursor)).body.getReader()
+  assert.equal(new TextDecoder().decode((await viewed.read()).value), `id: ${bad.cursor}\n\n`)
+  await viewed.cancel()
+  console.log('Local compiled Worker GREEN: D1 migrations/triggers, poll/SSE byte equality, both TS route aliases, Last-Event-ID, live delivery, 15 s heartbeat, bad/future cursor statuses, an undecodable stored row unreadable at its cursor (#8)')
 } finally {
   await mf.dispose()
 }

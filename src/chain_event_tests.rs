@@ -271,6 +271,10 @@ async fn unknown_version_kind_or_shape_is_reported_and_not_acknowledged() {
         ("{\"v\":3,\"kind\":\"tip\"}", "unknownVersion"),
         ("{\"v\":1,\"kind\":\"future\"}", "unknownKind"),
         ("{\"v\":1,\"kind\":\"tip\"}", "unknownShape"),
+        (
+            "{\"v\":1,\"kind\":\"unreadable\",\"cursor\":7,\"fault\":\"x\"}",
+            "unknownKind",
+        ),
     ] {
         assert!(events::decode(bad)
             .unwrap_err()
@@ -284,18 +288,132 @@ async fn unknown_version_kind_or_shape_is_reported_and_not_acknowledged() {
             ["{\"v\":3,\"kind\":\"future\"}"],
         )
         .unwrap();
-    let error = events::read_page(&db, before, 100).await.err().unwrap();
-    assert!(error.to_string().contains("unknownVersion"));
+    // #8: the service delivers the row it cannot decode as `unreadable` at
+    // its cursor; the reader's decoder refuses it there, so nothing past it
+    // is acknowledged by a reader that keeps the contract.
+    let page = events::read_page(&db, before, 100).await.unwrap();
+    assert_eq!(page.events.len(), 1);
+    let row = &page.events[0];
+    assert_eq!(page.cursor, row.cursor);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&row.payload).unwrap(),
+        serde_json::json!({"v": 1, "kind": "unreadable", "cursor": row.cursor, "fault": "unknownVersion: 3"})
+    );
+    assert!(events::decode(&row.payload)
+        .unwrap_err()
+        .to_string()
+        .contains("unknownKind: unreadable"));
+    // A webhook receives the same envelope and its cursor moves only on the
+    // receiver's 2xx: a receiver that refuses it is held at the cursor.
     let hooks = RecordedWebhooks::new("https://consumer.example/events", "synthetic-bearer");
-    assert!(events::deliver(&db, &hooks).await.is_err());
-    assert!(hooks.take().is_empty());
+    hooks.reply_for(
+        "https://consumer.example/events",
+        WebhookDelivery::Failed("unknownKind: unreadable".into()),
+    );
+    db.conn()
+        .execute(
+            "INSERT INTO chain_event_deliveries(target, cursor) VALUES (?, ?)",
+            rusqlite::params!["=https://consumer.example/events", before as i64],
+        )
+        .unwrap();
+    events::deliver(&db, &hooks).await.unwrap();
+    let posts = hooks.take();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body, row.payload);
     assert_eq!(
         db.conn()
-            .query_row("SELECT COUNT(*) FROM chain_event_deliveries", [], |r| r
+            .query_row("SELECT cursor FROM chain_event_deliveries", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        0
+        before as i64
     );
+}
+
+/// chaintracks-cloudflare #8: the beta's stored shape (a `fork` with depth
+/// -1) inside a page. Every row keeps its cursor and place, the page's
+/// cursor and `hasMore` are those of the rows, the stream frames the same
+/// bytes, and the compatibility views keep its id with no data.
+#[tokio::test]
+async fn an_undecodable_stored_row_is_delivered_unreadable_at_its_cursor() {
+    let (db, params, h) = fixture();
+    seed(&db, &params, &h[..2]).await;
+    let before = events::head(&db).await.unwrap();
+    let served = EventHeader::from(&h[1]);
+    let competitor = EventHeader::from(&header(103, "#8 the next block", &h[2].hash));
+    let beta_row = serde_json::json!({"v": 1, "kind": "fork", "height": 103, "depth": -1, "competingTips": [served, competitor]}).to_string();
+    let frozen = |n: &str| {
+        serde_json::to_string(&Envelope {
+            v: 1,
+            event: ChainEvent::Frozen {
+                outpoint: Outpoint {
+                    txid: block_hash(n),
+                    vout: 0,
+                },
+            },
+        })
+        .unwrap()
+    };
+    for payload in [frozen("#8 one"), beta_row.clone(), frozen("#8 two")] {
+        db.conn()
+            .execute("INSERT INTO chain_events(payload) VALUES (?)", [payload])
+            .unwrap();
+    }
+    let bad = before + 2;
+
+    let first = events::read_page(&db, before, 2).await.unwrap();
+    assert_eq!(
+        first.events.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        vec![before + 1, bad]
+    );
+    assert!(first.has_more);
+    assert_eq!(first.cursor, bad);
+    assert_eq!(first.events[0].payload, frozen("#8 one"));
+    assert!(first.events[0].fault.is_none());
+    let unreadable = &first.events[1];
+    let value: serde_json::Value = serde_json::from_str(&unreadable.payload).unwrap();
+    assert_eq!(value["v"], 1);
+    assert_eq!(value["kind"], "unreadable");
+    assert_eq!(value["cursor"], bad);
+    assert!(value["fault"]
+        .as_str()
+        .unwrap()
+        .starts_with("unknownShape: invalid value: integer `-1`"));
+    assert_eq!(unreadable.fault.as_deref(), value["fault"].as_str());
+    let json: serde_json::Value = serde_json::from_str(&first.json()).unwrap();
+    assert_eq!(json["cursor"], bad.to_string());
+    assert_eq!(json["hasMore"], true);
+    assert_eq!(json["events"][1]["cursor"], bad.to_string());
+    assert_eq!(json["events"][1]["event"], value);
+
+    let rest = events::read_page(&db, first.cursor, 2).await.unwrap();
+    assert_eq!(
+        rest.events.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        vec![bad + 1]
+    );
+    assert!(!rest.has_more);
+    assert_eq!(rest.events[0].payload, frozen("#8 two"));
+    let whole = events::read_page(&db, before, 100).await.unwrap();
+    assert_eq!(whole.events.len(), 3);
+    assert!(!whole.has_more);
+
+    assert_eq!(
+        events::sse_frame(unreadable, View::Envelope).unwrap(),
+        format!("id: {bad}\ndata: {}\n\n", unreadable.payload)
+    );
+    for view in [View::Tip, View::Reorg] {
+        assert_eq!(
+            events::sse_frame(unreadable, view).unwrap(),
+            format!("id: {bad}\n\n")
+        );
+    }
+
+    assert!(events::read_page(&db, bad + 2, 100)
+        .await
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("cursorAhead"));
+    assert!(events::read_page(&db, before, 0).await.is_err());
 }
 
 #[test]
@@ -555,4 +673,109 @@ async fn a_journal_fault_rolls_back_a_live_or_read_through_extension() {
         h[0].hash
     );
     assert_eq!(events::head(&db).await.unwrap(), before);
+}
+
+/// chaintracks-cloudflare #8: the beta's ten fork rows of 2026-10-12, depth
+/// -1 (one at 0). A bulk span writes its rows active before the tip flag
+/// moves (`insert_headers_batch`; the tip is chosen after the span); the
+/// cron meanwhile asks for the next heights through `insert_header`, whose
+/// tip is the flagged row: the stored header is a dupe, its child extends an
+/// active row that is not the flagged tip, so it lands inactive and the fork
+/// trigger measured `t.height - a.height` from a served tip below the active
+/// ancestor. A fork point at or above the served tip is above what was
+/// served: no fork is journaled there; the tip still is.
+fn journal_since(db: &SqliteDb, since: u64) -> Vec<String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare("SELECT payload FROM chain_events WHERE cursor > ? ORDER BY cursor")
+        .unwrap();
+    let rows = stmt
+        .query_map([since as i64], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    rows
+}
+
+/// The bulk span leaves A1 active under the root's tip flag; the cron's
+/// `insert_header` finds A1 a dupe and stores A2 inactive. The rows written
+/// from the bulk span on.
+async fn lagging_tip_flag(db: &SqliteDb) -> (u64, Vec<String>) {
+    let (_, params, h) = fixture();
+    seed(db, &params, &h[..1]).await;
+    let (root, a1) = (&h[0], &h[1]);
+    let a2 = header(102, "#8 A2 the next block", &a1.hash);
+    let before = events::head(db).await.unwrap();
+    storage::insert_headers_batch(db, &params, std::slice::from_ref(a1))
+        .await
+        .unwrap();
+    assert_eq!(
+        storage::served_tip(db).await.unwrap().unwrap().hash,
+        root.hash
+    );
+    assert!(storage::insert_header(db, &params, a1).await.unwrap().dupe);
+    storage::insert_header(db, &params, &a2).await.unwrap();
+    (before, journal_since(db, before))
+}
+
+/// The base's shape, kept as the record: through 0010 the trigger writes the
+/// beta's row (`fork`, `height` one above A1, `depth` -1, the served root as
+/// the first competing tip), which the decoder refuses.
+#[tokio::test]
+async fn through_0010_a_lagging_tip_flag_wrote_the_betas_negative_fork() {
+    let db = SqliteDb::migrated_through("0010");
+    let (_, rows) = lagging_tip_flag(&db).await;
+    let fork: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.contains("\"kind\":\"fork\""))
+        .collect();
+    assert_eq!(fork.len(), 1, "{rows:?}");
+    assert!(fork[0].starts_with("{\"v\":1,\"kind\":\"fork\",\"height\":102,\"depth\":-1,"));
+    assert!(events::decode(fork[0])
+        .unwrap_err()
+        .to_string()
+        .contains("unknownShape"));
+}
+
+#[tokio::test]
+async fn a_lagging_tip_flag_journals_no_fork_at_or_above_the_served_tip() {
+    let db = SqliteDb::migrated();
+    let (before, rows) = lagging_tip_flag(&db).await;
+    // Depth 0: an inactive child of an active row at the served tip's height
+    // that is not the served tip (the dual-active debris a bulk span leaves
+    // until `dedupe_active_heights` runs), written as D1 would hold it.
+    let (db0, params0, h0) = fixture();
+    seed(&db0, &params0, &h0[..2]).await;
+    let b1 = &h0[2];
+    db0.conn()
+        .execute(
+            "INSERT INTO headers(previous_header_id, previous_hash, height, is_active, is_chain_tip, hash, chain_work, version, merkle_root, time, bits, nonce) \
+             SELECT header_id, ?, 101, 1, 0, ?, ?, ?, ?, ?, ?, ? FROM headers WHERE hash = ?",
+            rusqlite::params![b1.previous_hash, b1.hash, h0[1].chain_work, b1.version, b1.merkle_root, b1.time, b1.bits, b1.nonce, b1.previous_hash],
+        )
+        .unwrap();
+    let before0 = events::head(&db0).await.unwrap();
+    let b2 = header(102, "#8 B2 on the debris", &b1.hash);
+    db0.conn()
+        .execute(
+            "INSERT INTO headers(previous_header_id, previous_hash, height, is_active, is_chain_tip, hash, chain_work, version, merkle_root, time, bits, nonce) \
+             SELECT header_id, ?, 102, 0, 0, ?, ?, ?, ?, ?, ?, ? FROM headers WHERE hash = ?",
+            rusqlite::params![b2.previous_hash, b2.hash, h0[1].chain_work, b2.version, b2.merkle_root, b2.time, b2.bits, b2.nonce, b1.hash],
+        )
+        .unwrap();
+    for row in rows.iter().chain(journal_since(&db0, before0).iter()) {
+        assert!(
+            !row.contains("\"kind\":\"fork\""),
+            "no fork above the served tip: {row}"
+        );
+        assert!(
+            events::decode(row).is_ok(),
+            "every journaled row decodes: {row}"
+        );
+    }
+    let page = events::read_page(&db, before, 100).await.unwrap();
+    assert!(page.events.iter().any(|e| matches!(
+        events::decode(&e.payload).unwrap().event,
+        ChainEvent::Tip { height: 102, .. }
+    )));
 }

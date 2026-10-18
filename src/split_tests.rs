@@ -299,6 +299,7 @@ async fn configured_depth_and_shared_tip_rung_names_reach_the_feed() {
         &crate::events::JournalEvent {
             cursor: 42,
             payload: wire.clone(),
+            fault: None,
         },
         crate::events::View::Envelope,
     )

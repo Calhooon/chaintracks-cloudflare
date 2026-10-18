@@ -243,8 +243,22 @@ pub fn decode(payload: &str) -> Result<Envelope> {
 #[derive(Debug, Clone)]
 pub struct JournalEvent {
     pub cursor: u64,
-    /// The original bytes, never reserialized by a transport.
+    /// The original bytes, never reserialized by a transport; for a stored
+    /// row this service cannot decode, its `unreadable` envelope.
     pub payload: String,
+    /// The decode fault of a stored row delivered as `unreadable`.
+    pub fault: Option<String>,
+}
+
+/// chaintracks-cloudflare #8: the service delivers every stored row at its
+/// cursor. A row it cannot decode itself goes out as this version-1 envelope
+/// in the row's place, never dropped and never a whole-page error; a reader
+/// stops at its cursor (an unknown kind to a version-1 decoder).
+pub fn unreadable(cursor: u64, fault: &str) -> String {
+    format!(
+        "{{\"v\":1,\"kind\":\"unreadable\",\"cursor\":{cursor},\"fault\":{}}}",
+        serde_json::Value::from(fault)
+    )
 }
 
 pub struct Page {
@@ -291,10 +305,22 @@ pub async fn read_page(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Pag
     rows.truncate(limit as usize);
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
-        decode(&row.payload)?;
-        events.push(JournalEvent {
-            cursor: row.cursor as u64,
-            payload: row.payload,
+        let cursor = row.cursor as u64;
+        events.push(match decode(&row.payload) {
+            Ok(_) => JournalEvent {
+                cursor,
+                payload: row.payload,
+                fault: None,
+            },
+            Err(e) => {
+                let fault = e.to_string();
+                log_error!("Chain event at cursor {cursor} is unreadable: {fault}");
+                JournalEvent {
+                    cursor,
+                    payload: unreadable(cursor, &fault),
+                    fault: Some(fault),
+                }
+            }
         });
     }
     Ok(Page {
@@ -384,9 +410,12 @@ pub fn compatibility_view(envelope: &Envelope, view: View) -> Option<serde_json:
     }
 }
 
+/// A compatibility view has no `unreadable` shape: the row keeps its id and
+/// carries no data, like any kind the view does not match.
 pub fn sse_frame(event: &JournalEvent, view: View) -> Result<String> {
     let data = match view {
         View::Envelope => Some(event.payload.clone()),
+        _ if event.fault.is_some() => None,
         _ => compatibility_view(&decode(&event.payload)?, view).map(|v| v.to_string()),
     };
     Ok(match data {
