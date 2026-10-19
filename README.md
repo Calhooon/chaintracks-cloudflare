@@ -1,11 +1,12 @@
 # chaintracks-cloudflare
 
 A BSV block-header service on Cloudflare Workers, with D1 header storage, R2
-bulk export and a Durable Object for tip-stream ingestion. **0.4.3** is the
+bulk export and a Durable Object for tip-stream ingestion. **0.5.0** is the
 version in [Cargo.toml](Cargo.toml); the crate is `bsv-chaintracks-cloudflare`
 and its library keeps the name `rust_chaintracks`. The header frame, compact
-target, proof-of-work check and chain work come from `bsv-rs` 0.6.0 (exact);
-the difficulty and checkpoint rules are in [src/consensus.rs](src/consensus.rs).
+target, proof-of-work check, chain work and the difficulty rule come from
+`bsv-rs` 0.7.2 (exact); the checkpoints and the store's ancestry window are in
+[src/consensus.rs](src/consensus.rs).
 
 ## Headers, proofs and events
 

@@ -9,34 +9,37 @@
 //!
 //! - the compact encoding (`SetCompact`, `GetCompact`, src/arith_uint256.cpp:182-225),
 //!   `CheckProofOfWork` (src/pow.cpp:150-171) and `GetBlockProof`
-//!   (src/block_index.cpp:114-127) are bsv-rs 0.6.0's (`bsv_rs::block`), read at
+//!   (src/block_index.cpp:114-127) are bsv-rs's (`bsv_rs::block`), read at
 //!   the same pin; `check_proof_of_work` here names its refusals as `HeaderFault`.
-//! - the `powLimit` of each chain: src/chainparams.cpp:1047-1048 (main),
-//!   :1343-1344 (testnet), :1471-1472 (regtest).
-//! - `next_work_required`: `GetNextWorkRequired` with its three regimes,
-//!   src/pow.cpp:95-117 (regtest's no-retarget, the legacy retarget with the
-//!   emergency adjustment and testnet's minimum-difficulty rule at 22-93 and
-//!   119-148, the DAA at 177-297), reading block times, `GetMedianTimePast`
-//!   (src/block_index.h:720-737) and the chain work `SetChainWork` sums
-//!   (src/block_index.h:661-666).
+//! - the difficulty rule is bsv-rs 0.7.2's (`bsv_rs::block::next_work_required`
+//!   and `ChainParams`): `GetNextWorkRequired` with its three regimes,
+//!   src/pow.cpp:95-117 (22-93, 119-148, 177-297), `GetMedianTimePast`
+//!   (src/block_index.h:720-737) and the `SetChainWork` sums
+//!   (src/block_index.h:661-666), with the `powLimit`, spacing, timespan and
+//!   `daaHeight` of each chain (src/chainparams.cpp:1047-1068, :1343-1364,
+//!   :1471-1490). This module ported them until 0.5.0; bsv-rs carries that
+//!   port with its citations. What stays here is the host's: the genesis
+//!   hash, the checkpoints, the `Window` the store loads, and the faults.
 //! - `check_checkpoint`: `Checkpoints::CheckBlock`, src/checkpoints.cpp:14-22, and
 //!   the checkpoint lists of src/chainparams.cpp:1124-1160 (main), :1419-1428
 //!   (testnet), :1530-1533 (regtest).
 
 use std::fmt;
 
-use bsv_rs::block::{ChainWork, CompactTarget, PowError};
+use bsv_rs::block::{
+    ChainWork, CompactTarget, DifficultyError, HeaderAncestry, HeaderLink, PowError,
+};
 use bsv_rs::primitives::{Hash32, U256};
 
 // ─── The primitives ─────────────────────────────────────────────────────────
 //
 // The 256-bit arithmetic, the compact encoding (`SetCompact`, `GetCompact`),
-// `CheckProofOfWork`, `GetBlockProof` and the pow limits are bsv-rs 0.6.0's
-// (`bsv_rs::primitives::U256`, `bsv_rs::block`), read at the same node pin and
-// the sibling's #63 and #64. Until 0.4.0 they were ported here; the node's
-// tables that tested the port run in bsv-rs's own suite. The difficulty rule
-// below stays this service's, on the bsv-rs types (the ruling of 2026-10-12,
-// Q2: it moves into bsv-rs with the chain parameters at 0.7.0).
+// `CheckProofOfWork`, `GetBlockProof`, the pow limits and, from 0.5.0, the
+// difficulty rule are bsv-rs's (`bsv_rs::primitives::U256`, `bsv_rs::block`),
+// read at the same node pin and the sibling's #63 and #64. Until 0.4.0 the
+// primitives were ported here, until 0.5.0 the rule (the ruling of
+// 2026-10-12, Q2: it moves into bsv-rs with the chain parameters); the node's
+// tables that tested each port run in bsv-rs's own suite as well as below.
 
 /// Exactly 64 hex digits: a block hash in display order, a stored chain work.
 fn is_hash_hex(s: &str) -> bool {
@@ -50,35 +53,16 @@ fn is_hash_hex(s: &str) -> bool {
 pub struct ChainParams {
     /// The node's network name (`CBaseChainParams`): "main", "test", "regtest".
     pub network: &'static str,
-    /// `consensus.powLimit`: the easiest target a header may carry.
-    pub pow_limit: U256,
-    /// `consensus.nPowTargetSpacing`, seconds.
-    pub pow_target_spacing: i64,
-    /// `consensus.nPowTargetTimespan`, seconds.
-    pub pow_target_timespan: i64,
-    /// `consensus.fPowAllowMinDifficultyBlocks`: testnet's 20-minute rule.
-    pub allow_min_difficulty_blocks: bool,
-    /// `consensus.fPowNoRetargeting`: regtest's constant difficulty.
-    pub no_retargeting: bool,
-    /// `consensus.daaHeight`: the DAA governs a header whose PARENT is at or
-    /// above this height (src/pow.cpp:111).
-    pub daa_height: u32,
+    /// What the difficulty rule and `CheckProofOfWork` read: `powLimit`, the
+    /// spacing and timespan, the minimum-difficulty and no-retarget flags,
+    /// `daaHeight` (bsv-rs's, with the node's lines).
+    pub pow: bsv_rs::block::ChainParams,
     /// `consensus.hashGenesisBlock`, display order.
     pub genesis_hash: String,
     /// `checkpointData`, ascending by height, hashes in display order. The
     /// node's own list is the default; `with_checkpoints` adds the owner's.
     pub checkpoints: Vec<(u32, String)>,
 }
-
-/// `uint256S("00000000ffff…ff")`: mainnet's and testnet's `powLimit`.
-const POW_LIMIT_MAIN: U256 = bsv_rs::block::POW_LIMIT_MAIN;
-/// `uint256S("7fff…ff")`: regtest's `powLimit`.
-const POW_LIMIT_REGTEST: U256 = bsv_rs::block::POW_LIMIT_REGTEST;
-
-/// Two weeks, `14 * 24 * 60 * 60` (every chain, src/chainparams.cpp:1050, 1346, 1474).
-const TWO_WEEKS: i64 = 14 * 24 * 60 * 60;
-/// Ten minutes, `10 * 60` (every chain, src/chainparams.cpp:1051, 1347, 1475).
-const TEN_MINUTES: i64 = 10 * 60;
 
 /// `CMainParams::checkpointData` (src/chainparams.cpp:1124-1160), verbatim.
 const MAIN_CHECKPOINTS: &[(u32, &str)] = &[
@@ -175,56 +159,38 @@ fn owned(list: &[(u32, &str)]) -> Vec<(u32, String)> {
 }
 
 impl ChainParams {
-    /// `CMainParams` (src/chainparams.cpp:1033-1160): the limits at
-    /// 1047-1053, `daaHeight` 504031 at 1068, the genesis hash asserted at
-    /// 1097-1099.
+    /// `CMainParams` (src/chainparams.cpp:1033-1160): the limits and
+    /// `daaHeight` bsv-rs's, the genesis hash asserted at 1097-1099.
     pub fn main() -> Self {
         Self {
             network: "main",
-            pow_limit: POW_LIMIT_MAIN,
-            pow_target_spacing: TEN_MINUTES,
-            pow_target_timespan: TWO_WEEKS,
-            allow_min_difficulty_blocks: false,
-            no_retargeting: false,
-            daa_height: 504_031,
+            pow: bsv_rs::block::ChainParams::main(),
             genesis_hash: "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
                 .to_string(),
             checkpoints: owned(MAIN_CHECKPOINTS),
         }
     }
 
-    /// `CTestNetParams` (src/chainparams.cpp:1329-1428): the limits at
-    /// 1343-1349 (the minimum-difficulty rule on), `daaHeight` 1188697 at
-    /// 1364, the genesis hash asserted at 1388-1390.
+    /// `CTestNetParams` (src/chainparams.cpp:1329-1428): the limits and
+    /// `daaHeight` bsv-rs's, the genesis hash asserted at 1388-1390.
     pub fn test() -> Self {
         Self {
             network: "test",
-            pow_limit: POW_LIMIT_MAIN,
-            pow_target_spacing: TEN_MINUTES,
-            pow_target_timespan: TWO_WEEKS,
-            allow_min_difficulty_blocks: true,
-            no_retargeting: false,
-            daa_height: 1_188_697,
+            pow: bsv_rs::block::ChainParams::test(),
             genesis_hash: "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
                 .to_string(),
             checkpoints: owned(TEST_CHECKPOINTS),
         }
     }
 
-    /// `CRegTestParams` (src/chainparams.cpp:1456-1533): the limits at
-    /// 1471-1477 (no retargeting), `daaHeight` 0 at 1490, the genesis hash
-    /// asserted at 1513-1515. The service never serves regtest; the host
+    /// `CRegTestParams` (src/chainparams.cpp:1456-1533): the limits and
+    /// `daaHeight` bsv-rs's, the genesis hash asserted at 1513-1515. The service never serves regtest; the host
     /// tests mine their fixtures under it, as the node's own regtest does.
     #[allow(dead_code)]
     pub fn regtest() -> Self {
         Self {
             network: "regtest",
-            pow_limit: POW_LIMIT_REGTEST,
-            pow_target_spacing: TEN_MINUTES,
-            pow_target_timespan: TWO_WEEKS,
-            allow_min_difficulty_blocks: true,
-            no_retargeting: true,
-            daa_height: 0,
+            pow: bsv_rs::block::ChainParams::regtest(),
             genesis_hash: "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
                 .to_string(),
             checkpoints: owned(REGTEST_CHECKPOINTS),
@@ -263,45 +229,12 @@ impl ChainParams {
         Ok(self)
     }
 
-    /// `DifficultyAdjustmentInterval()` (src/consensus/params.h:47-49): 2016.
-    pub fn difficulty_adjustment_interval(&self) -> i64 {
-        self.pow_target_timespan / self.pow_target_spacing
-    }
-
-    /// `GetCompact(powLimit)`: the bits of a minimum-difficulty header.
-    pub fn pow_limit_bits(&self) -> u32 {
-        self.pow_limit.to_compact()
-    }
-
     /// The checkpoint at `height`, if the list has one.
     pub fn checkpoint_at(&self, height: u32) -> Option<&str> {
         self.checkpoints
             .iter()
             .find(|(h, _)| *h == height)
             .map(|(_, hash)| hash.as_str())
-    }
-
-    /// How many headers, ending at the parent, `next_work_required` may read
-    /// for a header whose parent is at `prev_height`: the parent alone under
-    /// regtest's rule; 147 under the DAA (the parent back to the median of
-    /// three around `prev - 144`); a full interval for the legacy retarget at
-    /// a boundary and for testnet's walk back; 17 for the emergency
-    /// adjustment (the median time past at `prev - 6`). Never more than the
-    /// chain holds.
-    pub fn window_depth(&self, prev_height: u32) -> u32 {
-        let depth = if self.no_retargeting {
-            1
-        } else if prev_height >= self.daa_height {
-            147
-        } else {
-            let interval = self.difficulty_adjustment_interval();
-            if self.allow_min_difficulty_blocks || (prev_height as i64 + 1) % interval == 0 {
-                interval as u32
-            } else {
-                17
-            }
-        };
-        depth.min(prev_height + 1)
     }
 }
 
@@ -342,6 +275,10 @@ pub enum HeaderFault {
     /// The rule needs an ancestor the store does not hold (a hole below the
     /// parent): the bits cannot be checked, so the header is refused.
     AncestryMissing { height: i64 },
+    /// The rule has no answer where the node asserts or throws (a parent too
+    /// low for its regime, no work between the DAA's suitable blocks,
+    /// parameters with no adjustment interval): the header is refused.
+    NoDifficultyAnswer { error: DifficultyError },
 }
 
 impl HeaderFault {
@@ -360,6 +297,7 @@ impl HeaderFault {
             HeaderFault::PrevNotFound { .. } => "prev-blk-not-found",
             HeaderFault::BadGenesis { .. } => "bad-genesis",
             HeaderFault::AncestryMissing { .. } => "ancestry-missing",
+            HeaderFault::NoDifficultyAnswer { .. } => "no-difficulty-answer",
         }
     }
 }
@@ -410,6 +348,7 @@ impl fmt::Display for HeaderFault {
             HeaderFault::AncestryMissing { height } => {
                 write!(f, "{reason}: no stored ancestor at {height}")
             }
+            HeaderFault::NoDifficultyAnswer { error } => write!(f, "{reason}: {error}"),
         }
     }
 }
@@ -451,7 +390,7 @@ pub(crate) fn check_proof_of_work(
     bits: u32,
     params: &ChainParams,
 ) -> Result<(), HeaderFault> {
-    bsv_rs::block::check_proof_of_work(hash, bits, &params.pow_limit)
+    bsv_rs::block::check_proof_of_work(hash, bits, &params.pow.pow_limit)
         .map_err(|fault| pow_fault(fault, bits))
 }
 
@@ -477,30 +416,8 @@ pub(crate) fn check_checkpoint(
 
 // ─── The difficulty rule ────────────────────────────────────────────────────
 
-/// `a * b` modulo 2^256 (`base_uint::operator*=(uint32_t)`,
-/// arith_uint256.cpp:52-60: the carry out of the top word is dropped). The
-/// node's retarget multiplies by an `int64_t` timespan, which overload
-/// resolution converts to `uint32_t` (a standard conversion beats the
-/// `base_uint(uint64_t)` constructor); every timespan it multiplies by is
-/// clamped positive and far below 2^32, so the two agree.
-fn mul_u32(a: U256, b: u32) -> U256 {
-    a.wrapping_mul_u64(b as u64)
-}
-
-/// floor(n / d) (`base_uint::operator/=`, arith_uint256.cpp:78-105). The
-/// node throws on a zero divisor; every caller here divides by a value it
-/// has shown non-zero, and a zero divisor answers zero rather than panic.
-fn div(n: U256, d: U256) -> U256 {
-    n.checked_div(d).unwrap_or(U256::ZERO)
-}
-
-/// What the rule reads of a header: its height, time and bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Link {
-    pub height: u32,
-    pub time: u32,
-    pub bits: u32,
-}
+/// What the rule reads of a header: bsv-rs's `HeaderLink`.
+pub(crate) type Link = HeaderLink;
 
 impl From<&crate::types::BlockHeader> for Link {
     fn from(h: &crate::types::BlockHeader) -> Self {
@@ -512,12 +429,23 @@ impl From<&crate::types::BlockHeader> for Link {
     }
 }
 
+/// A bsv-rs refusal as this service names it: an ancestor the store does not
+/// hold is the hole it always was; the rest are the node's asserts.
+fn difficulty_fault(error: DifficultyError) -> HeaderFault {
+    match error {
+        DifficultyError::MissingAncestor { height } => HeaderFault::AncestryMissing {
+            height: height as i64,
+        },
+        error => HeaderFault::NoDifficultyAnswer { error },
+    }
+}
+
 /// A run of consecutive ancestors, ascending by height, each the parent of
 /// the next (the caller has checked the hash links: `storage::load_window`,
-/// `storage::insert_headers_batch`). The chain work between two of them is
-/// the sum of their `GetBlockProof`, which is what the node's `nChainWork`
-/// difference is (`SetChainWork`, src/block_index.h:661-666); the prefix sums
-/// are computed once per window.
+/// `storage::insert_headers_batch`): the `HeaderAncestry` bsv-rs's rule
+/// reads. The chain work between two of them is the node's `nChainWork`
+/// difference (`SetChainWork`, src/block_index.h:661-666), answered from
+/// prefix sums computed once per window rather than bsv-rs's default sum.
 pub(crate) struct Window {
     links: Vec<Link>,
     /// `work[i]` = the proofs of `links[1..=i]`.
@@ -526,15 +454,14 @@ pub(crate) struct Window {
 
 impl Window {
     pub fn new(links: Vec<Link>) -> Self {
-        let mut work = Vec::with_capacity(links.len());
-        let mut sum = ChainWork::ZERO;
-        for (i, l) in links.iter().enumerate() {
-            if i > 0 {
-                sum = sum.wrapping_add(ChainWork::from_bits(l.bits));
-            }
-            work.push(sum);
+        let mut w = Window {
+            links: Vec::with_capacity(links.len()),
+            work: Vec::with_capacity(links.len()),
+        };
+        for link in links {
+            w.push(link);
         }
-        Window { links, work }
+        w
     }
 
     pub fn push(&mut self, link: Link) {
@@ -546,190 +473,42 @@ impl Window {
         self.work.push(sum);
     }
 
-    fn index(&self, height: i64) -> Result<usize, HeaderFault> {
-        let first = match self.links.first() {
-            Some(l) => l.height as i64,
-            None => return Err(HeaderFault::AncestryMissing { height }),
+    fn index(&self, height: u32) -> Option<usize> {
+        let i = height.checked_sub(self.links.first()?.height)? as usize;
+        (i < self.links.len()).then_some(i)
+    }
+}
+
+impl HeaderAncestry for Window {
+    fn link_at(&self, height: u32) -> Option<Link> {
+        self.index(height).map(|i| self.links[i])
+    }
+
+    fn work_between(&self, first: u32, last: u32) -> Result<ChainWork, DifficultyError> {
+        let at = |height| {
+            self.index(height)
+                .map(|i| self.work[i])
+                .ok_or(DifficultyError::MissingAncestor { height })
         };
-        let i = height - first;
-        if i < 0 || i as usize >= self.links.len() {
-            return Err(HeaderFault::AncestryMissing { height });
-        }
-        Ok(i as usize)
-    }
-
-    pub fn get(&self, height: i64) -> Result<Link, HeaderFault> {
-        Ok(self.links[self.index(height)?])
-    }
-
-    /// `GetMedianTimePast` (src/block_index.h:722-737): the median of the
-    /// times of the block and up to ten before it (fewer only at genesis).
-    pub fn median_time_past(&self, height: i64) -> Result<i64, HeaderFault> {
-        let mut times = Vec::with_capacity(11);
-        for h in (height - 10).max(0)..=height {
-            times.push(self.get(h)?.time as i64);
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2])
-    }
-
-    /// `pindexLast->GetChainWork() - pindexFirst->GetChainWork()`.
-    fn work_between(&self, first: i64, last: i64) -> Result<U256, HeaderFault> {
-        let a = self.work[self.index(first)?];
-        let b = self.work[self.index(last)?];
-        Ok(b.as_u256().wrapping_sub(*a.as_u256()))
+        let (a, b) = (at(first)?, at(last)?);
+        let difference = b.as_u256().wrapping_sub(*a.as_u256());
+        Ok(ChainWork::from_be_bytes(difference.to_be_bytes()))
     }
 }
 
 /// `GetNextWorkRequired(pindexPrev, pblock)` (src/pow.cpp:95-117) for a
-/// header with time `new_time` whose parent is at `prev_height` in `w`.
-/// The genesis case (no parent) is the caller's: a header with no parent is
-/// the genesis or a checkpoint, never a header whose bits are computed.
+/// header with time `new_time` whose parent is at `prev_height` in `w`:
+/// `bsv_rs::block::next_work_required`. The genesis case (no parent) is the
+/// caller's: a header with no parent is the genesis or a checkpoint, never a
+/// header whose bits are computed.
 pub(crate) fn next_work_required(
     w: &Window,
     prev_height: u32,
     new_time: u32,
     params: &ChainParams,
 ) -> Result<u32, HeaderFault> {
-    let prev = w.get(prev_height as i64)?;
-    if params.no_retargeting {
-        return Ok(prev.bits);
-    }
-    if prev.height >= params.daa_height {
-        return next_cash_work_required(w, prev, new_time, params);
-    }
-    next_eda_work_required(w, prev, new_time, params)
-}
-
-/// `GetNextEDAWorkRequired` (src/pow.cpp:22-93): the legacy retarget every
-/// interval, testnet's minimum-difficulty rule, and the emergency adjustment.
-fn next_eda_work_required(
-    w: &Window,
-    prev: Link,
-    new_time: u32,
-    params: &ChainParams,
-) -> Result<u32, HeaderFault> {
-    let interval = params.difficulty_adjustment_interval();
-    let height = prev.height as i64 + 1;
-    if height % interval == 0 {
-        let first = w.get(height - interval)?;
-        return Ok(calculate_next_work_required(
-            prev,
-            first.time as i64,
-            params,
-        ));
-    }
-    let pow_limit_bits = params.pow_limit_bits();
-    if params.allow_min_difficulty_blocks {
-        if new_time as i64 > prev.time as i64 + 2 * params.pow_target_spacing {
-            return Ok(pow_limit_bits);
-        }
-        let mut index = prev;
-        while index.height != 0
-            && (index.height as i64) % interval != 0
-            && index.bits == pow_limit_bits
-        {
-            index = w.get(index.height as i64 - 1)?;
-        }
-        return Ok(index.bits);
-    }
-    if prev.bits == pow_limit_bits {
-        return Ok(pow_limit_bits);
-    }
-    let six = w.get(height - 7)?;
-    let mtp6 = w.median_time_past(prev.height as i64)? - w.median_time_past(six.height as i64)?;
-    if mtp6 < 12 * 3600 {
-        return Ok(prev.bits);
-    }
-    let mut pow = CompactTarget::from_bits(prev.bits).target;
-    pow = pow.wrapping_add(pow.shr(2));
-    if pow > params.pow_limit {
-        pow = params.pow_limit;
-    }
-    Ok(pow.to_compact())
-}
-
-/// `CalculateNextWorkRequired` (src/pow.cpp:119-148): the two-week retarget,
-/// the timespan clamped to a quarter and four times the target.
-pub(crate) fn calculate_next_work_required(
-    prev: Link,
-    first_block_time: i64,
-    params: &ChainParams,
-) -> u32 {
-    if params.no_retargeting {
-        return prev.bits;
-    }
-    let timespan = params.pow_target_timespan;
-    let actual = (prev.time as i64 - first_block_time).clamp(timespan / 4, timespan * 4);
-    let mut target = CompactTarget::from_bits(prev.bits).target;
-    target = mul_u32(target, actual as u32);
-    target = div(target, U256::from_u64(timespan as u64));
-    if target > params.pow_limit {
-        target = params.pow_limit;
-    }
-    target.to_compact()
-}
-
-/// `GetSuitableBlock` (src/pow.cpp:214-245): the median by time of the block
-/// and its two parents, by the node's own sorting network (its choice among
-/// equal times decides which block's chain work is read).
-fn suitable_block(w: &Window, height: i64) -> Result<Link, HeaderFault> {
-    let mut blocks = [w.get(height - 2)?, w.get(height - 1)?, w.get(height)?];
-    if blocks[0].time > blocks[2].time {
-        blocks.swap(0, 2);
-    }
-    if blocks[0].time > blocks[1].time {
-        blocks.swap(0, 1);
-    }
-    if blocks[1].time > blocks[2].time {
-        blocks.swap(1, 2);
-    }
-    Ok(blocks[1])
-}
-
-/// `ComputeTarget` (src/pow.cpp:177-208).
-fn compute_target(
-    w: &Window,
-    first: Link,
-    last: Link,
-    params: &ChainParams,
-) -> Result<U256, HeaderFault> {
-    let mut work = w.work_between(first.height as i64, last.height as i64)?;
-    work = mul_u32(work, params.pow_target_spacing as u32);
-    let spacing = params.pow_target_spacing;
-    let actual = (last.time as i64 - first.time as i64).clamp(72 * spacing, 288 * spacing);
-    work = div(work, U256::from_u64(actual as u64));
-    Ok(div(work.wrapping_neg(), work))
-}
-
-/// `GetNextCashWorkRequired` (src/pow.cpp:256-297): the DAA over the last
-/// 144 blocks.
-fn next_cash_work_required(
-    w: &Window,
-    prev: Link,
-    new_time: u32,
-    params: &ChainParams,
-) -> Result<u32, HeaderFault> {
-    if params.allow_min_difficulty_blocks
-        && new_time as i64 > prev.time as i64 + 2 * params.pow_target_spacing
-    {
-        return Ok(params.pow_limit_bits());
-    }
-    let height = prev.height as i64;
-    if height < params.difficulty_adjustment_interval() {
-        // The node asserts here (src/pow.cpp:275); a chain this short has no
-        // DAA answer, so the header cannot be checked.
-        return Err(HeaderFault::AncestryMissing {
-            height: height - 146,
-        });
-    }
-    let last = suitable_block(w, height)?;
-    let first = suitable_block(w, height - 144)?;
-    let target = compute_target(w, first, last, params)?;
-    if target > params.pow_limit {
-        return Ok(params.pow_limit_bits());
-    }
-    Ok(target.to_compact())
+    bsv_rs::block::next_work_required(&params.pow, w, prev_height, new_time)
+        .map_err(difficulty_fault)
 }
 
 /// The node's context checks for a header whose parent is at `prev_height`
@@ -794,17 +573,20 @@ mod tests {
     #[test]
     fn the_pow_limits_are_the_node_values() {
         assert_eq!(
-            ChainParams::main().pow_limit.to_hex(),
+            ChainParams::main().pow.pow_limit.to_hex(),
             "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
-        assert_eq!(ChainParams::test().pow_limit, ChainParams::main().pow_limit);
         assert_eq!(
-            ChainParams::regtest().pow_limit.to_hex(),
+            ChainParams::test().pow.pow_limit,
+            ChainParams::main().pow.pow_limit
+        );
+        assert_eq!(
+            ChainParams::regtest().pow.pow_limit.to_hex(),
             "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
         );
         // GetCompact of the limits: the bits a min-difficulty header carries.
-        assert_eq!(ChainParams::main().pow_limit_bits(), 0x1d00ffff);
-        assert_eq!(ChainParams::regtest().pow_limit_bits(), 0x207fffff);
+        assert_eq!(ChainParams::main().pow.pow_limit_bits(), 0x1d00ffff);
+        assert_eq!(ChainParams::regtest().pow.pow_limit_bits(), 0x207fffff);
     }
 
     #[test]
@@ -858,6 +640,8 @@ mod tests {
     // bitcoin-sv v1.2.3 src/test/pow_tests.cpp, ported test for test: the
     // node builds block indexes with times and bits and no proof of work
     // (`GetBlockIndex`, :125-138), and so do these (a `Window` of links).
+    // The rule is bsv-rs's since 0.5.0; the tables pin it through the
+    // service's `Window`, the ancestry the store hands it.
 
     fn link(height: u32, time: u32, bits: u32) -> Link {
         Link { height, time, bits }
@@ -877,7 +661,11 @@ mod tests {
         ];
         for &(height, time, bits, first_time, expected) in rows {
             assert_eq!(
-                calculate_next_work_required(link(height, time, bits), first_time, &main),
+                bsv_rs::block::calculate_next_work_required(
+                    &main.pow,
+                    link(height, time, bits),
+                    first_time
+                ),
                 expected,
                 "block {height}"
             );
@@ -914,8 +702,7 @@ mod tests {
             next_work_required(&self.w, self.tip(), 0, params).unwrap()
         }
         fn next_cash_work(&self, params: &ChainParams) -> u32 {
-            next_cash_work_required(&self.w, self.w.get(self.tip() as i64).unwrap(), 0, params)
-                .unwrap()
+            bsv_rs::block::next_cash_work_required(&params.pow, &self.w, self.tip(), 0).unwrap()
         }
     }
 
@@ -924,12 +711,12 @@ mod tests {
     #[test]
     fn the_emergency_adjustment_matches_retargeting_test() {
         let main = ChainParams::main();
-        let pow_limit = main.pow_limit;
+        let pow_limit = main.pow.pow_limit;
         let mut current = shr(&pow_limit, 1);
         let initial_bits = get_compact(&current);
         let mut c = Chain::new(1269211443, initial_bits);
         for _ in 1..100 {
-            c.add(main.pow_target_spacing, initial_bits);
+            c.add(main.pow.pow_target_spacing, initial_bits);
         }
         for _ in 100..110 {
             c.add(2 * 3600, initial_bits);
@@ -962,14 +749,14 @@ mod tests {
     #[test]
     fn the_daa_matches_cash_difficulty_test() {
         let main = ChainParams::main();
-        let pow_limit = main.pow_limit;
+        let pow_limit = main.pow.pow_limit;
         let pow_limit_bits = get_compact(&pow_limit);
         let initial_bits = get_compact(&shr(&pow_limit, 4));
         let mut c = Chain::new(1269211443, initial_bits);
         for _ in 1..2050 {
             c.add(600, initial_bits);
         }
-        let mut bits = next_cash_work_required(&c.w, c.w.get(2049).unwrap(), 0, &main).unwrap();
+        let mut bits = c.next_cash_work(&main);
         for _ in 0..10 {
             c.add(600, bits);
             assert_eq!(c.next_cash_work(&main), bits);
@@ -1105,16 +892,16 @@ mod tests {
 
     #[test]
     fn the_window_depth_covers_what_each_regime_reads() {
-        assert_eq!(ChainParams::regtest().window_depth(965_000), 1);
-        assert_eq!(ChainParams::main().window_depth(886_000), 147);
-        assert_eq!(ChainParams::main().window_depth(478_000), 17);
+        assert_eq!(ChainParams::regtest().pow.window_depth(965_000), 1);
+        assert_eq!(ChainParams::main().pow.window_depth(886_000), 147);
+        assert_eq!(ChainParams::main().pow.window_depth(478_000), 17);
         assert_eq!(
-            ChainParams::main().window_depth(479_807),
+            ChainParams::main().pow.window_depth(479_807),
             2016,
             "479808 is a boundary"
         );
         assert_eq!(
-            ChainParams::test().window_depth(1_000),
+            ChainParams::test().pow.window_depth(1_000),
             1001,
             "the walk back, never past genesis"
         );
