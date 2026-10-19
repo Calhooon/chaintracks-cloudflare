@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.0] - 2026-10-19
+
+- bsv-rs from `=0.6.0` to `=0.7.2`, the same `default-features = false` and
+  `block` feature. Every varint read was re-read against 0.7's canonical
+  rule (`Reader::read_var_int` refuses a non-canonical encoding): this crate
+  reads none. It parses only the 80-byte header frame, through
+  `bsv_rs::block::BlockHeader::from_binary`, so nothing moved and no lenient
+  read was added.
+- The difficulty rule's copy is deleted. `next_work_required`, the legacy
+  retarget with the emergency adjustment, testnet's minimum-difficulty rule,
+  the DAA, `GetMedianTimePast` and the chain-work sums were this crate's port
+  of bitcoin-sv v1.2.3 `src/pow.cpp`; bsv-rs 0.7.2 carries that port
+  (`bsv_rs::block::{next_work_required, ChainParams, HeaderAncestry,
+  DifficultyError}`) and `src/consensus.rs` now calls it. The host's
+  `ChainParams` keeps the network, the genesis hash and the checkpoints and
+  holds bsv-rs's parameters as `pow`; `Window` is the store's
+  `HeaderAncestry`, answering the chain work between two heights from its
+  prefix sums. `check_checkpoint` stays here.
+- A header the rule cannot answer where the node asserts or throws (a parent
+  too low for its regime, no work between the DAA's suitable blocks) is
+  refused as `no-difficulty-answer`; before, the first was
+  `ancestry-missing` at a height below the genesis and the second a zero
+  target. A missing stored ancestor is `ancestry-missing` as before. Neither
+  case arises on main or test past their first 2016 headers.
+- The 8 consensus tests run against bsv-rs's rule through the service's
+  `Window` (the node's `pow_tests.cpp` tables); the whole-EDA-era replay stays
+  ignored. `src/consensus.rs` is 909 lines, from 1122.
+
 ## [0.4.3] - 2026-10-18
 
 - Publishable to crates.io as `bsv-chaintracks-cloudflare`; the library keeps

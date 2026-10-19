@@ -556,7 +556,7 @@ pub async fn insert_header(
     check_fork_prior_to_checkpoint(db, params, header, current_tip.as_ref()).await?;
     let anchored = match &previous_header {
         Some(parent) => {
-            let window = load_window(db, parent, params.window_depth(parent.height)).await?;
+            let window = load_window(db, parent, params.pow.window_depth(parent.height)).await?;
             consensus::check_context(&window, header, params).map_err(|f| refused(header, &f))?;
             true
         }
@@ -862,7 +862,7 @@ pub async fn relink_orphan_and_reevaluate(
             stored.height, parent.hash, parent.height
         )));
     }
-    let window = load_window(db, &parent, params.window_depth(parent.height)).await?;
+    let window = load_window(db, &parent, params.pow.window_depth(parent.height)).await?;
     consensus::check_context(&window, &stored, params).map_err(|f| refused(&stored, &f))?;
 
     let chain_work = add_work(&parent.chain_work, &calculate_work(stored.bits));
@@ -1022,6 +1022,7 @@ pub async fn insert_headers_batch(
                 .iter()
                 .map(|h| {
                     params
+                        .pow
                         .window_depth(h.height - 1)
                         .saturating_sub(h.height - first.height)
                 })
@@ -1944,7 +1945,7 @@ pub async fn revalidate_step(
     }
 
     // One read: the window below the cursor and up to `budget` rows above.
-    let depth = params.window_depth(cursor.height).max(1);
+    let depth = params.pow.window_depth(cursor.height).max(1);
     let lo = (cursor.height + 1).saturating_sub(depth);
     let hi = tip.height.min(cursor.height.saturating_add(budget));
     let rows: Vec<HeaderRow> = Query::new(sql_active_headers_between())

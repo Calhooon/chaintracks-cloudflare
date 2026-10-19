@@ -432,9 +432,9 @@ pub(crate) fn min_difficulty_rule() -> &'static ChainParams {
         let mut p = ChainParams::regtest()
             .with_checkpoints(&format!("{}:{}", HEAVY_ROOT_HEIGHT, heavy_root().hash))
             .unwrap();
-        p.no_retargeting = false;
-        p.allow_min_difficulty_blocks = true;
-        p.daa_height = u32::MAX;
+        p.pow.no_retargeting = false;
+        p.pow.allow_min_difficulty_blocks = true;
+        p.pow.daa_height = u32::MAX;
         p
     })
 }
