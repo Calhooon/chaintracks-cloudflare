@@ -161,6 +161,13 @@ and tip roll back together.
 emits no tip, fork or age above the verification ceiling. During re-validation,
 the announced tip advances with the verified cursor; lowering that cursor
 is a tip change, not a declaration that still-active headers were orphaned.
+A reorg written while that cursor stands below the fork height carries, as
+`newTip`, the verified tip of that moment, below `forkHeight`; the row decodes,
+and its `deactivatedHeaders` are the only headers it removed. Production
+cursor 627 is one (#12): the repair of #4 deactivated the orphan at 956433
+with the pass restarted at 530359. The journal is append-only, so such a
+row is never rewritten or marked; a consumer that replays from 0 reads the
+headers it deactivated, not the distance between `newTip` and `forkHeight`.
 When no verified tip is available, tip delivery waits. Readers fail closed
 through the existing header routes. The legacy tip webhook also uses this
 ceiling, including on read-through notifications.
