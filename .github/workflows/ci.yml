@@ -101,3 +101,9 @@ jobs:
         test -s \"$LANE32_WITNESS_FILE\"\nfor test in tests/worker_*.mjs; do\n  if [ \"$test\" = tests/worker_events.mjs\
         \ ]; then\n    node \"$test\" \"$LANE32_WITNESS_FILE\" || exit\n  else\n    node \"$test\" || exit\n  fi\n\
         done"
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: tools/scrub.sh
