@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] - 2026-10-22
+
+- bsv-rs from `=0.7.2` to `0.8.1` (the caret; one bsv-rs per lock with the
+  middleware, on ^0.8 since 2026-10-22). 0.8.1 reads atomic BEEFs on the
+  subject's graph, types the wallet's busy answer and marks `Error`
+  non_exhaustive; this crate uses only `block` and `primitives`, whose
+  source is the same at 0.8.1 as at 0.7.2, and matches no `bsv_rs::Error`.
+  No wire change. A minor version because `ChainParams::pow` and
+  `BlockHeader::wire` carry bsv-rs types.
+
 ## [0.5.0] - 2026-10-19
 
 - bsv-rs from `=0.6.0` to `=0.7.2`, the same `default-features = false` and

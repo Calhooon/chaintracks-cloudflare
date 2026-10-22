@@ -11,8 +11,8 @@
 //!   `CheckProofOfWork` (src/pow.cpp:150-171) and `GetBlockProof`
 //!   (src/block_index.cpp:114-127) are bsv-rs's (`bsv_rs::block`), read at
 //!   the same pin; `check_proof_of_work` here names its refusals as `HeaderFault`.
-//! - the difficulty rule is bsv-rs 0.7.2's (`bsv_rs::block::next_work_required`
-//!   and `ChainParams`): `GetNextWorkRequired` with its three regimes,
+//! - the difficulty rule is bsv-rs 0.8.1's (`src/block` as at 0.7.2;
+//!   `bsv_rs::block::next_work_required` and `ChainParams`):`GetNextWorkRequired` with its three regimes,
 //!   src/pow.cpp:95-117 (22-93, 119-148, 177-297), `GetMedianTimePast`
 //!   (src/block_index.h:720-737) and the `SetChainWork` sums
 //!   (src/block_index.h:661-666), with the `powLimit`, spacing, timespan and
