@@ -108,7 +108,7 @@ fn the_stream_ends_at_900_queries_inside_the_platform_bound() {
     assert_eq!(budget.spent(), 900);
     assert!(budget.spent() < 1000);
     assert!(!budget.take(), "a spent budget stays spent");
-    // The tip view without a cursor: the head and the served tip first.
+    // The tip view without a cursor: the head and the served tip before the read.
     let mut budget = events::QueryBudget::new(5, events::STREAM_QUERY_BOUND);
     let mut wakes = 0;
     while budget.take() {

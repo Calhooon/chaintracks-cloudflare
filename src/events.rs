@@ -506,7 +506,7 @@ pub const RETAIN_TIP_AGE_SECS: u64 = 86_400;
 /// `tipAge` rows' cutoff (both bound from the Worker's clock, so the two
 /// statements pick the same rows). At most 1,000 rows a tick, never the head
 /// row. The chain rows are the prefix above the floor older than ?2: the scan
-/// by cursor stops at the first younger row. The `tipAge` rows come by their
+/// by cursor stops at the oldest row younger than ?2. The `tipAge` rows come by their
 /// `event_key` index alone. A row of any other kind (`unreadable`'s stored
 /// rows) is kept.
 const RETAIN_PICKED: &str = "WITH head AS (SELECT COALESCE(MAX(cursor), 0) AS c FROM chain_events), young AS (SELECT COALESCE((SELECT cursor FROM chain_events WHERE cursor > ?1 AND created_at >= ?2 ORDER BY cursor LIMIT 1), (SELECT c FROM head)) AS c), picked AS (SELECT cursor, 1 AS chain FROM chain_events WHERE cursor > ?1 AND cursor < (SELECT c FROM young) AND json_extract(payload, '$.kind') IN ('tip', 'fork', 'reorg', 'invalidated', 'frozen', 'split', 'splitResolved') UNION ALL SELECT cursor, 0 AS chain FROM chain_events WHERE event_key >= 'tipAge:' AND event_key < 'tipAge;' AND created_at < ?3 AND cursor < (SELECT c FROM head) ORDER BY cursor LIMIT 1000)";
@@ -929,19 +929,25 @@ fn wake_frames(wake: &Wake, view: View) -> Result<String> {
 
 /// Change 2 (CF4), the feed-2 stream: one D1 query a wake (the page, the
 /// head and the tip together, `SQL_WAKE`), and a clean end with `retry:`
-/// when `budget` is spent. `first` is the route's own read at the open,
+/// when `budget` is spent. `opening` is the route's own read at the open,
 /// already counted in `budget`.
 pub fn stream_v2(
     db: worker::D1Database,
-    first: Wake,
+    opening: Wake,
     view: View,
     initial: String,
     budget: QueryBudget,
 ) -> Result<worker::Response> {
     let mut ready = initial;
-    ready.push_str(&wake_frames(&first, view)?);
+    ready.push_str(&wake_frames(&opening, view)?);
     let body = futures_util::stream::unfold(
-        Some((db, first.page.cursor, ready, first.page.has_more, budget)),
+        Some((
+            db,
+            opening.page.cursor,
+            ready,
+            opening.page.has_more,
+            budget,
+        )),
         move |state| async move {
             let (db, cursor, ready, more, mut budget) = state?;
             if !ready.is_empty() {
