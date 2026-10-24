@@ -92,7 +92,9 @@ its envelope in the same D1 transaction.
 opaque decimal strings, scoped to one chain/database, within D1's exact
 integer range; skipped numbers are allowed. A malformed cursor is HTTP 400;
 a cursor ahead of this journal is HTTP 409 `cursorAhead`, an incident the
-client reports. No retention deletion is implemented in this migration.
+client reports. Under `CHAIN_EVENT_FEED = "1"` no row is ever deleted; under
+`"2"` old rows go and a cursor below the floor is HTTP 410 `cursorExpired`
+("Feed 2: retention and the floor" below).
 
 [D] Every stored row is delivered at its cursor, in order. A stored row the
 service cannot decode itself is delivered in its place as
@@ -116,7 +118,13 @@ data: {"v":1,"kind":"invalidated","blockHash":"000000000000000000000000000000000
 
 [D] `Last-Event-ID` takes precedence over `since` on reconnect. The stream
 replays the journal, checks D1 every 15 seconds when caught up, and sends
-comment heartbeats during quiet intervals. Dropping the response cancels its
+comment heartbeats during quiet intervals (under feed 2 the comment is
+`: heartbeat tipAge=<s>`, the served tip's age for an operator; a comment,
+so no reader parses it). Under feed 2 the stream spends one D1 query a wake
+and at most 900 in one invocation (D1 answers 1,000 queries a Worker
+invocation); at the bound it writes `retry: 1000` and ends with EOF, and the
+client reconnects with its `Last-Event-ID` as after any drop. The bound is
+never `feedUnavailable`. Dropping the response cancels its
 timer. Pages and streams use `Cache-Control: no-store` and
 `X-Chain-Event-Version: 2`. A journal/decoder fault before the stream opens
 is an HTTP error; after opening it is an SSE `event: error` with a reported
@@ -172,8 +180,10 @@ When no verified tip is available, tip delivery waits. Readers fail closed
 through the existing header routes. The legacy tip webhook also uses this
 ceiling, including on read-through notifications.
 
-[X] `tipAge` accompanies each distinct served tip and runs on the existing
-minute cron even when every courier is unreachable. Overlapping ticks for
+[X] `tipAge` accompanies each distinct served tip. Under feed 1 the minute
+cron also journals one on an unchanged tip, even when every courier is
+unreachable; under feed 2 a same tip journals nothing, and the age at any
+later moment is `now - tip.time` from the last `tip` row. Overlapping ticks for
 the same tip/minute deduplicate. [SRC] The timer is
 `rust-chaintracks@461dc39 src/lib.rs:68-74`, `wrangler.toml:53-54`. Migration
 0009 does no additional header scan or re-validation; P0-4's bounded pass
@@ -261,7 +271,65 @@ an unknown version, kind or shape through a status, metric or listener error
 without acknowledging the cursor or silently reconnecting; a client with
 no feed polls only the heights of the proofs it holds."
 
+## Feed 2 (0.7.0): the var, retention and the floor, the edge
+
+[D] `CHAIN_EVENT_FEED` is read once per invocation. Unset, `"1"` or any other
+value is the 0.6.0 feed exactly; `"2"` is the design of bsv-stack-lean
+`docs/p0/chaintracks-reorg-feed.md` (the owner's word of 2026-10-24 on its
+section 15). The envelope, its kinds and fields, the cursor's meaning and
+`X-Chain-Event-Version: 2` are the same under both.
+
+[D] **Retention and the floor.** Under feed 2 the scheduled tick deletes the
+chain rows (`tip`, `fork`, `reorg`, `invalidated`, `frozen`, `split`,
+`splitResolved`) older than 90 days and the `tipAge` rows older than 24 hours
+by `created_at`, at most 1,000 rows a tick, never the journal's head row; a
+row of any other kind is kept. `chain_event_state.floor` (migration 0012) is
+the greatest cursor of a deleted chain row, raised in the transaction that
+deletes it; 0 until one is deleted. A page or a stream from a cursor below the
+floor (0 included, once the floor is above it) answers HTTP 410:
+
+```json
+{"v":1,"error":"cursorExpired","floor":"4100","tip":{"height":970123,"hash":"..."}}
+```
+
+A cursor at or above the floor reads the page the full journal would give; a
+`tipAge` row deleted above the floor is a skipped number. A stream whose
+cursor the floor passes ends with `retry:`, and its reconnect hears the 410.
+
+[D] **The re-read after a 410.** The client reads the service's header at the
+height of its own last known tip (`/v2/header/height/<h>`). If the hash is its
+own, nothing at or below `h` moved (each header names its parent), and it
+resumes from `floor`. If not, it walks its own remembered tips down until one
+matches; the height above the match is its fork height, and it re-asks its
+proofs from there, then resumes from `floor`. It never resumes from a cursor
+below the floor, and never reads the 410 as an empty page.
+
+[D] **The outbox** under feed 2 reads the head, the floor and every target's
+cursor in one query a tick; a target at the head costs nothing more. A target
+with no stored cursor starts at the floor; a stored cursor ahead of the
+journal or below the floor is logged and that target waits for the operator
+while the others run. Delivery stays at least once.
+
+[D] **The header routes' lifetimes** (chaintracks-cloudflare #16). A height
+within 400 of the served tip (the deepest reorg the service journals) answers
+`Cache-Control: no-cache` on every height, hash, range and root route, under
+both feeds and whether or not the edge is on. Below that line: with
+`HEADER_EDGE_DEPTH` unset, the 0.6.0 lifetimes (`public, max-age=3600` on the
+v2 routes); with it set to a number (never below 400), the line is that depth
+and a settled answer is kept in `caches.default` with `public, max-age=86400`
+and `Cache-Tag: h-<height>,hb-<height/1000>` (a range: each thousand it
+touches). `/admin/ingest` answering `activated`, and `POST
+/admin/edge-purge?from=&to=`, take the heights off the edge: `cache.delete` in
+the colo that runs the call, and the zone's purge by tag (`HEADER_EDGE_ZONE_ID`,
+the secret `HEADER_EDGE_PURGE_TOKEN`). [X] Whether the zone's tag purge reaches
+Cache API entries in every colo is read on beta before it is claimed.
+
 ## Upgrade, rollback and owner gate
+
+[D] 0.7.0 applies migration 0012 after 0011: one column,
+`chain_event_state.floor`, default 0, and nothing else. Feed 1 never reads it.
+Rolling feed 2 back is the var (`"1"`); rows deleted under feed 2 stay
+deleted, and the floor stays for the next time feed 2 runs.
 
 [D] Apply migration 0008, complete the owner's P0-4 soak, apply 0009, and deploy
 this branch only on the owner's beta go. Configure canonical webhook targets

@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased]
+
+The chain-event feed's four changes and the edge half of #16, from
+bsv-stack-lean `docs/p0/chaintracks-reorg-feed.md` (ruled 2026-10-24), each
+behind a var; with both vars unset the feed is 0.6.0's and the header routes
+change only in the `no-cache` below.
+
+- `CHAIN_EVENT_FEED`: unset or `"1"` the 0.6.0 feed exactly; `"2"` the four
+  changes. Read once per invocation.
+- Change 1 (CF3): under `"2"` the minute's timer journals no `tipAge` row on
+  an unchanged tip; the `tipAge` row at each tip change stays. The SSE
+  heartbeat comment carries `tipAge=<s>`.
+- Change 2 (CF4): under `"2"` the page, the stream's open and each wake read
+  the rows, the head and the served tip in one D1 query; the stream ends with
+  `retry: 1000` and EOF at 900 queries in one invocation, never
+  `feedUnavailable` for the bound. `CHAIN_EVENT_STREAM_BOUND` is a test hook
+  that can only lower the bound.
+- Change 3 (CF2): migration `0012_chain_event_floor.sql` adds
+  `chain_event_state.floor` (default 0) and nothing else. Under `"2"` the tick
+  deletes chain rows older than 90 days and `tipAge` rows older than 24 h, at
+  most 1,000 a tick, never the head row, and raises the floor in the same
+  transaction; a page or a stream below the floor answers HTTP 410
+  `{"v":1,"error":"cursorExpired","floor":"<n>","tip":{height,hash}}`.
+- Change 4: under `"2"` the outbox reads the head and every target's cursor
+  once a tick; a caught-up target costs nothing more.
+- The edge (#16, CF5): every height within 400 of the served tip answers
+  `Cache-Control: no-cache` on the height, hash, range and root routes,
+  replacing 0.6.0's `public, max-age=3600` there, whatever the vars.
+  `HEADER_EDGE_DEPTH` (a number, at least 400) keeps settled answers in
+  `caches.default` with `public, max-age=86400` and `Cache-Tag: h-<height>,
+  hb-<height/1000>`; `/admin/ingest`'s replacement and the new
+  `POST /admin/edge-purge?from=&to=` purge them locally and by tag through the
+  zone (`HEADER_EDGE_ZONE_ID`, the secret `HEADER_EDGE_PURGE_TOKEN`).
+- The compiled-Worker gate runs every script under both feeds; the events
+  script carries the witness scenario.
+
 ## [0.6.0] - 2026-10-22
 
 - bsv-rs from `=0.7.2` to `0.8.1` (the caret; one bsv-rs per lock with the
