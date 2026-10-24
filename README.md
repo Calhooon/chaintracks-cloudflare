@@ -32,6 +32,20 @@ queries (`/findHeaderHexForHeight`, `/isValidRootForHeight` and the
 repair routes under `/admin/`. It does not require clients to poll the whole
 chain. `/getInfo` carries `rungTips`, each configured courier's latest tip.
 
+## Vars
+
+The deploy's `[vars]` and secrets that shape the feed and the header routes
+(the rest are in [wrangler.toml](wrangler.toml)):
+
+| name | kind | unset | set |
+|---|---|---|---|
+| `CHAIN_EVENT_FEED` | var | the 0.6.0 feed | `"2"`: no minute `tipAge`, one query a stream wake and a clean end at 900, the 90-day retention and 410 `cursorExpired`, the outbox's one head read ([docs/CHAIN-EVENTS.md](docs/CHAIN-EVENTS.md)) |
+| `HEADER_EDGE_DEPTH` | var | no cache; 0.6.0 lifetimes more than 400 below the tip, `no-cache` within | the settled line (at least 400): settled answers from `caches.default` for a day, tagged |
+| `HEADER_EDGE_ZONE_ID` | var | no zone purge (the colo's `cache.delete` only) | the zone whose tags a purge names |
+| `HEADER_EDGE_PURGE_TOKEN` | secret | as above | the purge token, read by `env.secret` alone |
+| `CHAIN_EVENT_WEBHOOK_URLS`, `CHAIN_EVENT_WEBHOOK_TOKEN` | var, secret | no outbox | the outbox targets and their bearer |
+| `CHAIN_EVENT_STREAM_BOUND` | var | 900 | a test hook: a lower stream bound, never a higher one |
+
 ## Health and beta
 
 `GET /health` returns the service status plus `build.lib_rev`, `build.dirty`,
