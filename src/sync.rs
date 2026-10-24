@@ -90,6 +90,11 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
     if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
         log_error!("Chain-event outbox error (cursor retained): {e:?}");
     }
+    if tick.feed == crate::events::Feed::V2 {
+        if let Err(e) = crate::events::retain(&db, crate::events::now_secs()).await {
+            log_error!("Chain-event retention error (nothing deleted): {e:?}");
+        }
+    }
     result
 }
 

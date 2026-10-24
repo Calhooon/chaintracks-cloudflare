@@ -182,3 +182,149 @@ async fn the_read_of_an_empty_journal_is_head_0_and_no_tip() {
     assert!(wake.tip.is_none());
     assert!(wake.page.events.is_empty());
 }
+
+fn insert_row(db: &SqliteDb, payload: &str, key: Option<&str>, created_at: u64) -> u64 {
+    db.conn()
+        .execute(
+            "INSERT INTO chain_events(payload, event_key, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![payload, key, created_at as i64],
+        )
+        .unwrap();
+    db.conn().last_insert_rowid() as u64
+}
+
+fn cursors(db: &SqliteDb) -> Vec<u64> {
+    let mut statement = db
+        .conn()
+        .prepare("SELECT cursor FROM chain_events ORDER BY cursor")
+        .unwrap();
+    statement
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(|r| r.unwrap() as u64)
+        .collect()
+}
+
+fn floor(db: &SqliteDb) -> u64 {
+    db.conn()
+        .query_row(
+            "SELECT floor FROM chain_event_state WHERE id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as u64
+}
+
+fn payload_of(db: &SqliteDb, kind: &str) -> String {
+    db.conn()
+        .query_row(
+            "SELECT payload FROM chain_events WHERE json_extract(payload, '$.kind') = ?1 ORDER BY cursor DESC LIMIT 1",
+            [kind],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+const DAY: u64 = 86_400;
+
+/// Witness step 5 (CF2): chain rows older than 90 days and `tipAge` rows
+/// older than 24 hours go, the floor rises to the greatest deleted chain
+/// cursor in the same transaction, a cursor below it reads 410 and a cursor
+/// at it reads the page the full journal gives (a deleted `tipAge` is a
+/// skipped number); a row of an unknown kind and the head row stay.
+#[tokio::test]
+async fn the_retention_deletes_old_rows_and_raises_the_floor_with_them() {
+    let (db, _) = served_chain().await;
+    let now = events::now_secs();
+    let tip = payload_of(&db, "tip");
+    let age = payload_of(&db, "tipAge");
+    db.conn()
+        .execute(
+            "UPDATE chain_events SET created_at = ?1",
+            [(now - 100 * DAY) as i64],
+        )
+        .unwrap();
+    let opening = cursors(&db);
+    // created_at rises with the cursor, as unixepoch() writes it.
+    let old_tip = insert_row(&db, &tip, None, now - 100 * DAY);
+    let unknown = insert_row(&db, r#"{"v":3,"kind":"later"}"#, None, now - 95 * DAY);
+    let young_tip = insert_row(&db, &tip, None, now - 10 * DAY);
+    let old_age = insert_row(&db, &age, Some("tipAge:a:1"), now - 2 * DAY);
+    let young_age = insert_row(&db, &age, Some("tipAge:a:2"), now - 3_600);
+    let head = insert_row(&db, &tip, None, now);
+    let whole = events::read_wake(&db, unknown - 1, 100).await.unwrap();
+    assert_eq!(floor(&db), 0);
+    events::retain(&db, now).await.unwrap();
+    assert_eq!(floor(&db), old_tip, "the greatest deleted chain row");
+    assert_eq!(cursors(&db), vec![unknown, young_tip, young_age, head]);
+    assert!(opening.iter().all(|c| *c < old_tip));
+    assert!(old_age > young_tip, "a deleted tipAge above the floor");
+    // Below the floor: 410 with the floor and the served tip.
+    let expired = events::read_wake(&db, old_tip - 1, 100).await.unwrap();
+    assert!(expired.expired(old_tip - 1));
+    let body: serde_json::Value = serde_json::from_str(&expired.expired_json()).unwrap();
+    let served = storage::served_tip(&db).await.unwrap().unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"v": 1, "error": "cursorExpired", "floor": old_tip.to_string(),
+            "tip": {"height": served.height, "hash": served.hash}})
+    );
+    assert!(
+        expired.expired(0),
+        "a replay from 0 past a floor is told so"
+    );
+    // At the floor: the page the full journal gives from there.
+    let at = events::read_wake(&db, old_tip, 100).await.unwrap();
+    assert!(!at.expired(old_tip));
+    assert_eq!(
+        at.page.events.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        vec![unknown, young_tip, young_age, head]
+    );
+    assert_eq!(
+        whole
+            .page
+            .events
+            .iter()
+            .map(|e| e.cursor)
+            // the one difference: the deleted tipAge, a skipped number
+            .filter(|c| *c >= unknown && *c != old_age)
+            .collect::<Vec<_>>(),
+        at.page.events.iter().map(|e| e.cursor).collect::<Vec<_>>()
+    );
+    // A second tick a day later: the young tipAge goes, a skipped number above
+    // the floor; the floor stays, the page from the floor has no chain hole.
+    events::retain(&db, now + DAY).await.unwrap();
+    assert_eq!(floor(&db), old_tip);
+    assert_eq!(cursors(&db), vec![unknown, young_tip, head]);
+    // Eighty-one days on, the young tip is old; the head row stays always.
+    events::retain(&db, now + 81 * DAY).await.unwrap();
+    assert_eq!(floor(&db), young_tip);
+    assert_eq!(cursors(&db), vec![unknown, head]);
+    events::retain(&db, now + 1_000 * DAY).await.unwrap();
+    assert_eq!(cursors(&db), vec![unknown, head], "never the head row");
+    assert_eq!(floor(&db), young_tip);
+}
+
+/// At most 1,000 rows a tick; the backlog of the minute's `tipAge` rows
+/// written since 0009 drains over the ticks after the release.
+#[tokio::test]
+async fn the_retention_deletes_at_most_1000_rows_a_tick() {
+    let (db, _) = served_chain().await;
+    let now = events::now_secs();
+    let age = payload_of(&db, "tipAge");
+    for minute in 0..1_500 {
+        insert_row(
+            &db,
+            &age,
+            Some(&format!("tipAge:backlog:{minute}")),
+            now - 2 * DAY,
+        );
+    }
+    insert_row(&db, &payload_of(&db, "tip"), None, now);
+    let before = cursors(&db).len();
+    events::retain(&db, now).await.unwrap();
+    assert_eq!(before - cursors(&db).len(), 1_000);
+    events::retain(&db, now).await.unwrap();
+    assert_eq!(before - cursors(&db).len(), 1_500);
+    assert_eq!(floor(&db), 0, "a tipAge row never raises the floor");
+}
