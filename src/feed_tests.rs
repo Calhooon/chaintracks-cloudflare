@@ -91,3 +91,94 @@ fn the_feed_var_reads_2_as_the_design_and_anything_else_as_0_6_0() {
         assert_eq!(Feed::parse(other), Feed::V1);
     }
 }
+
+/// Change 2 (CF4), the bound's arithmetic on the counter: an envelope stream
+/// opened with a cursor spends one query at the open and one a wake, so it
+/// wakes 899 times and ends with `retry:` at 900 queries, inside the
+/// platform's 1,000; at 0.6.0 (three before the body, two a wake) the
+/// queries pass 1,000 on wake 499, after 498 wakes of 15 s (7,470 s).
+#[test]
+fn the_stream_ends_at_900_queries_inside_the_platform_bound() {
+    let mut budget = events::QueryBudget::new(1, events::STREAM_QUERY_BOUND);
+    let mut wakes = 0;
+    while budget.take() {
+        wakes += 1;
+    }
+    assert_eq!(wakes, 899);
+    assert_eq!(budget.spent(), 900);
+    assert!(budget.spent() < 1000);
+    assert!(!budget.take(), "a spent budget stays spent");
+    // The tip view without a cursor: the head and the served tip first.
+    let mut budget = events::QueryBudget::new(5, events::STREAM_QUERY_BOUND);
+    let mut wakes = 0;
+    while budget.take() {
+        wakes += 1;
+    }
+    assert_eq!(wakes, 895);
+    // The test hook lowers the bound and never raises it.
+    let mut hooked = events::QueryBudget::new(1, 1);
+    assert!(!hooked.take());
+    let mut raised = events::QueryBudget::new(899, 5_000);
+    assert!(raised.take());
+    assert!(!raised.take());
+    // 0.6.0: 3 + 2 * wakes queries pass 1,000 on wake 499.
+    assert_eq!((1000 - 3) / 2 + 1, 499);
+    assert_eq!(498 * 15, 7_470);
+    assert_eq!(events::STREAM_END, "retry: 1000\n\n");
+}
+
+/// The feed-2 read is the page the 0.6.0 read gives, in one query, with the
+/// head and the served tip beside it; the heartbeat carries the tip's age.
+#[tokio::test]
+async fn one_query_reads_the_page_the_head_and_the_tip() {
+    let (db, _) = served_chain().await;
+    let whole = events::read_page(&db, 0, 100).await.unwrap();
+    let mut cursor = 0;
+    let mut replay = Vec::new();
+    loop {
+        let wake = events::read_wake(&db, cursor, 1).await.unwrap();
+        let page = events::read_page(&db, cursor, 1).await.unwrap();
+        assert_eq!(wake.page.json(), page.json());
+        assert_eq!(wake.head, whole.cursor);
+        let tip = wake.tip.clone().unwrap();
+        let served = storage::served_tip(&db).await.unwrap().unwrap();
+        assert_eq!(
+            (tip.height, tip.hash.as_str(), tip.time),
+            (served.height, served.hash.as_str(), served.time)
+        );
+        replay.extend(wake.page.events.iter().map(|e| e.payload.clone()));
+        cursor = wake.page.cursor;
+        if !wake.page.has_more {
+            break;
+        }
+    }
+    assert_eq!(
+        replay,
+        whole
+            .events
+            .iter()
+            .map(|e| e.payload.clone())
+            .collect::<Vec<_>>()
+    );
+    let empty = events::read_wake(&db, cursor, 100).await.unwrap();
+    assert!(empty.page.events.is_empty());
+    assert_eq!(empty.page.cursor, cursor);
+    let tip = empty.tip.unwrap();
+    assert_eq!(
+        events::heartbeat(Some(&tip), u64::from(tip.time) + 42),
+        ": heartbeat tipAge=42\n\n"
+    );
+    assert_eq!(events::heartbeat(Some(&tip), 0), ": heartbeat tipAge=0\n\n");
+    assert_eq!(events::heartbeat(None, 0), ": heartbeat\n\n");
+    assert!(events::read_wake(&db, cursor, 0).await.is_err());
+}
+
+/// An empty store still answers the anchor row: head 0, no tip.
+#[tokio::test]
+async fn the_read_of_an_empty_journal_is_head_0_and_no_tip() {
+    let db = SqliteDb::migrated();
+    let wake = events::read_wake(&db, 0, 100).await.unwrap();
+    assert_eq!(wake.head, 0);
+    assert!(wake.tip.is_none());
+    assert!(wake.page.events.is_empty());
+}

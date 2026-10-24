@@ -147,7 +147,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
                 _ => None,
             };
             if let Some(view) = view {
-                return event_response(db, &req, view, true).await;
+                return event_response(db, env, &req, view, true).await;
             }
             return handle_v2(&db, env, &chain, &v2p, &req.url()?).await;
         }
@@ -158,10 +158,10 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         // Health (plain text, no wrapper ; matches production root endpoint)
         (Method::Get, "/") => health(&chain),
         (Method::Get, "/events") => {
-            event_response(db, &req, crate::events::View::Envelope, false).await
+            event_response(db, env, &req, crate::events::View::Envelope, false).await
         }
         (Method::Get, "/events/stream") => {
-            event_response(db, &req, crate::events::View::Envelope, true).await
+            event_response(db, env, &req, crate::events::View::Envelope, true).await
         }
 
         // Info & chain
@@ -970,8 +970,17 @@ fn add_cors(mut response: Response) -> Response {
     response
 }
 
+fn event_page(page: &crate::events::Page) -> Result<Response> {
+    let headers = Headers::new();
+    headers.set("Content-Type", "application/json")?;
+    headers.set("Cache-Control", "no-store")?;
+    headers.set("X-Chain-Event-Version", "2")?;
+    Ok(Response::ok(page.json())?.with_headers(headers))
+}
+
 async fn event_response(
     db: worker::D1Database,
+    env: &Env,
     req: &Request,
     view: crate::events::View,
     streaming: bool,
@@ -985,6 +994,9 @@ async fn event_response(
         Ok(cursor) => cursor,
         Err(e) => return wrap_error(&e.to_string(), 400),
     };
+    if crate::events::Feed::of(env) == crate::events::Feed::V2 {
+        return event_response_v2(db, env, cursor, view, streaming).await;
+    }
     let since = match (cursor, view) {
         (Some(cursor), _) => cursor,
         (None, crate::events::View::Envelope) => 0,
@@ -1004,12 +1016,54 @@ async fn event_response(
         crate::events::stream(db, since, view, initial).await
     } else {
         let page = crate::events::read_page(&db, since, crate::events::PAGE_SIZE).await?;
-        let headers = Headers::new();
-        headers.set("Content-Type", "application/json")?;
-        headers.set("Cache-Control", "no-store")?;
-        headers.set("X-Chain-Event-Version", "2")?;
-        Ok(Response::ok(page.json())?.with_headers(headers))
+        event_page(&page)
     }
+}
+
+/// Change 2 (CF4): the feed-2 page and stream read the journal by one query
+/// (`events::SQL_WAKE`); the stream counts every query of its invocation,
+/// the route's included, against `events::STREAM_QUERY_BOUND`.
+async fn event_response_v2(
+    db: worker::D1Database,
+    env: &Env,
+    cursor: Option<u64>,
+    view: crate::events::View,
+    streaming: bool,
+) -> Result<Response> {
+    let mut spent = 0;
+    let since = match (cursor, view) {
+        (Some(cursor), _) => cursor,
+        (None, crate::events::View::Envelope) => 0,
+        (None, _) => {
+            spent += 1;
+            crate::events::head(&db).await?
+        }
+    };
+    let mut initial = String::new();
+    if streaming && cursor.is_none() && matches!(view, crate::events::View::Tip) {
+        // served_tip: the ceiling, the tip and at most one height read.
+        spent += 3;
+        if let Some(tip) = storage::served_tip(&db).await? {
+            initial = crate::events::initial_tip(&tip);
+        }
+    }
+    spent += 1;
+    let wake = crate::events::read_wake(&db, since, crate::events::PAGE_SIZE).await?;
+    if since > wake.head {
+        return wrap_error("cursorAhead: cursor belongs to another journal", 409);
+    }
+    if !streaming {
+        return event_page(&wake.page);
+    }
+    // The test hook: a lower bound drives the stream's end without 900
+    // real queries; it can never raise the bound.
+    let bound = env
+        .var("CHAIN_EVENT_STREAM_BOUND")
+        .ok()
+        .and_then(|v| v.to_string().trim().parse::<u32>().ok())
+        .unwrap_or(crate::events::STREAM_QUERY_BOUND);
+    let budget = crate::events::QueryBudget::new(spent, bound);
+    crate::events::stream_v2(db, wake, view, initial, budget)
 }
 
 #[cfg(test)]

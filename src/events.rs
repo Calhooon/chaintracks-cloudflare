@@ -333,32 +333,171 @@ pub async fn read_page(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Pag
     .await?;
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cursor = row.cursor as u64;
-        events.push(match decode(&row.payload) {
-            Ok(_) => JournalEvent {
-                cursor,
-                payload: row.payload,
-                fault: None,
-            },
-            Err(e) => {
-                let fault = e.to_string();
-                log_error!("Chain event at cursor {cursor} is unreadable: {fault}");
-                JournalEvent {
-                    cursor,
-                    payload: unreadable(cursor, &fault),
-                    fault: Some(fault),
-                }
-            }
-        });
-    }
+    let events = rows
+        .into_iter()
+        .map(|row| journal_event(row.cursor as u64, row.payload))
+        .collect::<Vec<_>>();
     Ok(Page {
         cursor: events.last().map_or(since, |e| e.cursor),
         events,
         has_more,
     })
 }
+
+fn journal_event(cursor: u64, payload: String) -> JournalEvent {
+    match decode(&payload) {
+        Ok(_) => JournalEvent {
+            cursor,
+            payload,
+            fault: None,
+        },
+        Err(e) => {
+            let fault = e.to_string();
+            log_error!("Chain event at cursor {cursor} is unreadable: {fault}");
+            JournalEvent {
+                cursor,
+                payload: unreadable(cursor, &fault),
+                fault: Some(fault),
+            }
+        }
+    }
+}
+
+/// Change 2 (CF4): "Queries per Worker invocation (read subrequest limits) |
+/// 1000 (Workers Paid)" [LIT] https://developers.cloudflare.com/d1/platform/limits/
+/// (Last updated Apr 21, 2026). A feed-2 stream spends at most this many,
+/// then writes `retry: 1000` and ends: an ordinary reconnect with
+/// `Last-Event-ID`, never `feedUnavailable` for the bound.
+pub const STREAM_QUERY_BOUND: u32 = 900;
+
+/// The D1 queries one stream invocation has spent against its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudget {
+    spent: u32,
+    bound: u32,
+}
+
+impl QueryBudget {
+    /// `bound` above [`STREAM_QUERY_BOUND`] is lowered to it: the test hook
+    /// `CHAIN_EVENT_STREAM_BOUND` can shorten a stream, never lengthen one.
+    pub fn new(spent: u32, bound: u32) -> Self {
+        Self {
+            spent,
+            bound: bound.min(STREAM_QUERY_BOUND),
+        }
+    }
+
+    /// One more query, when the bound leaves room for it.
+    pub fn take(&mut self) -> bool {
+        if self.spent >= self.bound {
+            return false;
+        }
+        self.spent += 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub fn spent(&self) -> u32 {
+        self.spent
+    }
+}
+
+/// The served tip as a feed-2 read carries it: the 410's `tip` and the
+/// heartbeat's age.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ServedTip {
+    pub height: u32,
+    pub hash: String,
+    pub time: u32,
+}
+
+/// One feed-2 read: the page, the journal's head and the served tip, in one
+/// D1 query (a page request, a stream's open and each of its wakes).
+pub struct Wake {
+    pub page: Page,
+    pub head: u64,
+    pub tip: Option<ServedTip>,
+}
+
+/// The one query of a feed-2 read. The anchor row is always present, so an
+/// empty page still carries the head and the tip.
+pub const SQL_WAKE: &str = "SELECT a.head AS head, a.tip AS tip, e.cursor AS cursor, e.payload AS payload FROM (SELECT (SELECT COALESCE(MAX(cursor), 0) FROM chain_events) AS head, (SELECT json_object('height', height, 'hash', hash, 'time', time) FROM chain_event_served_tip) AS tip) a LEFT JOIN (SELECT cursor, payload FROM chain_events WHERE cursor > ? ORDER BY cursor LIMIT ?) e ON 1 ORDER BY e.cursor";
+
+pub async fn read_wake(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Wake> {
+    if since > MAX_CURSOR || !(1..=PAGE_SIZE).contains(&limit) {
+        return Err(fault("invalid event cursor or page size"));
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        head: f64,
+        tip: Option<String>,
+        cursor: Option<f64>,
+        payload: Option<String>,
+    }
+    let rows: Vec<Row> = Query::new(SQL_WAKE)
+        .bind(since)
+        .bind(limit + 1)
+        .all(db)
+        .await?;
+    let anchor = rows
+        .first()
+        .ok_or_else(|| fault("event journal unavailable"))?;
+    if anchor.head < 0.0 || anchor.head > MAX_CURSOR as f64 {
+        return Err(fault("event cursor exhausted"));
+    }
+    let head = anchor.head as u64;
+    let tip = match &anchor.tip {
+        Some(raw) => Some(
+            serde_json::from_str::<ServedTip>(raw)
+                .map_err(|e| fault(format!("served tip unreadable: {e}")))?,
+        ),
+        None => None,
+    };
+    let mut events = rows
+        .into_iter()
+        .filter_map(|r| Some(journal_event(r.cursor? as u64, r.payload?)))
+        .collect::<Vec<_>>();
+    let has_more = events.len() > limit as usize;
+    events.truncate(limit as usize);
+    Ok(Wake {
+        page: Page {
+            cursor: events.last().map_or(since, |e| e.cursor),
+            events,
+            has_more,
+        },
+        head,
+        tip,
+    })
+}
+
+/// Seconds since the epoch, from the Worker's clock (the host's in tests).
+pub fn now_secs() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        worker::Date::now().as_millis() / 1000
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+}
+
+/// A feed-2 heartbeat: a comment, so no client parses it and no contract
+/// moves; the served tip's age is there for an operator (CF3).
+pub fn heartbeat(tip: Option<&ServedTip>, now: u64) -> String {
+    match tip {
+        Some(tip) => format!(
+            ": heartbeat tipAge={}\n\n",
+            now.saturating_sub(u64::from(tip.time))
+        ),
+        None => ": heartbeat\n\n".to_string(),
+    }
+}
+
+/// The frames a feed-2 stream writes when its bound is spent.
+pub const STREAM_END: &str = "retry: 1000\n\n";
 
 impl Page {
     pub fn json(&self) -> String {
@@ -583,6 +722,13 @@ pub async fn stream(
             }
         },
     );
+    sse_response(body)
+}
+
+fn sse_response<S>(body: S) -> Result<worker::Response>
+where
+    S: futures_util::Stream<Item = Result<Vec<u8>>> + 'static,
+{
     let headers = worker::Headers::new();
     headers.set("Content-Type", "text/event-stream")?;
     headers.set("Cache-Control", "no-store")?;
@@ -590,4 +736,79 @@ pub async fn stream(
     headers.set("Access-Control-Expose-Headers", "X-Chain-Event-Version")?;
     headers.set("Access-Control-Allow-Origin", "*")?;
     worker::Response::from_stream(body).map(|r| r.with_headers(headers))
+}
+
+fn feed_unavailable(description: &str) -> Vec<u8> {
+    // This is a reported feed fault with no id, so a reader cannot
+    // acknowledge the bad record. Envelope clients must report it.
+    let payload = serde_json::json!({"v":1,"error":"feedUnavailable","description":description});
+    format!("event: error\ndata: {payload}\n\n").into_bytes()
+}
+
+/// The frames of one feed-2 read: the rows, else a heartbeat with the age.
+fn wake_frames(wake: &Wake, view: View) -> Result<String> {
+    let mut chunk = String::new();
+    for event in &wake.page.events {
+        chunk.push_str(&sse_frame(event, view)?);
+    }
+    if chunk.is_empty() {
+        chunk = heartbeat(wake.tip.as_ref(), now_secs());
+    }
+    Ok(chunk)
+}
+
+/// Change 2 (CF4), the feed-2 stream: one D1 query a wake (the page, the
+/// head and the tip together, `SQL_WAKE`), and a clean end with `retry:`
+/// when `budget` is spent. `first` is the route's own read at the open,
+/// already counted in `budget`.
+pub fn stream_v2(
+    db: worker::D1Database,
+    first: Wake,
+    view: View,
+    initial: String,
+    budget: QueryBudget,
+) -> Result<worker::Response> {
+    let mut ready = initial;
+    ready.push_str(&wake_frames(&first, view)?);
+    let body = futures_util::stream::unfold(
+        Some((db, first.page.cursor, ready, first.page.has_more, budget)),
+        move |state| async move {
+            let (db, cursor, ready, more, mut budget) = state?;
+            if !ready.is_empty() {
+                return Some((
+                    Ok::<_, Error>(ready.into_bytes()),
+                    Some((db, cursor, String::new(), more, budget)),
+                ));
+            }
+            if !budget.take() {
+                return Some((Ok(STREAM_END.as_bytes().to_vec()), None));
+            }
+            if !more {
+                worker::Delay::from(std::time::Duration::from_secs(15)).await;
+            }
+            match read_wake(&db, cursor, PAGE_SIZE).await {
+                Ok(wake) if cursor > wake.head => Some((
+                    Ok(feed_unavailable(
+                        "cursorAhead: cursor belongs to another journal",
+                    )),
+                    None,
+                )),
+                Ok(wake) => match wake_frames(&wake, view) {
+                    Ok(chunk) => Some((
+                        Ok(chunk.into_bytes()),
+                        Some((
+                            db,
+                            wake.page.cursor,
+                            String::new(),
+                            wake.page.has_more,
+                            budget,
+                        )),
+                    )),
+                    Err(e) => Some((Err(e), None)),
+                },
+                Err(e) => Some((Ok(feed_unavailable(&e.to_string())), None)),
+            }
+        },
+    );
+    sse_response(body)
 }
