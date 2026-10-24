@@ -1052,6 +1052,17 @@ async fn event_response_v2(
     if since > wake.head {
         return wrap_error("cursorAhead: cursor belongs to another journal", 409);
     }
+    // Change 3 (CF2): below the floor the page would have a hole; the client
+    // re-reads from its own tip (docs/CHAIN-EVENTS.md "Retention and the floor").
+    if wake.expired(since) {
+        let headers = Headers::new();
+        headers.set("Content-Type", "application/json")?;
+        headers.set("Cache-Control", "no-store")?;
+        headers.set("X-Chain-Event-Version", "2")?;
+        return Ok(Response::ok(wake.expired_json())?
+            .with_status(410)
+            .with_headers(headers));
+    }
     if !streaming {
         return event_page(&wake.page);
     }

@@ -416,12 +416,31 @@ pub struct ServedTip {
 pub struct Wake {
     pub page: Page,
     pub head: u64,
+    /// Change 3 (CF2): the retention's floor (`chain_event_state.floor`).
+    pub floor: u64,
     pub tip: Option<ServedTip>,
+}
+
+impl Wake {
+    /// A cursor below the floor: the rows above it are no longer whole.
+    pub fn expired(&self, since: u64) -> bool {
+        since < self.floor
+    }
+
+    /// The 410 body: the floor and the served tip, never a page with a hole.
+    pub fn expired_json(&self) -> String {
+        let tip = self.tip.as_ref().map_or(
+            serde_json::Value::Null,
+            |t| serde_json::json!({"height": t.height, "hash": t.hash}),
+        );
+        serde_json::json!({"v": 1, "error": "cursorExpired", "floor": self.floor.to_string(), "tip": tip})
+            .to_string()
+    }
 }
 
 /// The one query of a feed-2 read. The anchor row is always present, so an
 /// empty page still carries the head and the tip.
-pub const SQL_WAKE: &str = "SELECT a.head AS head, a.tip AS tip, e.cursor AS cursor, e.payload AS payload FROM (SELECT (SELECT COALESCE(MAX(cursor), 0) FROM chain_events) AS head, (SELECT json_object('height', height, 'hash', hash, 'time', time) FROM chain_event_served_tip) AS tip) a LEFT JOIN (SELECT cursor, payload FROM chain_events WHERE cursor > ? ORDER BY cursor LIMIT ?) e ON 1 ORDER BY e.cursor";
+pub const SQL_WAKE: &str = "SELECT a.head AS head, a.floor AS floor, a.tip AS tip, e.cursor AS cursor, e.payload AS payload FROM (SELECT (SELECT COALESCE(MAX(cursor), 0) FROM chain_events) AS head, (SELECT floor FROM chain_event_state WHERE id = 1) AS floor, (SELECT json_object('height', height, 'hash', hash, 'time', time) FROM chain_event_served_tip) AS tip) a LEFT JOIN (SELECT cursor, payload FROM chain_events WHERE cursor > ? ORDER BY cursor LIMIT ?) e ON 1 ORDER BY e.cursor";
 
 pub async fn read_wake(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Wake> {
     if since > MAX_CURSOR || !(1..=PAGE_SIZE).contains(&limit) {
@@ -430,6 +449,7 @@ pub async fn read_wake(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Wak
     #[derive(Deserialize)]
     struct Row {
         head: f64,
+        floor: Option<f64>,
         tip: Option<String>,
         cursor: Option<f64>,
         payload: Option<String>,
@@ -446,6 +466,10 @@ pub async fn read_wake(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Wak
         return Err(fault("event cursor exhausted"));
     }
     let head = anchor.head as u64;
+    let floor = anchor
+        .floor
+        .ok_or_else(|| fault("chain_event_state row 1 is missing (migration 0012?)"))?
+        as u64;
     let tip = match &anchor.tip {
         Some(raw) => Some(
             serde_json::from_str::<ServedTip>(raw)
@@ -466,8 +490,56 @@ pub async fn read_wake(db: &impl HeaderDb, since: u64, limit: u32) -> Result<Wak
             has_more,
         },
         head,
+        floor,
         tip,
     })
+}
+
+/// Change 3 (CF2): a chain row is kept 90 days, a `tipAge` row 24 hours, by
+/// `created_at` (the owner's word on DECISIONS section 14.1, design
+/// section 6).
+pub const RETAIN_CHAIN_SECS: u64 = 90 * 86_400;
+pub const RETAIN_TIP_AGE_SECS: u64 = 86_400;
+
+/// The rows one tick deletes, and the floor it raises, in one transaction.
+/// ?1 the floor read before the batch, ?2 the chain rows' cutoff, ?3 the
+/// `tipAge` rows' cutoff (both bound from the Worker's clock, so the two
+/// statements pick the same rows). At most 1,000 rows a tick, never the head
+/// row. The chain rows are the prefix above the floor older than ?2: the scan
+/// by cursor stops at the first younger row. The `tipAge` rows come by their
+/// `event_key` index alone. A row of any other kind (`unreadable`'s stored
+/// rows) is kept.
+const RETAIN_PICKED: &str = "WITH head AS (SELECT COALESCE(MAX(cursor), 0) AS c FROM chain_events), young AS (SELECT COALESCE((SELECT cursor FROM chain_events WHERE cursor > ?1 AND created_at >= ?2 ORDER BY cursor LIMIT 1), (SELECT c FROM head)) AS c), picked AS (SELECT cursor, 1 AS chain FROM chain_events WHERE cursor > ?1 AND cursor < (SELECT c FROM young) AND json_extract(payload, '$.kind') IN ('tip', 'fork', 'reorg', 'invalidated', 'frozen', 'split', 'splitResolved') UNION ALL SELECT cursor, 0 AS chain FROM chain_events WHERE event_key >= 'tipAge:' AND event_key < 'tipAge;' AND created_at < ?3 AND cursor < (SELECT c FROM head) ORDER BY cursor LIMIT 1000)";
+
+pub fn sql_retain_floor() -> String {
+    format!("{RETAIN_PICKED} UPDATE chain_event_state SET floor = MAX(floor, COALESCE((SELECT MAX(cursor) FROM picked WHERE chain = 1), 0)) WHERE id = 1")
+}
+
+pub fn sql_retain_delete() -> String {
+    format!("{RETAIN_PICKED} DELETE FROM chain_events WHERE cursor IN (SELECT cursor FROM picked)")
+}
+
+/// Change 3 (CF2), the scheduled tick's retention under feed 2: the floor
+/// rises to the greatest deleted chain row's cursor in the transaction that
+/// deletes it, so a cursor at or above the floor never reads a hole.
+pub async fn retain(db: &impl HeaderDb, now: u64) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Row {
+        floor: f64,
+    }
+    let floor = Query::new("SELECT floor FROM chain_event_state WHERE id = 1")
+        .first::<Row>(db)
+        .await?
+        .ok_or_else(|| fault("chain_event_state row 1 is missing"))?
+        .floor as u64;
+    let chain_cutoff = now.saturating_sub(RETAIN_CHAIN_SECS);
+    let tip_age_cutoff = now.saturating_sub(RETAIN_TIP_AGE_SECS);
+    let bind = |q: Query| q.bind(floor).bind(chain_cutoff).bind(tip_age_cutoff);
+    db.batch(vec![
+        bind(Query::new(sql_retain_floor())),
+        bind(Query::new(sql_retain_delete())),
+    ])
+    .await
 }
 
 /// Seconds since the epoch, from the Worker's clock (the host's in tests).
@@ -793,6 +865,11 @@ pub fn stream_v2(
                     )),
                     None,
                 )),
+                // The floor passed this stream's cursor: the reconnect hears
+                // the 410 with the floor and the tip.
+                Ok(wake) if wake.expired(cursor) => {
+                    Some((Ok(STREAM_END.as_bytes().to_vec()), None))
+                }
                 Ok(wake) => match wake_frames(&wake, view) {
                     Ok(chunk) => Some((
                         Ok(chunk.into_bytes()),
