@@ -38,6 +38,9 @@ mod consensus;
 mod courier_tests;
 mod couriers;
 mod d1;
+mod edge;
+#[cfg(test)]
+mod edge_tests;
 mod events;
 #[cfg(test)]
 mod feed_tests;

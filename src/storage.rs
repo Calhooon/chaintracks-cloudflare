@@ -1760,6 +1760,51 @@ pub async fn served_ceiling(db: &impl HeaderDb) -> worker::Result<Ceiling> {
     })
 }
 
+/// The ceiling and the served tip's height in one read: the edge half
+/// (chaintracks-cloudflare #16) decides a route's band from the tip without
+/// a query more than the route made at 0.6.0. The tip is migration 0009's
+/// `chain_event_served_tip`, the same selection as [`served_tip`].
+pub(crate) const SQL_CEILING_AND_TIP: &str = "SELECT validated_height, validated_hash, validation_fault, validation_complete, (SELECT height FROM chain_event_served_tip) AS tip_height FROM sync_state WHERE id = 1";
+
+pub async fn served_ceiling_and_tip(db: &impl HeaderDb) -> worker::Result<(Ceiling, Option<u32>)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        validated_height: Option<f64>,
+        validation_complete: Option<f64>,
+        tip_height: Option<f64>,
+    }
+    let row: Option<Row> = Query::new(SQL_CEILING_AND_TIP).first(db).await?;
+    let row = row.ok_or_else(|| worker::Error::RustError("sync_state row 1 is missing".into()))?;
+    let ceiling = if row.validation_complete.unwrap_or(0.0) as i64 == 1 {
+        Ceiling::All
+    } else {
+        match row.validated_height {
+            Some(h) => Ceiling::UpTo(h as u32),
+            None => Ceiling::Nothing,
+        }
+    };
+    Ok((ceiling, row.tip_height.map(|h| h as u32)))
+}
+
+/// `count` headers from `start` as hex, clipped to `ceiling` (the routes,
+/// the ceiling read with the tip by [`served_ceiling_and_tip`]).
+pub async fn headers_hex_under(
+    db: &impl HeaderDb,
+    ceiling: Ceiling,
+    start: u32,
+    count: u32,
+) -> worker::Result<String> {
+    let count = match ceiling {
+        Ceiling::All => count,
+        Ceiling::UpTo(c) if start <= c => count.min(c - start + 1),
+        _ => 0,
+    };
+    if count == 0 {
+        return Ok(String::new());
+    }
+    get_headers_hex(db, start, count).await
+}
+
 /// The active header at `height`, if the ceiling admits it (the routes).
 pub async fn served_header_for_height(
     db: &impl HeaderDb,
@@ -1769,17 +1814,6 @@ pub async fn served_header_for_height(
         return Ok(None);
     }
     find_header_for_height(db, height).await
-}
-
-/// The active header with `hash`, if the ceiling admits its height (the routes).
-pub async fn served_active_header_for_hash(
-    db: &impl HeaderDb,
-    hash: &str,
-) -> worker::Result<Option<BlockHeader>> {
-    let ceiling = served_ceiling(db).await?;
-    Ok(find_active_header_for_hash(db, hash)
-        .await?
-        .filter(|h| ceiling.admits(h.height)))
 }
 
 /// The served tip: the chain tip once the store is re-validated, before that
@@ -1824,23 +1858,6 @@ pub async fn present_height(db: &impl HeaderDb) -> worker::Result<Option<u32>> {
         }
     };
     Ok(Some(seen.map_or(tip.height, |s| s.max(tip.height))))
-}
-
-/// `count` headers from `start` as hex, clipped to the ceiling (the routes).
-pub async fn served_headers_hex(
-    db: &impl HeaderDb,
-    start: u32,
-    count: u32,
-) -> worker::Result<String> {
-    let count = match served_ceiling(db).await? {
-        Ceiling::All => count,
-        Ceiling::UpTo(c) if start <= c => count.min(c - start + 1),
-        _ => 0,
-    };
-    if count == 0 {
-        return Ok(String::new());
-    }
-    get_headers_hex(db, start, count).await
 }
 
 /// One step of the re-validation.
