@@ -39,7 +39,8 @@ const mf = new Miniflare({
   scriptPath: resolve('build/worker/shim.mjs'),
   modulesRules: [{type: 'ESModule', include: ['**/*.js', '**/*.mjs']}, {type: 'CompiledWasm', include: ['**/*.wasm']}],
   compatibilityDate: '2024-01-01',
-  bindings: {CHAIN: 'main', ARCADE_URL: 'https://arcade.test', BITAILS_URL: 'https://bitails.test',
+  // CHAIN_EVENT_FEED: the gate runs this script under "1" and "2" (ci.yml)
+  bindings: {CHAIN_EVENT_FEED: process.env.CHAIN_EVENT_FEED ?? '1', CHAIN: 'main', ARCADE_URL: 'https://arcade.test', BITAILS_URL: 'https://bitails.test',
     ARCADE_IMPLEMENTATION: 'peer', SPLIT_DEPTH: '3',
     CHAIN_EVENT_WEBHOOK_URLS: 'https://consumer.example/events', CHAIN_EVENT_WEBHOOK_TOKEN: 'local'},
   d1Databases: ['DB'],
