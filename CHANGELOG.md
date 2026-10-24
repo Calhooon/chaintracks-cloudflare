@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-10-23
 
 The chain-event feed's four changes and the edge half of #16, from
 bsv-stack-lean `docs/p0/chaintracks-reorg-feed.md` (ruled 2026-10-24), each
