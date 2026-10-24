@@ -74,7 +74,8 @@ const mf = new Miniflare({
     {type: 'CompiledWasm', include: ['**/*.wasm']},
   ],
   compatibilityDate: '2024-01-01',
-  bindings: {
+  // CHAIN_EVENT_FEED: the gate runs this script under "1" and "2" (ci.yml)
+  bindings: {CHAIN_EVENT_FEED: process.env.CHAIN_EVENT_FEED ?? '1',
     CHAIN: 'main',
     CHECKPOINTS: `${ANCHOR}:${fields(ANCHOR).hash}`,
     ADMIN_TOKEN: 'local',

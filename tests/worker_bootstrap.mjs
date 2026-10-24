@@ -39,7 +39,8 @@ const mf = new Miniflare({
     {type: 'CompiledWasm', include: ['**/*.wasm']},
   ],
   compatibilityDate: '2024-01-01',
-  bindings: {CHAIN: 'main', ADMIN_TOKEN: 'local', UPSTREAM_CHAINTRACKS_URL: 'https://peer.test'},
+  // CHAIN_EVENT_FEED: the gate runs this script under "1" and "2" (ci.yml)
+  bindings: {CHAIN_EVENT_FEED: process.env.CHAIN_EVENT_FEED ?? '1', CHAIN: 'main', ADMIN_TOKEN: 'local', UPSTREAM_CHAINTRACKS_URL: 'https://peer.test'},
   d1Databases: ['DB'],
   outboundService: request => {
     outbound.push(request.url)

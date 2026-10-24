@@ -95,12 +95,20 @@ jobs:
     - run: cargo install worker-build@0.7.5 --locked
     - run: worker-build --release
     - run: npm install --prefix "$RUNNER_TEMP/worker-gate-node" --no-save --package-lock=false miniflare@4.20260426.0
-    - run: "export MINIFLARE_MODULE=\"$RUNNER_TEMP/worker-gate-node/node_modules/miniflare/dist/src/index.js\"\n\
-        export LANE32_WITNESS_FILE=\"$RUNNER_TEMP/chain-events.json\"\nrm -f \"$LANE32_WITNESS_FILE\"\ncargo test\
-        \ --lib chain_event_tests::scenario_announced_nobody_hears_has_a_versioned_reorg --no-fail-fast -- --exact\n\
-        test -s \"$LANE32_WITNESS_FILE\"\nfor test in tests/worker_*.mjs; do\n  if [ \"$test\" = tests/worker_events.mjs\
-        \ ]; then\n    node \"$test\" \"$LANE32_WITNESS_FILE\" || exit\n  else\n    node \"$test\" || exit\n  fi\n\
-        done"
+    - run: |
+        export MINIFLARE_MODULE="$RUNNER_TEMP/worker-gate-node/node_modules/miniflare/dist/src/index.js"
+        export LANE32_WITNESS_FILE="$RUNNER_TEMP/chain-events.json"
+        rm -f "$LANE32_WITNESS_FILE"
+        cargo test --lib chain_event_tests::scenario_announced_nobody_hears_has_a_versioned_reorg --no-fail-fast -- --exact
+        test -s "$LANE32_WITNESS_FILE"
+        # worker_events.mjs runs both chain-event feeds itself; the others run under each.
+        node tests/worker_events.mjs "$LANE32_WITNESS_FILE" || exit
+        for feed in 1 2; do
+          for test in tests/worker_*.mjs; do
+            [ "$test" = tests/worker_events.mjs ] && continue
+            CHAIN_EVENT_FEED=$feed node "$test" || exit
+          done
+        done
   scrub:
     name: scrub
     runs-on: ubuntu-latest
