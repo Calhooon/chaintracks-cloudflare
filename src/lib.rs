@@ -39,6 +39,8 @@ mod courier_tests;
 mod couriers;
 mod d1;
 mod events;
+#[cfg(test)]
+mod feed_tests;
 mod health;
 #[cfg(test)]
 mod host_harness;

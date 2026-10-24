@@ -9,6 +9,36 @@ use worker::{Error, Result};
 pub const PAGE_SIZE: u32 = 100;
 const MAX_CURSOR: u64 = 9_007_199_254_740_991;
 
+/// `CHAIN_EVENT_FEED`, read once per invocation: `"2"` is the 0.7.0 feed
+/// (bsv-stack-lean `docs/p0/chaintracks-reorg-feed.md` sections 4 to 6: no
+/// minute's `tipAge` row, one query a stream wake and a clean end before the
+/// platform's bound, the retention with its floor, the outbox's one head
+/// read); unset, `"1"` or any other value is the 0.6.0 feed exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Feed {
+    #[default]
+    V1,
+    V2,
+}
+
+impl Feed {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("2") => Feed::V2,
+            _ => Feed::V1,
+        }
+    }
+
+    pub fn of(env: &worker::Env) -> Self {
+        Self::parse(
+            env.var("CHAIN_EVENT_FEED")
+                .ok()
+                .map(|v| v.to_string())
+                .as_deref(),
+        )
+    }
+}
+
 /// These bytes and the work belong to the header, independent of D1 flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -426,13 +456,19 @@ pub fn sse_frame(event: &JournalEvent, view: View) -> Result<String> {
 
 /// The scheduled handler exists at rust-chaintracks@461dc39 src/lib.rs:68-74
 /// and wrangler.toml:53-54. Keep age observable even when couriers are down.
+/// Feed 1 only: under feed 2 a same tip journals nothing (CF3); the publish
+/// trigger's `tipAge` row at each tip change stays (`0009` `chain_event_publish`)
+/// and the stream's heartbeat carries the age for an operator.
 pub const SQL_TIP_AGE: &str = "INSERT OR IGNORE INTO chain_events(payload, event_key) SELECT json_object('v', 1, 'kind', 'tipAge', 'seconds', MAX(0, unixepoch() - time), 'tip', json(payload)), 'tipAge:' || hash || ':' || (unixepoch() / 60) FROM chain_event_served_tip";
 
-pub async fn timer(db: &impl HeaderDb) -> Result<()> {
+pub async fn timer(db: &impl HeaderDb, feed: Feed) -> Result<()> {
     Query::new("UPDATE chain_event_signal SET tick = tick + 1 WHERE id = 1")
         .run(db)
         .await?;
-    Query::new(SQL_TIP_AGE).run(db).await
+    match feed {
+        Feed::V1 => Query::new(SQL_TIP_AGE).run(db).await,
+        Feed::V2 => Ok(()),
+    }
 }
 
 /// At-least-once webhook outbox. A refusal stops this target at its cursor;

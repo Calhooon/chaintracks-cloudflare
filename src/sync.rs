@@ -49,6 +49,10 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         .filter(|s| !s.is_empty());
 
     let params = chain_params(env, &chain)?;
+    let tick = Invocation {
+        env,
+        feed: crate::events::Feed::of(env),
+    };
 
     // E5: the push source goes ahead of the poll. The object holding the
     // peer's tip stream is woken if it is gone, and answers whether this
@@ -67,7 +71,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
 
     let result = if poll {
         let ladder = courier_ladder(env, &chain);
-        let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), env).await;
+        let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), &tick).await;
         let requests = ladder.requests();
         log!(
             "Cron: the poll asked the couriers {requests} times ({})",
@@ -81,7 +85,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         result
     } else {
         log!("Cron: the push is live; the couriers are not asked this tick");
-        run_pushed_tick(&db, &params, env).await
+        run_pushed_tick(&db, &params, &tick).await
     };
     if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
         log_error!("Chain-event outbox error (cursor retained): {e:?}");
@@ -98,7 +102,7 @@ pub(crate) async fn run_pushed_tick(
     params: &ChainParams,
     hooks: &impl TipWebhooks,
 ) -> Result<()> {
-    crate::events::timer(db).await?;
+    crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
     finish_sync(db, hooks, None).await;
     Ok(())
@@ -322,7 +326,7 @@ async fn run_cron_inner(
 ) -> Result<()> {
     // #32: age is emitted even when the source is unreachable. This timer
     // uses the verified served tip and deduplicates overlapping cron ticks.
-    crate::events::timer(db).await?;
+    crate::events::timer(db, hooks.feed()).await?;
     // The tip, read ONCE per cron (round 5, LOW-4): the height decides the
     // sync mode, the competitor check compares its hash, and the announce
     // reuses it unless a competitor landed meanwhile.
@@ -1387,6 +1391,32 @@ pub(crate) trait TipWebhooks {
         _cursor: u64,
     ) -> WebhookDelivery {
         self.post(target, token, body).await
+    }
+    /// The chain-event feed of this invocation (`CHAIN_EVENT_FEED`).
+    fn feed(&self) -> crate::events::Feed {
+        crate::events::Feed::V1
+    }
+}
+
+/// One scheduled invocation: the deploy's tip webhooks, with the chain-event
+/// feed read once (`CHAIN_EVENT_FEED`) for every step of the tick.
+pub(crate) struct Invocation<'a> {
+    pub(crate) env: &'a Env,
+    pub(crate) feed: crate::events::Feed,
+}
+
+impl TipWebhooks for Invocation<'_> {
+    fn targets(&self) -> Vec<WebhookTarget> {
+        self.env.targets()
+    }
+    fn token(&self) -> String {
+        self.env.token()
+    }
+    async fn post(&self, target: &WebhookTarget, token: &str, body: &str) -> WebhookDelivery {
+        self.env.post(target, token, body).await
+    }
+    fn feed(&self) -> crate::events::Feed {
+        self.feed
     }
 }
 

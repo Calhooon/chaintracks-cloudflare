@@ -332,6 +332,8 @@ pub(crate) struct RecordedWebhooks {
     pub reply: WebhookDelivery,
     replies_by_url: RefCell<HashMap<String, WebhookDelivery>>,
     posts: RefCell<Vec<Post>>,
+    /// The chain-event feed the tick runs under (`CHAIN_EVENT_FEED`).
+    pub feed: crate::events::Feed,
 }
 
 impl RecordedWebhooks {
@@ -342,6 +344,7 @@ impl RecordedWebhooks {
             reply: WebhookDelivery::Accepted(200),
             replies_by_url: RefCell::new(HashMap::new()),
             posts: RefCell::new(Vec::new()),
+            feed: crate::events::Feed::V1,
         }
     }
 
@@ -366,6 +369,10 @@ impl TipWebhooks for RecordedWebhooks {
 
     fn token(&self) -> String {
         self.token.clone()
+    }
+
+    fn feed(&self) -> crate::events::Feed {
+        self.feed
     }
 
     async fn post(&self, target: &WebhookTarget, token: &str, body: &str) -> WebhookDelivery {
