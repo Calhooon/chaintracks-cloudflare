@@ -186,11 +186,11 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         }
         (Method::Get, "/findHeaderHexForBlockHash") => {
             let url = req.url()?;
-            find_header_hex_for_block_hash(&db, &url).await
+            find_header_hex_for_block_hash(&db, env, &url).await
         }
         (Method::Get, "/getHeaders") => {
             let url = req.url()?;
-            get_headers(&db, &url).await
+            get_headers(&db, env, &url).await
         }
 
         // Validation
@@ -207,6 +207,12 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
             let url = req.url()?;
             let body = req.text().await?;
             admin_ingest(&db, env, &chain, &url, &body).await
+        }
+
+        // Admin (CF5): take settled heights off the edge cache.
+        (Method::Post, "/admin/edge-purge") => {
+            let url = req.url()?;
+            admin_edge_purge(&db, env, &url).await
         }
 
         // Admin: backfill a below-tip header gap from WoC. The cron only
@@ -316,16 +322,72 @@ async fn find_header_hex_for_height(
         .and_then(|(_, v)| v.parse().ok())
         .ok_or_else(|| Error::RustError("Missing ?height= parameter".into()))?;
 
-    if let Some(h) = storage::served_header_for_height(db, height).await? {
-        return wrap_success(PublicBlockHeader::from(h));
+    let edge = crate::edge::Edge::of(env);
+    let key = crate::edge::Key::HeightV1(height).url(&origin(url));
+    if let Some(hit) = crate::edge::lookup(edge, &key).await {
+        return Ok(hit);
+    }
+    let (header, tip) = served_at_height(db, height).await?;
+    if let Some(h) = header {
+        let settled = crate::edge::settled(tip, height, edge.line());
+        let tags = crate::edge::height_tags(height);
+        let response = wrap_success(PublicBlockHeader::from(h))?;
+        return crate::edge::answer(edge, &key, response, settled, tags, None).await;
     }
     // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
     if ensure_fresh_header(db, env, chain, height).await?.is_some() {
         if let Some(h) = storage::served_header_for_height(db, height).await? {
-            return wrap_success(PublicBlockHeader::from(h));
+            let response = wrap_success(PublicBlockHeader::from(h))?;
+            return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
         }
     }
     wrap_error("Header not found", 404)
+}
+
+/// The request's origin, the edge's keys' scheme and host.
+fn origin(url: &url::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+/// The served header at `height` and the served tip's height, in the two
+/// queries the 0.6.0 route made (the ceiling now carries the tip).
+async fn served_at_height(
+    db: &worker::D1Database,
+    height: u32,
+) -> Result<(Option<BlockHeader>, Option<u32>)> {
+    let (ceiling, tip) = storage::served_ceiling_and_tip(db).await?;
+    if !ceiling.admits(height) {
+        return Ok((None, tip));
+    }
+    Ok((storage::find_header_for_height(db, height).await?, tip))
+}
+
+/// The served active header with `hash` and the served tip's height.
+async fn served_by_hash(
+    db: &worker::D1Database,
+    hash: &str,
+) -> Result<(Option<BlockHeader>, Option<u32>)> {
+    let (ceiling, tip) = storage::served_ceiling_and_tip(db).await?;
+    let header = storage::find_active_header_for_hash(db, hash)
+        .await?
+        .filter(|h| ceiling.admits(h.height));
+    Ok((header, tip))
+}
+
+/// A served range: its hex, the served tip's height, and whether the whole
+/// range is settled (every requested height present and below the line).
+async fn served_range(
+    db: &worker::D1Database,
+    edge: crate::edge::Edge,
+    start: u32,
+    count: u32,
+) -> Result<(String, bool)> {
+    let (ceiling, tip) = storage::served_ceiling_and_tip(db).await?;
+    let hex = storage::headers_hex_under(db, ceiling, start, count).await?;
+    let n = (hex.len() / 160) as u32;
+    let settled =
+        n == count && n > 0 && crate::edge::settled(tip, start.saturating_add(n - 1), edge.line());
+    Ok((hex, settled))
 }
 
 /// Read-through grace window for FRESH blocks (owner decision 2026-07-08):
@@ -367,6 +429,7 @@ async fn ensure_fresh_header(
 
 async fn find_header_hex_for_block_hash(
     db: &worker::D1Database,
+    env: &Env,
     url: &url::Url,
 ) -> Result<Response> {
     let hash = url
@@ -375,13 +438,23 @@ async fn find_header_hex_for_block_hash(
         .map(|(_, v)| v.to_string())
         .ok_or_else(|| Error::RustError("Missing ?hash= parameter".into()))?;
 
-    match storage::served_active_header_for_hash(db, &hash).await? {
-        Some(h) => wrap_success(PublicBlockHeader::from(h)),
-        None => wrap_error("Header not found", 404),
+    let edge = crate::edge::Edge::of(env);
+    let key = crate::edge::Key::HashV1(hash.clone()).url(&origin(url));
+    if let Some(hit) = crate::edge::lookup(edge, &key).await {
+        return Ok(hit);
+    }
+    match served_by_hash(db, &hash).await? {
+        (Some(h), tip) => {
+            let settled = crate::edge::settled(tip, h.height, edge.line());
+            let tags = crate::edge::height_tags(h.height);
+            let response = wrap_success(PublicBlockHeader::from(h))?;
+            crate::edge::answer(edge, &key, response, settled, tags, None).await
+        }
+        (None, _) => wrap_error("Header not found", 404),
     }
 }
 
-async fn get_headers(db: &worker::D1Database, url: &url::Url) -> Result<Response> {
+async fn get_headers(db: &worker::D1Database, env: &Env, url: &url::Url) -> Result<Response> {
     let height: u32 = url
         .query_pairs()
         .find(|(k, _)| k == "height")
@@ -394,8 +467,20 @@ async fn get_headers(db: &worker::D1Database, url: &url::Url) -> Result<Response
         .unwrap_or(1);
 
     // Public cap only ; internal callers (R2 export) read full 100k files.
-    let hex_str = storage::served_headers_hex(db, height, count.min(10_000)).await?;
-    wrap_success(&hex_str)
+    let count = count.min(10_000);
+    let edge = crate::edge::Edge::of(env);
+    let key = crate::edge::Key::RangeV1 {
+        start: height,
+        count,
+    }
+    .url(&origin(url));
+    if let Some(hit) = crate::edge::lookup(edge, &key).await {
+        return Ok(hit);
+    }
+    let (hex_str, settled) = served_range(db, edge, height, count).await?;
+    let tags = crate::edge::range_tags(height, height.saturating_add(count.max(1) - 1));
+    let response = wrap_success(&hex_str)?;
+    crate::edge::answer(edge, &key, response, settled, tags, None).await
 }
 
 async fn is_valid_root_for_height(
@@ -422,13 +507,26 @@ async fn is_valid_root_for_height(
     //    → 404 error ; "unable to verify" must be distinguishable from
     //    "invalid", or a storage hole reads as proof-rejection downstream
     //    (wallet-infra already treats an error here as "fall back to WoC").
-    if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
-        return wrap_success(valid);
+    let edge = crate::edge::Edge::of(env);
+    let key = crate::edge::Key::Root {
+        height,
+        root: root.to_lowercase(),
+    }
+    .url(&origin(url));
+    if let Some(hit) = crate::edge::lookup(edge, &key).await {
+        return Ok(hit);
+    }
+    if let (Some(h), tip) = served_at_height(db, height).await? {
+        let valid = h.merkle_root.eq_ignore_ascii_case(&root);
+        let settled = crate::edge::settled(tip, height, edge.line());
+        let tags = crate::edge::height_tags(height);
+        return crate::edge::answer(edge, &key, wrap_success(valid)?, settled, tags, None).await;
     }
     // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
     if ensure_fresh_header(db, env, chain, height).await?.is_some() {
         if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
-            return wrap_success(valid);
+            let response = wrap_success(valid)?;
+            return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
         }
     }
     wrap_error(
@@ -470,6 +568,11 @@ fn v2_binary(bytes: Vec<u8>, cache: &str, extra: &[(&str, String)]) -> Result<Re
     Ok(resp.with_headers(headers))
 }
 
+/// The 0.6.0 lifetime of every v2 height route; it stands only below the
+/// settled line with `HEADER_EDGE_DEPTH` unset (`edge::control`).
+const V060: &str = "public, max-age=3600";
+use crate::edge::NEAR;
+
 fn v2_valid_hash(h: &str) -> bool {
     h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -509,29 +612,40 @@ async fn handle_v2(
             let Ok(height) = raw.parse::<u32>() else {
                 return v2_error("ERR_INVALID_PARAMS", "Invalid height parameter", 400);
             };
-            let mut header = storage::served_header_for_height(db, height).await?;
+            let edge = crate::edge::Edge::of(env);
+            let key = crate::edge::Key::HeightV2 {
+                height,
+                bin: want_bin,
+            }
+            .url(&origin(url));
+            if let Some(hit) = crate::edge::lookup(edge, &key).await {
+                return Ok(hit);
+            }
+            let (mut header, tip) = served_at_height(db, height).await?;
+            let mut settled = crate::edge::settled(tip, height, edge.line());
             if header.is_none() {
                 // Same fresh-block read-through grace as the v1 surface.
                 if ensure_fresh_header(db, env, chain, height).await?.is_some() {
                     header = storage::served_header_for_height(db, height).await?;
+                    settled = false;
                 }
             }
-            match header {
+            let tags = crate::edge::height_tags(height);
+            let response = match header {
                 Some(h) if want_bin => {
                     let hh = h.height.to_string();
-                    v2_binary(
-                        h.to_bytes().to_vec(),
-                        "public, max-age=3600",
-                        &[("X-Block-Height", hh)],
+                    v2_binary(h.to_bytes().to_vec(), NEAR, &[("X-Block-Height", hh)])?
+                }
+                Some(h) => v2_json(PublicBlockHeader::from(h), NEAR)?,
+                None => {
+                    return v2_error(
+                        "ERR_NOT_FOUND",
+                        &format!("Header not found at height {height}"),
+                        404,
                     )
                 }
-                Some(h) => v2_json(PublicBlockHeader::from(h), "public, max-age=3600"),
-                None => v2_error(
-                    "ERR_NOT_FOUND",
-                    &format!("Header not found at height {height}"),
-                    404,
-                ),
-            }
+            };
+            crate::edge::answer(edge, &key, response, settled, tags, Some(V060)).await
         }
 
         p if p.starts_with("/header/hash/") => {
@@ -543,22 +657,33 @@ async fn handle_v2(
             if !v2_valid_hash(raw) {
                 return v2_error("ERR_INVALID_PARAMS", "Invalid hash parameter", 400);
             }
-            match storage::served_active_header_for_hash(db, &raw.to_lowercase()).await? {
-                Some(h) if want_bin => {
-                    let hh = h.height.to_string();
-                    v2_binary(
-                        h.to_bytes().to_vec(),
-                        "public, max-age=3600",
-                        &[("X-Block-Height", hh)],
-                    )
-                }
-                Some(h) => v2_json(PublicBlockHeader::from(h), "public, max-age=3600"),
-                None => v2_error(
+            let hash = raw.to_lowercase();
+            let edge = crate::edge::Edge::of(env);
+            let key = crate::edge::Key::HashV2 {
+                hash: hash.clone(),
+                bin: want_bin,
+            }
+            .url(&origin(url));
+            if let Some(hit) = crate::edge::lookup(edge, &key).await {
+                return Ok(hit);
+            }
+            let (header, tip) = served_by_hash(db, &hash).await?;
+            let Some(h) = header else {
+                return v2_error(
                     "ERR_NOT_FOUND",
                     &format!("Header not found for hash {raw}"),
                     404,
-                ),
-            }
+                );
+            };
+            let settled = crate::edge::settled(tip, h.height, edge.line());
+            let tags = crate::edge::height_tags(h.height);
+            let response = if want_bin {
+                let hh = h.height.to_string();
+                v2_binary(h.to_bytes().to_vec(), NEAR, &[("X-Block-Height", hh)])?
+            } else {
+                v2_json(PublicBlockHeader::from(h), NEAR)?
+            };
+            crate::edge::answer(edge, &key, response, settled, tags, Some(V060)).await
         }
 
         "/headers" | "/headers.bin" => {
@@ -586,18 +711,31 @@ async fn handle_v2(
             };
             // Public cap mirrors the v1 route; huge counts truncate to what
             // exists (the vector expects X-Header-Count <= requested).
-            let hex_str = storage::served_headers_hex(db, height, count.min(10_000)).await?;
+            let count = count.min(10_000);
+            let edge = crate::edge::Edge::of(env);
+            let key = crate::edge::Key::RangeV2 {
+                start: height,
+                count,
+                bin: v2_path.ends_with(".bin"),
+            }
+            .url(&origin(url));
+            if let Some(hit) = crate::edge::lookup(edge, &key).await {
+                return Ok(hit);
+            }
+            let (hex_str, settled) = served_range(db, edge, height, count).await?;
             let bytes =
                 hex::decode(&hex_str).map_err(|e| Error::RustError(format!("hex decode: {e}")))?;
             let n = (bytes.len() / 80) as u32;
-            v2_binary(
+            let response = v2_binary(
                 bytes,
-                "public, max-age=3600",
+                NEAR,
                 &[
                     ("X-Start-Height", height.to_string()),
                     ("X-Header-Count", n.to_string()),
                 ],
-            )
+            )?;
+            let tags = crate::edge::range_tags(height, height.saturating_add(count - 1));
+            crate::edge::answer(edge, &key, response, settled, tags, Some(V060)).await
         }
 
         _ => v2_error("ERR_NOT_FOUND", "Not found", 404),
@@ -647,7 +785,16 @@ async fn admin_ingest(
         Err(storage::IngestError::Refused(e)) => return wrap_error(&format!("{e}"), 422),
         Err(storage::IngestError::Store(e)) => return Err(e),
     };
-    wrap_success(serde_json::json!({
+    // CF5: the operator's replacement (the 956433 class, far below the tip)
+    // is what can reach a settled height; its heights leave the edge.
+    let edge_purge =
+        if out.outcome == "activated" && crate::edge::Edge::of(env) != crate::edge::Edge::Off {
+            let heights: Vec<u32> = headers.iter().map(|h| h.height).collect();
+            Some(crate::edge::purge(env, &origin(url), &heights, &out.deactivated).await)
+        } else {
+            None
+        };
+    let mut answer = serde_json::json!({
         "start": start,
         "parsed": headers.len(),
         "inserted": out.inserted,
@@ -656,7 +803,47 @@ async fn admin_ingest(
         "deactivated": out.deactivated,
         "childRelinked": out.child_relinked,
         "reason": out.reason,
-    }))
+    });
+    // The 0.6.0 answer, unchanged unless the edge was purged.
+    if let Some(purged) = edge_purge {
+        answer["edgePurge"] = serde_json::to_value(purged).unwrap_or_default();
+    }
+    wrap_success(answer)
+}
+
+/// Admin endpoint (CF5): `POST /admin/edge-purge?from=H&to=T`, at most 1,000
+/// heights a call. Takes `[from, to]` off the edge: `cache.delete` in this
+/// colo (the height keys, and the hash keys of every stored row at those
+/// heights, active or not) and the zone's purge by tag. For a replacement
+/// another admin path made (a bulk span's repair, a canonicalization), or a
+/// purge to repeat.
+async fn admin_edge_purge(db: &worker::D1Database, env: &Env, url: &url::Url) -> Result<Response> {
+    let get = |k: &str| -> Option<u32> {
+        url.query_pairs()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let (Some(from), Some(to)) = (get("from"), get("to")) else {
+        return wrap_error("Missing from/to query parameters", 400);
+    };
+    if to < from || to - from >= 1000 {
+        return wrap_error("to must be >= from, at most 1,000 heights a call", 400);
+    }
+    let heights: Vec<u32> = (from..=to).collect();
+    #[derive(serde::Deserialize)]
+    struct Row {
+        hash: String,
+    }
+    let hashes: Vec<String> =
+        crate::d1::Query::new("SELECT hash FROM headers WHERE height BETWEEN ? AND ?")
+            .bind(from)
+            .bind(to)
+            .all::<Row>(db)
+            .await?
+            .into_iter()
+            .map(|r| r.hash)
+            .collect();
+    wrap_success(crate::edge::purge(env, &origin(url), &heights, &hashes).await)
 }
 
 /// Admin endpoint: backfill a below-tip gap one header at a time from the
