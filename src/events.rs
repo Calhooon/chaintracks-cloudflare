@@ -697,12 +697,11 @@ pub async fn deliver(db: &impl HeaderDb, hooks: &impl TipWebhooks) -> Result<()>
         return Err(fault("chain-event webhook token is unset"));
     }
     let budget = (32 / targets.len()) as u32;
+    if hooks.feed() == Feed::V2 {
+        return deliver_v2(db, hooks, targets, &token, budget).await;
+    }
     for target in targets {
-        let key = format!(
-            "{}={}",
-            target.binding.as_deref().unwrap_or_default(),
-            target.url
-        );
+        let key = target_key(&target);
         #[derive(Deserialize)]
         struct Row {
             cursor: f64,
@@ -714,26 +713,125 @@ pub async fn deliver(db: &impl HeaderDb, hooks: &impl TipWebhooks) -> Result<()>
                 .await?;
         let since = row.map_or(0, |r| r.cursor as u64);
         let page = read_page(db, since, budget).await?;
-        for event in page.events {
-            match hooks
-                .post_event(&target, &token, &event.payload, event.cursor)
-                .await
-            {
-                WebhookDelivery::Accepted(_) => {
-                    Query::new("INSERT INTO chain_event_deliveries(target, cursor) VALUES (?, ?) ON CONFLICT(target) DO UPDATE SET cursor = MAX(chain_event_deliveries.cursor, excluded.cursor)")
-                        .bind(&*key).bind(event.cursor).run(db).await?;
-                }
-                failure => {
-                    log_error!(
-                        "Chain-event delivery failed at cursor {}: {failure:?}",
-                        event.cursor
-                    );
-                    break;
-                }
+        post_events(db, hooks, &target, &key, &token, page.events).await?;
+    }
+    Ok(())
+}
+
+fn target_key(target: &crate::sync::WebhookTarget) -> String {
+    format!(
+        "{}={}",
+        target.binding.as_deref().unwrap_or_default(),
+        target.url
+    )
+}
+
+/// POST each row in order; a 2xx advances the target's cursor, a refusal
+/// stops this target at its cursor (the next tick retries it).
+async fn post_events(
+    db: &impl HeaderDb,
+    hooks: &impl TipWebhooks,
+    target: &crate::sync::WebhookTarget,
+    key: &str,
+    token: &str,
+    events: Vec<JournalEvent>,
+) -> Result<()> {
+    for event in events {
+        match hooks
+            .post_event(target, token, &event.payload, event.cursor)
+            .await
+        {
+            WebhookDelivery::Accepted(_) => {
+                Query::new("INSERT INTO chain_event_deliveries(target, cursor) VALUES (?, ?) ON CONFLICT(target) DO UPDATE SET cursor = MAX(chain_event_deliveries.cursor, excluded.cursor)")
+                    .bind(key).bind(event.cursor).run(db).await?;
+            }
+            failure => {
+                log_error!(
+                    "Chain-event delivery failed at cursor {}: {failure:?}",
+                    event.cursor
+                );
+                break;
             }
         }
     }
     Ok(())
+}
+
+/// Change 4, the feed-2 outbox's one read a tick for every target: the
+/// journal's head, the floor and every stored delivery cursor.
+pub const SQL_OUTBOX: &str = "SELECT a.head AS head, a.floor AS floor, d.target AS target, d.cursor AS cursor FROM (SELECT (SELECT COALESCE(MAX(cursor), 0) FROM chain_events) AS head, (SELECT floor FROM chain_event_state WHERE id = 1) AS floor) a LEFT JOIN chain_event_deliveries d ON 1";
+
+/// A behind target's rows: its cursor is known to stand inside the journal.
+pub const SQL_ROWS: &str =
+    "SELECT cursor, payload FROM chain_events WHERE cursor > ? ORDER BY cursor LIMIT ?";
+
+/// Change 4: a target at the head costs nothing past the one read; a behind
+/// target its page and its POSTs; the at-least-once contract is 0.6.0's. A
+/// target with no stored cursor starts at the floor (0 until the retention
+/// deletes a chain row): it never held a cursor, so nothing is skipped for
+/// it. A stored cursor ahead of the journal or below the floor is logged
+/// and that target waits for the operator; the others still run.
+async fn deliver_v2(
+    db: &impl HeaderDb,
+    hooks: &impl TipWebhooks,
+    targets: Vec<crate::sync::WebhookTarget>,
+    token: &str,
+    budget: u32,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Row {
+        head: f64,
+        floor: Option<f64>,
+        target: Option<String>,
+        cursor: Option<f64>,
+    }
+    let rows: Vec<Row> = Query::new(SQL_OUTBOX).all(db).await?;
+    let anchor = rows
+        .first()
+        .ok_or_else(|| fault("event journal unavailable"))?;
+    let head = anchor.head as u64;
+    let floor = anchor
+        .floor
+        .ok_or_else(|| fault("chain_event_state row 1 is missing (migration 0012?)"))?
+        as u64;
+    let stored: std::collections::HashMap<String, u64> = rows
+        .iter()
+        .filter_map(|r| Some((r.target.clone()?, r.cursor? as u64)))
+        .collect();
+    for target in targets {
+        let key = target_key(&target);
+        let since = stored.get(&key).copied().unwrap_or(floor);
+        if since == head {
+            continue;
+        }
+        if since > head {
+            log_error!("Chain-event target {key} is at {since}, ahead of the journal's {head} (cursorAhead)");
+            continue;
+        }
+        if since < floor {
+            log_error!(
+                "Chain-event target {key} is at {since}, below the floor {floor} (cursorExpired)"
+            );
+            continue;
+        }
+        let rows: Vec<RowsRow> = Query::new(SQL_ROWS)
+            .bind(since)
+            .bind(budget)
+            .all(db)
+            .await?;
+        let events = rows
+            .into_iter()
+            .map(|r| journal_event(r.cursor as u64, r.payload))
+            .collect();
+        post_events(db, hooks, &target, &key, token, events).await?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RowsRow {
+    cursor: f64,
+    payload: String,
 }
 
 /// The stream owns its D1 binding. Dropping the response cancels its Delay;

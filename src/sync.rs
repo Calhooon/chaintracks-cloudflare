@@ -87,7 +87,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         log!("Cron: the push is live; the couriers are not asked this tick");
         run_pushed_tick(&db, &params, &tick).await
     };
-    if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env)).await {
+    if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env, tick.feed)).await {
         log_error!("Chain-event outbox error (cursor retained): {e:?}");
     }
     if tick.feed == crate::events::Feed::V2 {
@@ -1786,7 +1786,7 @@ mod tip_webhook_tests {
 
 // #32: uses the existing service-binding transport, with separate opt-in
 // targets so the legacy height webhook remains compatible.
-pub(crate) struct EventWebhookConfig<'a>(pub(crate) &'a Env);
+pub(crate) struct EventWebhookConfig<'a>(pub(crate) &'a Env, pub(crate) crate::events::Feed);
 
 impl TipWebhooks for EventWebhookConfig<'_> {
     fn targets(&self) -> Vec<WebhookTarget> {
@@ -1805,6 +1805,9 @@ impl TipWebhooks for EventWebhookConfig<'_> {
     }
     async fn post(&self, target: &WebhookTarget, token: &str, body: &str) -> WebhookDelivery {
         send_webhook(self.0, target, token, body, None).await
+    }
+    fn feed(&self) -> crate::events::Feed {
+        self.1
     }
     async fn post_event(
         &self,

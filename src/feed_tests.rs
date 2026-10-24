@@ -328,3 +328,98 @@ async fn the_retention_deletes_at_most_1000_rows_a_tick() {
     assert_eq!(before - cursors(&db).len(), 1_500);
     assert_eq!(floor(&db), 0, "a tipAge row never raises the floor");
 }
+
+/// Change 4, the outbox under feed 2: one read of the head and of every
+/// delivery cursor a tick for both targets; the caught-up target costs
+/// nothing more, the behind one its page and its POSTs; a quiet tick is the
+/// one read; the 0.6.0 outbox reads three queries a target.
+#[tokio::test]
+async fn the_outbox_reads_the_head_once_a_tick_for_every_target() {
+    use crate::d1::Query;
+    use crate::host_harness::{Handed, Recorder};
+    let (db, _) = served_chain().await;
+    let head = events::head(&db).await.unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO chain_event_deliveries(target, cursor) VALUES ('A=https://a.example/events', ?1)",
+            [head as i64],
+        )
+        .unwrap();
+    let mut hooks = RecordedWebhooks::new(
+        "A=https://a.example/events,B=https://b.example/events",
+        "synthetic-bearer",
+    );
+    hooks.feed = Feed::V2;
+    let rec = Recorder::new(&db);
+    events::deliver(&rec, &hooks).await.unwrap();
+    let sent = hooks.take();
+    assert!(!sent.is_empty());
+    assert!(sent
+        .iter()
+        .all(|p| p.target.binding.as_deref() == Some("B")));
+    let reads: Vec<Handed> = rec
+        .handed()
+        .into_iter()
+        .filter(|h| !matches!(h, Handed::Execute(_)))
+        .collect();
+    assert_eq!(
+        reads,
+        vec![
+            Handed::All(Query::new(events::SQL_OUTBOX)),
+            Handed::All(Query::new(events::SQL_ROWS).bind(0u64).bind(16u32)),
+        ]
+    );
+    assert_eq!(
+        rec.handed().len() - reads.len(),
+        sent.len(),
+        "one cursor upsert per accepted POST"
+    );
+    // Both at the head: the tick is the one read.
+    let quiet = Recorder::new(&db);
+    events::deliver(&quiet, &hooks).await.unwrap();
+    assert!(hooks.take().is_empty());
+    assert_eq!(
+        quiet.handed(),
+        vec![Handed::All(Query::new(events::SQL_OUTBOX))]
+    );
+    // 0.6.0 on the same quiet journal: per target its cursor, the head, the rows.
+    hooks.feed = Feed::V1;
+    let old = Recorder::new(&db);
+    events::deliver(&old, &hooks).await.unwrap();
+    assert_eq!(old.handed().len(), 6);
+}
+
+/// A stored cursor below the floor or ahead of the journal stops that target
+/// alone, logged; a new target starts at the floor; the bytes are the page's.
+#[tokio::test]
+async fn the_outbox_holds_an_expired_target_and_starts_a_new_one_at_the_floor() {
+    let (db, _) = served_chain().await;
+    let whole = events::read_page(&db, 0, 100).await.unwrap();
+    let floor = whole.events[0].cursor;
+    db.conn()
+        .execute("UPDATE chain_event_state SET floor = ?1", [floor as i64])
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO chain_event_deliveries(target, cursor) VALUES ('A=https://a.example/events', 0), ('C=https://c.example/events', 999999)",
+            [],
+        )
+        .unwrap();
+    let mut hooks = RecordedWebhooks::new(
+        "A=https://a.example/events,B=https://b.example/events,C=https://c.example/events",
+        "synthetic-bearer",
+    );
+    hooks.feed = Feed::V2;
+    events::deliver(&db, &hooks).await.unwrap();
+    let sent = hooks.take();
+    assert!(sent
+        .iter()
+        .all(|p| p.target.binding.as_deref() == Some("B")));
+    assert_eq!(
+        sent.iter().map(|p| p.body.clone()).collect::<Vec<_>>(),
+        whole.events[1..]
+            .iter()
+            .map(|e| e.payload.clone())
+            .collect::<Vec<_>>()
+    );
+}
