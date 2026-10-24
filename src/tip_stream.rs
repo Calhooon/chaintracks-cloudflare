@@ -462,8 +462,9 @@ mod object {
                             a.tip_height,
                             a.tip_hash
                         );
+                        let feed = events::Feed::of(&self.env);
                         if let Err(e) =
-                            events::deliver(&db, &sync::EventWebhookConfig(&self.env)).await
+                            events::deliver(&db, &sync::EventWebhookConfig(&self.env, feed)).await
                         {
                             log_error!("Chain-event outbox error (cursor retained): {e:?}");
                         }
