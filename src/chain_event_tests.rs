@@ -506,7 +506,7 @@ async fn cron_emits_age_during_source_outage_and_clamps_future_tip_time() {
         events::decode(&page.events[0].payload).unwrap().event,
         ChainEvent::TipAge { seconds: 0, .. }
     ));
-    events::timer(&db).await.unwrap();
+    events::timer(&db, events::Feed::V1).await.unwrap();
     assert_eq!(events::head(&db).await.unwrap(), page.cursor);
 }
 
