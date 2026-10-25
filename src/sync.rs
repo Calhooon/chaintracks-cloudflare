@@ -110,6 +110,9 @@ pub(crate) async fn run_pushed_tick(
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
     finish_sync(db, hooks, None).await;
+    // #27: a tick the push covers is a completed pass too (the push is the
+    // sync source while it is live), so `lastPassAt` stays a minute old.
+    stamp_pass(db).await;
     Ok(())
 }
 
@@ -191,6 +194,13 @@ pub(crate) const RECORD_SEEN_SQL: &str =
 pub(crate) const RECORD_FAULT_SQL: &str =
     "UPDATE sync_state SET last_error = ?1, last_error_at = datetime('now') WHERE id = 1";
 const FAULT_TEXT_CAP: usize = 480;
+/// 0.7.1 (#27, bsv-low #877): the end of the last completed sync pass, idle
+/// passes included (migration 0013), served as `lastPassAt`: the liveness
+/// signal a consumer reads to tell a quiet chain from a stalled tracker.
+/// `updated_at` stays the last advance (audit M6) and the courier record
+/// stays the couriers' answer. Binds: none.
+pub(crate) const STAMP_PASS_SQL: &str =
+    "UPDATE sync_state SET last_pass_at = datetime('now') WHERE id = 1";
 
 async fn record_seen(db: &impl HeaderDb, height: u32) {
     if let Err(e) = crate::d1::Query::new(RECORD_SEEN_SQL)
@@ -229,6 +239,29 @@ pub(crate) async fn note_seen(db: &impl HeaderDb, height: u32) {
             log_error!("push: could not read the courier record (migration 0007 applied?): {e:?}")
         }
     }
+}
+
+/// #27: the pass stamp, written once at the end of every completed pass,
+/// best-effort and LOUD like the courier record: a missing column (migration
+/// 0013 not applied) never stops the sync, and `/getInfo` names it
+/// (`syncSchemaFault`). The load: one `UPDATE` of the single `sync_state` row
+/// a pass, 1,440 D1 writes a day at the minute cron, bounded by the cron and
+/// not by the chain; the one deliberate exception to round 5 LOW-4's "the
+/// idle cron writes nothing" (the #32 age writes aside), so that a quiet
+/// chain and a stalled tracker read differently on `/getInfo`.
+async fn stamp_pass(db: &impl HeaderDb) {
+    if let Err(e) = crate::d1::Query::new(STAMP_PASS_SQL).run(db).await {
+        log_error!("Cron: could not stamp the pass (migration 0013 applied?): {e:?}");
+    }
+}
+
+/// #27: how the cron's pass ended. `Completed` is the idle return and the
+/// work branch's end; `Skipped` is the tick no courier answered (its fault
+/// recorded), which does not stamp `last_pass_at`.
+#[derive(Debug, PartialEq, Eq)]
+enum Pass {
+    Completed,
+    Skipped,
 }
 
 /// The idle tick's half of the record (D5): read what stands; write the
@@ -319,7 +352,14 @@ pub(crate) async fn run_cron(
             return Err(e);
         }
     }
-    result
+    // #27: the stamp is the pass's last write, and only a completed pass
+    // writes it: a pass that failed (an error, the observations' fault) or
+    // that no courier answered records its fault as before and leaves
+    // `last_pass_at` where it stood.
+    if result? == Pass::Completed {
+        stamp_pass(db).await;
+    }
+    Ok(())
 }
 
 async fn run_cron_inner(
@@ -328,7 +368,7 @@ async fn run_cron_inner(
     source: &impl ChainSource,
     upstream_url: Option<&str>,
     hooks: &impl TipWebhooks,
-) -> Result<()> {
+) -> Result<Pass> {
     // #32: age is emitted even when the source is unreachable. This timer
     // uses the verified served tip and deduplicates overlapping cron ticks.
     crate::events::timer(db, hooks.feed()).await?;
@@ -350,7 +390,7 @@ async fn run_cron_inner(
             // round 4 (MED-1): the announce still runs, so a refused delivery
             // is retried by every cron, not only by one that moved the tip.
             announce_tip(db, hooks, tip).await;
-            return Ok(());
+            return Ok(Pass::Skipped);
         }
     };
     let woc_height = chain_info.blocks;
@@ -404,8 +444,9 @@ async fn run_cron_inner(
         // tick and one write only when the record is behind the couriers'
         // answer (after migration 0007, or after an ingest that bypassed the
         // cron), so the launch gate reads lag 0 on a quiet chain and never
-        // "unknown"; round 5's "writes nothing" holds whenever the record is
-        // current. The tally is logged on every tick (the quiet chain shows
+        // "unknown"; round 5's "writes nothing" holds for the courier record
+        // whenever it is current (the #27 pass stamp is the one write every
+        // idle pass makes, besides the #32 age). The tally is logged on every tick (the quiet chain shows
         // the ladder answering).
         keep_seen_current(db, woc_height).await;
         revalidate(db, params).await;
@@ -418,12 +459,16 @@ async fn run_cron_inner(
         // competitor ingested just above (the 2026-09-07 shape) is announced
         // the moment it flips the tip.
         announce_tip(db, hooks, tip).await;
-        return Ok(());
+        // #27: the idle pass completed; `run_cron` stamps `last_pass_at`
+        // (the one write of a current record's idle pass besides the #32
+        // age, 1,440 a day at the minute cron).
+        return Ok(Pass::Completed);
     }
 
     // D5: the highest tip any courier answered, recorded on every cron that
-    // has work (the idle cron writes nothing, round 5 LOW-4; an idle tick's
-    // lag is 0 by construction). /getInfo serves this minus the stored tip.
+    // has work (the idle cron writes no courier record, round 5 LOW-4; an
+    // idle tick's lag is 0 by construction). /getInfo serves this minus the
+    // stored tip.
     record_seen(db, woc_height).await;
     let gap = woc_height - our_height;
 
@@ -574,7 +619,8 @@ async fn run_cron_inner(
     }
     finish_sync(db, hooks, new_tip).await;
 
-    Ok(())
+    // #27: the pass with work completed; `run_cron` stamps `last_pass_at`.
+    Ok(Pass::Completed)
 }
 
 /// P0-4: one step of the re-validation of the stored chain (after the deploy,
