@@ -1388,7 +1388,7 @@ async fn no_premature_clear_while_a_target_has_not_heard_the_fork() {
 /// written ONCE when the record is behind, see `courier_tests`), then the
 /// announce row and the deliveries, and writes nothing when the record is
 /// current and every target has the tip. #32 adds the durable age write and
-/// the served-ceiling read. To red:
+/// the served-ceiling read; #27 the pass stamp, the pass's last write. To red:
 /// `run_cron`, `announce_tip(db, hooks, tip)` on the idle path to
 /// `announce_tip(db, hooks, None)`, or the D5 `if seen != Some(woc_height)`
 /// guard dropped (a write every tick).
@@ -1428,8 +1428,10 @@ async fn an_idle_cron_reads_the_tip_once_and_emits_age() {
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),
             Handed::All(Query::new(ROUND3_READ_DELIVERIES)),
+            // #27: the pass stamp, the pass's last write
+            Handed::Execute(Query::new(crate::statement_pins::LASTPASS_STAMP)),
         ],
-        "one tip read, bounded age journal, validation and announce reads"
+        "one tip read, bounded age journal, validation and announce reads, the pass stamp"
     );
 }
 

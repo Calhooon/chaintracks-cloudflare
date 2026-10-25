@@ -48,6 +48,8 @@ mod health;
 #[cfg(test)]
 mod host_harness;
 #[cfg(test)]
+mod lastpass_tests;
+#[cfg(test)]
 mod pow_tests;
 mod push;
 #[cfg(test)]

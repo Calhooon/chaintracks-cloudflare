@@ -438,8 +438,8 @@ async fn a_courier_serving_a_header_without_proof_of_work_is_a_faulting_rung() {
 use crate::d1::Query;
 use crate::host_harness::{Handed, Recorder};
 use crate::statement_pins::{
-    D5_COURIER_HEALTH, D5_RECORD_SEEN, MAIN_CHAIN_TIP, P04_VALIDATION_STATE, ROUND2_ANNOUNCED_TIP,
-    ROUND3_READ_DELIVERIES,
+    D5_COURIER_HEALTH, D5_RECORD_SEEN, LASTPASS_STAMP, MAIN_CHAIN_TIP, P04_VALIDATION_STATE,
+    ROUND2_ANNOUNCED_TIP, ROUND3_READ_DELIVERIES,
 };
 
 /// The deploy of 2026-09-08 21:41Z landed on a chain idle at 965908 for 40
@@ -448,7 +448,8 @@ use crate::statement_pins::{
 /// store. An idle cron now reads the record once and writes the seen height
 /// ONCE when the record is behind the couriers' answer (after the migration,
 /// or after an ingest that bypassed the cron); when the record is current it
-/// writes nothing (round 5 LOW-4 kept). To red: `run_cron`, the idle path's
+/// writes no courier record (round 5 LOW-4 kept; the #27 pass stamp is the
+/// pass's one write besides the #32 age). To red: `run_cron`, the idle path's
 /// `if seen != Some(woc_height)` guard dropped (a write every tick) or the
 /// record dropped (the gate never passes on a quiet chain).
 #[tokio::test]
@@ -481,6 +482,8 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),
             Handed::All(Query::new(ROUND3_READ_DELIVERIES)),
+            // #27: the pass stamp, the pass's last write
+            Handed::Execute(Query::new(LASTPASS_STAMP)),
         ],
         "the idle cron seeds the courier record and emits age"
     );
@@ -511,8 +514,10 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),
             Handed::All(Query::new(ROUND3_READ_DELIVERIES)),
+            // #27: the pass stamp, the pass's last write
+            Handed::Execute(Query::new(LASTPASS_STAMP)),
         ],
-        "a current courier record: only age writes"
+        "a current courier record: only age writes and the pass stamp"
     );
     assert!(hooks.take().is_empty());
 }
