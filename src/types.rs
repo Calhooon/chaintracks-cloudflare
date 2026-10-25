@@ -233,6 +233,13 @@ pub struct ChaintracksInfo {
     /// the API-visible freshness signal (audit M6): consumers must be able
     /// to detect a stale tip instead of trusting it blindly.
     pub last_synced_at: Option<String>,
+    /// 0.7.1 (#27, bsv-low #877): the end of the last completed sync pass,
+    /// idle passes included (migration 0013); the liveness signal.
+    /// `lastSyncedAt` stays the last advance (M6). Absent until the first
+    /// pass after the migration; a pass that fails records
+    /// `lastSyncError` and leaves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pass_at: Option<String>,
     /// Height recorded at the last successful sync.
     pub last_synced_height: Option<u32>,
     /// Consecutive tip announces no consumer accepted (M19B-G2 round 2; the
