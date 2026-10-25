@@ -1,6 +1,6 @@
 [package]
 name = "bsv-chaintracks-cloudflare"
-version = "0.7.0"
+version = "0.7.1"
 description = "A BSV block-header service on Cloudflare Workers: D1 header storage, R2 bulk export, a chain-event feed."
 license = "MIT"
 repository = "https://github.com/Calhooon/chaintracks-cloudflare"

@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.7.1] - unreleased
+## [0.7.1] - 2026-10-25
 
 - `/getInfo` carries `lastPassAt` (#27, asked by bsv-low #877): the end of the
   last completed sync pass, idle passes and ticks the push covers included,
