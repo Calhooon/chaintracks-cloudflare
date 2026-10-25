@@ -79,7 +79,10 @@ that time, but their duration is also [D].
 
 Repeat `/getInfo` until `heightLive` reaches the seen tip, `liveLagBlocks` is
 zero, `validationComplete` is true, `validatedHeight` reaches the tip and
-`validationFault` is clear; inspect `lastSyncError` and its age. An existing
+`validationFault` is clear; inspect `lastSyncError` and its age. `lastPassAt`
+(after migration 0013) is the end of the last completed sync pass, idle passes
+included: within a minute or two of now on a healthy deploy, a quiet chain
+included, while `lastSyncedAt` is the last advance. An existing
 fault is not automatically cleared by a later successful poll. Re-check
 `/health` against the public tag revision throughout the soak.
 

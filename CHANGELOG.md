@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.7.1] - unreleased
+
+- `/getInfo` carries `lastPassAt` (#27, asked by bsv-low #877): the end of the
+  last completed sync pass, idle passes and ticks the push covers included,
+  from the new column `sync_state.last_pass_at` (migration
+  `0013_last_pass_at.sql`, additive, one column). A consumer tells a quiet
+  chain (a fresh `lastPassAt`, an aging `lastSyncedAt`) from a stalled tracker
+  (both aging). A pass no courier answered, or one that failed, records
+  `lastSyncError` as before and does not stamp. `lastSyncedAt` stays the last
+  advance (M6) and `lastSeenAt` the couriers' answer: neither meaning moves.
+- The load: one `UPDATE` of the single `sync_state` row a pass, 1,440 D1
+  writes a day at the minute cron, bounded by the cron and not by the chain;
+  the one deliberate exception to "the idle cron writes nothing" (round 5,
+  LOW-4). `/getInfo` adds one read of the same row. Before the migration the
+  stamp logs and the cron still syncs; `/getInfo` names the column in
+  `syncSchemaFault`.
+- The compiled-Worker gate: a quiet tick under both feeds answers `/getInfo`
+  with a newer `lastPassAt` and the same `lastSyncedAt` and `lastSeenAt`.
+
 ## [0.7.0] - 2026-10-23
 
 The chain-event feed's four changes and the edge half of #16, from

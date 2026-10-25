@@ -32,6 +32,28 @@ queries (`/findHeaderHexForHeight`, `/isValidRootForHeight` and the
 repair routes under `/admin/`. It does not require clients to poll the whole
 chain. `/getInfo` carries `rungTips`, each configured courier's latest tip.
 
+## Freshness on `/getInfo`
+
+Three times answer three questions, each from the single `sync_state` row:
+
+| field | moves when | means |
+|---|---|---|
+| `lastSyncedAt` | a new tip's claim (audit M6) | the last advance |
+| `lastSeenAt` | a cron with work; an idle cron only when the record is behind the couriers' answer | the couriers' highest answer |
+| `lastPassAt` | the end of every completed sync pass, idle passes and ticks the push covers included (migration 0013) | the liveness signal: a pass ran |
+
+On a quiet chain `lastSyncedAt` ages while `lastPassAt` stays a minute old; a
+stalled tracker ages both. A pass no courier answered, or one that failed,
+records `lastSyncError` and `lastSyncErrorAt` and leaves `lastPassAt`.
+
+The load: one `UPDATE` of the `sync_state` row a pass, 1,440 D1 writes a day
+at the minute cron, bounded by the cron and not by the chain. It is the one
+deliberate exception to "the idle cron writes nothing" (round 5, LOW-4), which
+still holds for the courier record and the tip announce; the minute's age
+writes of the chain-event feed are separate. `/getInfo` reads the stamp with
+one more read of the same row; before migration 0013 it omits `lastPassAt`
+and names the missing column in `syncSchemaFault`, and the cron still syncs.
+
 ## Vars
 
 The deploy's `[vars]` and secrets that shape the feed and the header routes
