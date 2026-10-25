@@ -363,3 +363,45 @@ for (const [feed, edgeDepth] of [['1', undefined], ['2', '400']]) {
     await mf.dispose()
   }
 }
+
+// 0.7.1 (#27, bsv-low #877): a scheduled tick on a quiet chain (the couriers
+// answer the stored tip, nothing new) stamps lastPassAt and moves neither
+// lastSyncedAt (M6) nor lastSeenAt (the courier record, current after the
+// first tick). The stamp is planted in the past first: datetime('now') has a
+// second's resolution.
+for (const feed of ['1', '2']) {
+  const chain = []
+  for (let h = 0; h <= 3; h++) chain.push(synthetic('q' + h, h, h ? chain[h - 1].hash : '0'.repeat(64), BigInt(h + 1) * 2n))
+  const tip = chain[3]
+  const json = value => new Response(JSON.stringify(value), {headers: {'content-type': 'application/json'}})
+  const mf = worker({CHAIN_EVENT_FEED: feed}, async request => {
+    if (new URL(request.url).pathname.endsWith('/chain/info')) return json({blocks: tip.height, bestblockhash: tip.hash})
+    return new Response('down', {status: 503})
+  })
+  try {
+    const db = await mf.getD1Database('DB')
+    await migrate(db)
+    await db.batch(chain.map(h => insert(db, h, 1, h === tip ? 1 : 0)))
+    await db.prepare('UPDATE sync_state SET validation_complete = 1 WHERE id = 1').run()
+    const cron = async () => (await mf.getWorker()).scheduled({cron: '* * * * *'})
+    const info = async () => (await (await mf.dispatchFetch('https://worker.test/getInfo')).json()).value
+    assert.equal((await info()).lastPassAt, undefined, 'absent before the first pass')
+    await cron()
+    const first = await info()
+    assert.equal(first.heightLive, tip.height, 'the tick was idle')
+    assert.equal(first.lastSeenHeight, tip.height)
+    assert.equal(typeof first.lastPassAt, 'string', 'the first idle pass stamps')
+    const planted = '2000-01-01 00:00:00'
+    await db.prepare('UPDATE sync_state SET last_pass_at = ? WHERE id = 1').bind(planted).run()
+    await cron()
+    const second = await info()
+    assert(second.lastPassAt > planted, `lastPassAt newer than before: ${second.lastPassAt}`)
+    assert.equal(second.lastSyncedAt, first.lastSyncedAt, 'lastSyncedAt stays the last advance')
+    assert.equal(second.lastSeenAt, first.lastSeenAt, 'the courier record untouched')
+    assert.equal(second.lastSeenHeight, first.lastSeenHeight)
+    assert.equal(second.syncSchemaFault, undefined)
+    console.log(`Local compiled Worker GREEN (lastPassAt, feed ${feed}): a quiet tick stamps the pass; lastSyncedAt and lastSeenAt unmoved`)
+  } finally {
+    await mf.dispose()
+  }
+}
