@@ -488,6 +488,34 @@ fn the_ct33_statements_are_the_new_literals() {
     }
 }
 
+/// 0.7.1 (#27, bsv-low #877), sync.rs: the pass stamp, written once at the
+/// end of every completed sync pass, idle included (migration 0013).
+pub(crate) const LASTPASS_STAMP: &str =
+    "UPDATE sync_state SET last_pass_at = datetime('now') WHERE id = 1";
+/// 0.7.1, storage.rs: the stamp read by /getInfo (never on the cron's path).
+pub(crate) const LASTPASS_READ: &str = "SELECT last_pass_at FROM sync_state WHERE id = 1";
+/// The statements new in 0.7.1.
+pub(crate) const LASTPASS_VOCABULARY: [&str; 2] = [LASTPASS_STAMP, LASTPASS_READ];
+
+/// The 0.7.1 statements are the two literals above and nothing in any
+/// earlier vocabulary: `updated_at` (M6) and the courier record keep the
+/// statements that write them.
+#[test]
+fn the_lastpass_statements_are_the_two_new_literals() {
+    assert_eq!(crate::sync::STAMP_PASS_SQL, LASTPASS_STAMP);
+    assert_eq!(crate::storage::SQL_LAST_PASS, LASTPASS_READ);
+    for s in LASTPASS_VOCABULARY {
+        assert!(
+            !MAIN_VOCABULARY.contains(&s)
+                && !ROUND5_VOCABULARY.contains(&s)
+                && !D5_VOCABULARY.contains(&s)
+                && !P04_VOCABULARY.contains(&s)
+                && !CT33_VOCABULARY.contains(&s),
+            "{s}"
+        );
+    }
+}
+
 /// The round-5 probes are the two literals above and nothing else.
 #[test]
 fn the_round_5_statements_are_the_two_new_literals() {

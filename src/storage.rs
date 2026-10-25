@@ -140,6 +140,11 @@ pub(crate) const SQL_SYNC_FRESHNESS: &str =
 pub(crate) const SQL_COURIER_HEALTH: &str =
     "SELECT last_seen_height, last_seen_at, last_error, last_error_at FROM sync_state WHERE id = 1";
 
+/// 0.7.1 (#27): the pass stamp (migration 0013) on `/getInfo`, its own read
+/// so a store before the migration still serves every other field and names
+/// the missing column in `syncSchemaFault`. One read a `/getInfo` call.
+pub(crate) const SQL_LAST_PASS: &str = "SELECT last_pass_at FROM sync_state WHERE id = 1";
+
 /// The announce delivery counters (`/getInfo`, since M19B-G2 round 2):
 /// consecutive undelivered announces, and the lifetime stuck count.
 pub(crate) const SQL_ANNOUNCE_COUNTERS: &str =
@@ -434,6 +439,20 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
             None
         }
     };
+    // #27: the pass stamp, loud on a read fault like the others (a missing
+    // column names migration 0013 in `syncSchemaFault`).
+    #[derive(serde::Deserialize)]
+    struct PassRow {
+        last_pass_at: Option<String>,
+    }
+    let last_pass_at = match Query::new(SQL_LAST_PASS).first::<PassRow>(db).await {
+        Ok(row) => row.and_then(|r| r.last_pass_at),
+        Err(e) => {
+            log_error!("get_info: pass stamp read failed (migration 0013 applied?): {e}");
+            sync_schema_fault.get_or_insert_with(|| format!("{e}"));
+            None
+        }
+    };
     let rung_tips = match crate::rungs::read(db).await {
         Ok(tips) => tips,
         Err(e) => {
@@ -450,6 +469,7 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
         is_syncing: false,
         storage_type: "d1".to_string(),
         last_synced_at: sync.as_ref().and_then(|r| r.updated_at.clone()),
+        last_pass_at,
         last_synced_height: sync
             .as_ref()
             .and_then(|r| r.last_synced_height.map(|v| v as u32)),
