@@ -69,8 +69,31 @@ highest linked active row it walks forward by height through the courier
 ladder (at most 100 heights a pass) and hands the run to the path
 `POST /admin/ingest` runs, which activates it under the stored child that
 names it. A height no courier serves is recorded as `lastSyncError` and
-`linkState` stays `linked: false`; a tick the push covers records the state
-and leaves the heal to the next poll.
+`linkState` stays `linked: false`. A tick the push covers heals the same
+way through the same ladder (#31); a linked chain asks no courier there. A
+heal costs at most one courier request a rung a height (three on main),
+at most 300 a pass. A break more than 400 heights under the tip is seen by
+no pass, only by `/admin/linkcheck` (a slow full pass is issue #33 of this
+repository).
+
+## One writer at a time
+
+The cron's pass, a tick the push covers and a push through the tip stream's
+door are three writers of one chain state; on 2026-11-02 18:48Z a reorg sync
+and a push of the same headers interleaved (#32). Each now takes the writer
+lease (migration 0015: `sync_state.lease_owner`, `lease_until`) with one
+`UPDATE` before it writes and gives it back after; a writer that finds it
+held writes nothing, and a holder that died frees it after 120 s. A pass
+turned away waits for the next tick; a push turned away answers `busy` and
+the object asks again, 15 times 2 s apart. The load: two `sync_state`
+writes per pass, per tick and per push that is not `known`. Before migration
+0015 every writer logs the missing column and writes unserialized, as before.
+`/admin/ingest` and `/admin/backfill` do not take it.
+
+Behind a live push the cron still polls when the stream is down, when no
+push that advanced the active chain and no poll landed in the quiet
+interval (a re-sent tip the store keeps inactive is not heard), or when the
+store's tip sat below `lastSeenHeight` for more than one tick.
 
 The load: four reads a pass (three bounded by the window, about 1,200 rows,
 and the stored state), and a write of the `sync_state` row only when the answer changed (a new tip), so an
