@@ -37,6 +37,7 @@ pub(crate) const PARENT_WALK_LIMIT: usize = 36;
 pub(crate) struct Announced {
     /// `"known"`: the pushed header is already the active row at its height
     /// (a stream's opening tip after a reconnect); nothing was written.
+    /// `"busy"` (#31): another writer held the store; nothing was written.
     /// Otherwise the outcome of `storage::ingest_pushed`: `"active"`,
     /// `"activated"` or `"storedInactive"`.
     pub outcome: &'static str,
@@ -54,7 +55,7 @@ pub(crate) struct Announced {
 impl Announced {
     /// The push changed the store (a header written, or a row activated).
     pub fn stored(&self) -> bool {
-        self.outcome != "known"
+        !matches!(self.outcome, "known" | "busy")
     }
 }
 
@@ -94,7 +95,32 @@ pub(crate) async fn ingest_announced(
     if stored.as_ref().is_some_and(|s| s.is_active) {
         return answer(db, "known", 0, None).await;
     }
+    // #31 (#32 ask 1): the push writes holding the writer lease, as the
+    // cron's pass does; held elsewhere, nothing is written (`"busy"`) and
+    // the object asks again.
+    let lease = sync::take_lease(db, "push").await;
+    if let sync::Lease::Busy = lease {
+        return answer(db, "busy", 0, None).await;
+    }
+    let result = ingest_held(db, params, source, hooks, header, &refuse).await;
+    sync::release_lease(db, lease).await;
+    result
+}
 
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+async fn ingest_held<F, Fut>(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    hooks: &impl TipWebhooks,
+    header: BlockHeader,
+    refuse: &F,
+) -> Result<Announced, IngestError>
+where
+    F: Fn(worker::Error) -> Fut,
+    Fut: std::future::Future<Output = IngestError>,
+{
     // The run from the first stored ancestor up to the header, oldest first.
     let mut run = vec![header];
     let zero = "0".repeat(64);

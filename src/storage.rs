@@ -215,6 +215,14 @@ pub(crate) const SQL_LINK_CHILD: &str =
     "UPDATE headers SET previous_header_id = (SELECT header_id FROM headers WHERE hash = ?1) \
      WHERE hash = ?2";
 
+/// #31: set the parent link of every active row in `[?1, ?2]` that has
+/// none, to the row with the hash it names (null when no such row is
+/// stored). Seeks `idx_headers_active_height` for the span and the hash's
+/// unique index for each parent.
+pub(crate) const SQL_LINK_SPAN: &str =
+    "UPDATE headers SET previous_header_id = (SELECT p.header_id FROM headers p WHERE p.hash = headers.previous_hash) \
+     WHERE is_active = 1 AND previous_header_id IS NULL AND height >= ?1 AND height <= ?2";
+
 /// Make one hash the single active row at its height (operator ingest).
 pub(crate) const SQL_CANONICALIZE_HEIGHT: &str =
     "UPDATE headers SET is_active = CASE WHEN hash = ? THEN 1 ELSE 0 END \
@@ -1383,6 +1391,14 @@ async fn canonicalize_pushed(
     };
     out.canonicalized = headers.iter().filter(|h| sole_active(h)).count() as u32;
     if out.canonicalized as usize == headers.len() {
+        // #31 (Read B's residue): the bulk writer sets no parent link, so the
+        // pushed rows and the child above them are linked here, as the
+        // activation below links its child.
+        Query::new(SQL_LINK_SPAN)
+            .bind(first.height)
+            .bind(last.height + 1)
+            .run(db)
+            .await?;
         // The batch writer sets no tip; a push that extended the chain does here.
         update_chain_tip_to_highest(db).await?;
         return Ok(out);

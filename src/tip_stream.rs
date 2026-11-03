@@ -106,12 +106,22 @@ impl StreamState {
     /// One answer of the door (`push::Announced::outcome`) at `now`: the
     /// counters, and `last_push_at`, which `poll_due` reads as the push
     /// being heard.
+    ///
+    /// #31 (Read B's pump): only a push that advanced the active chain
+    /// (`"active"`, `"activated"`) is heard. A header the door stored and
+    /// kept inactive is counted as stored and not heard: Arcade opens every
+    /// connection with its current tip, so in a store that keeps that tip
+    /// inactive every reconnect re-stored it, the quiet interval never
+    /// elapsed, and the poll never ran.
     pub fn ingested(&mut self, outcome: &str, now: u64) {
-        if outcome != "known" {
-            self.stored += 1;
-            self.last_push_at = now;
-        } else {
-            self.known += 1;
+        match outcome {
+            "known" => self.known += 1,
+            "busy" => self.busy += 1,
+            "active" | "activated" => {
+                self.stored += 1;
+                self.last_push_at = now;
+            }
+            _ => self.stored += 1,
         }
     }
 
@@ -153,8 +163,10 @@ impl PollState {
 }
 
 /// Whether this cron tick asks the couriers, and why: always while the
-/// stream is down; behind a live stream only when neither a push nor a poll
-/// has landed within the quiet interval. `None`: the push covers the tick.
+/// stream is down; behind a live stream when the store's tip sat below the
+/// seen height for more than one tick (#31, #32 ask 2: a push that cannot
+/// land is no push), or when neither a push nor a poll has landed within
+/// the quiet interval. `None`: the push covers the tick.
 pub(crate) fn poll_due(
     stream: &StreamState,
     poll: &PollState,
@@ -164,6 +176,9 @@ pub(crate) fn poll_due(
 ) -> Option<&'static str> {
     if !stream.live(now, heartbeat_ms) {
         return Some("the stream is down");
+    }
+    if poll.behind_ticks > 1 {
+        return Some("the store sat behind the seen tip for more than one tick");
     }
     let heard = stream.last_push_at.max(poll.last_poll_at);
     (now.saturating_sub(heard) >= quiet_ms).then_some("the push was quiet for the interval")
@@ -181,6 +196,10 @@ mod object {
     use worker::*;
 
     const KEY: &str = "state";
+    /// #31: a push turned away by the writer lease is asked again this many
+    /// times, this far apart: 30 s, inside the heartbeat's 45.
+    const BUSY_TRIES: u32 = 15;
+    const BUSY_WAIT_MS: u64 = 2_000;
     const POLL_KEY: &str = "poll";
 
     fn now_ms() -> u64 {
@@ -242,6 +261,10 @@ mod object {
             let now = now_ms();
             match (req.method(), req.path().as_str()) {
                 (Method::Post, "/wake") => {
+                    let behind = req
+                        .url()?
+                        .query_pairs()
+                        .any(|(k, v)| k == "behind" && v == "1");
                     let storage = self.state.storage();
                     let alarm = storage.get_alarm().await?.map(|v| v as u64);
                     let woke = st.wake_due(now, cfg.heartbeat_ms, alarm);
@@ -250,6 +273,7 @@ mod object {
                         log!("tip stream: woken by the cron (alarm {alarm:?})");
                     }
                     let mut poll = self.poll().await;
+                    poll.note_behind(behind);
                     let due = poll_due(&st, &poll, now, cfg.heartbeat_ms, cfg.quiet_ms);
                     match due {
                         Some(why) => {
@@ -475,7 +499,23 @@ mod object {
                 }
             };
             let ladder = sync::courier_ladder(&self.env, &chain);
-            match push::ingest_announced(&db, &params, &ladder, &self.env, header).await {
+            // #31: a writer holding the store turns the push away (`busy`);
+            // it is asked again, `BUSY_TRIES` times `BUSY_WAIT_MS` apart,
+            // inside the heartbeat.
+            let mut tries = 0;
+            let answer = loop {
+                let answer =
+                    push::ingest_announced(&db, &params, &ladder, &self.env, header.clone()).await;
+                match &answer {
+                    Ok(a) if a.outcome == "busy" && tries < BUSY_TRIES => {
+                        tries += 1;
+                        st.ingested("busy", now_ms());
+                        Delay::from(Duration::from_millis(BUSY_WAIT_MS)).await;
+                    }
+                    _ => break answer,
+                }
+            };
+            match answer {
                 Ok(a) => {
                     st.drops_in_row = 0;
                     st.last_tip_height = a.tip_height;
@@ -517,8 +557,13 @@ mod object {
 /// whether this tick polls. Answers the object's reply, or `None` when the
 /// binding is absent or the call fails (the poll then runs as it always has).
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn wake(env: &worker::Env) -> Option<serde_json::Value> {
-    call(env, "https://tip-stream/wake").await
+pub(crate) async fn wake(env: &worker::Env, behind: bool) -> Option<serde_json::Value> {
+    let url = if behind {
+        "https://tip-stream/wake?behind=1"
+    } else {
+        "https://tip-stream/wake"
+    };
+    call(env, url).await
 }
 
 /// The cron's record of a poll's courier requests.

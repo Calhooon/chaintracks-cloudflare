@@ -1388,7 +1388,8 @@ async fn no_premature_clear_while_a_target_has_not_heard_the_fork() {
 /// written ONCE when the record is behind, see `courier_tests`), then the
 /// announce row and the deliveries, and writes nothing when the record is
 /// current and every target has the tip. #32 adds the durable age write and
-/// the served-ceiling read; #27 the pass stamp, the pass's last write. To red:
+/// the served-ceiling read; #27 the pass stamp, the pass's last write; #31
+/// the writer lease around the pass (`host_harness::leased`). To red:
 /// `run_cron`, `announce_tip(db, hooks, tip)` on the idle path to
 /// `announce_tip(db, hooks, None)`, or the D5 `if seen != Some(woc_height)`
 /// guard dropped (a write every tick).
@@ -1414,7 +1415,7 @@ async fn an_idle_cron_reads_the_tip_once_and_emits_age() {
         .unwrap();
     assert!(hooks.take().is_empty());
     assert_eq!(
-        rec.handed()[before..].to_vec(),
+        crate::host_harness::leased(rec.handed()[before..].to_vec()),
         vec![
             Handed::Execute(Query::new(
                 "UPDATE chain_event_signal SET tick = tick + 1 WHERE id = 1"

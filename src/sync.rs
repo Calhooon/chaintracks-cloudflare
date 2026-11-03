@@ -60,7 +60,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
     // stream is down, once a quiet interval behind it). No answer (no
     // binding, a fault) is a poll, as before E5.
     #[cfg(target_arch = "wasm32")]
-    let wake = crate::tip_stream::wake(env).await;
+    let wake = crate::tip_stream::wake(env, store_behind(&db).await).await;
     #[cfg(not(target_arch = "wasm32"))]
     let wake: Option<serde_json::Value> = None;
     let poll = wake
@@ -109,14 +109,32 @@ pub(crate) async fn run_pushed_tick(
     source: &impl ChainSource,
     hooks: &impl TipWebhooks,
 ) -> Result<()> {
-    let _ = source;
+    // #31: the tick writes (the heal), so it holds the writer lease.
+    let lease = take_lease(db, "tick").await;
+    if let Lease::Busy = lease {
+        log!("Cron: another writer holds the store (the writer lease); this tick writes nothing");
+        return Ok(());
+    }
+    let result = run_pushed_tick_held(db, params, source, hooks).await;
+    release_lease(db, lease).await;
+    result
+}
+
+async fn run_pushed_tick_held(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    hooks: &impl TipWebhooks,
+) -> Result<()> {
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
-    // #30: the link state is read on this tick too; a heal reads the
-    // couriers, so it waits for the next poll.
+    // #30: the link state is read on this tick too. #31 (Read B's Q1): and
+    // a broken chain is healed on it through the ladder: every tick of the
+    // 2026-11-02 stall took this branch, and the heal waited for a poll the
+    // live push never let run. A linked chain asks no courier here.
     match storage::find_chain_tip(db).await {
         Ok(tip) => {
-            link_leg(db, params, None::<&NoSource>, tip.as_ref()).await;
+            link_leg(db, params, Some(source), tip.as_ref()).await;
         }
         Err(e) => log_error!("Cron: the link check's tip read failed: {e:?}"),
     }
@@ -125,6 +143,78 @@ pub(crate) async fn run_pushed_tick(
     // sync source while it is live), so `lastPassAt` stays a minute old.
     stamp_pass(db).await;
     Ok(())
+}
+
+/// #31 (#32 ask 1): the writer lease's term, in seconds. A cron pass, a tick
+/// the push covers and a push through the door each hold it while they
+/// write; a holder that died (an evicted object, a pass past its limits)
+/// frees it at the term. Two minutes: a pass of the minute cron and a push's
+/// parent walk end well inside it; a pass longer than the term (a catch-up
+/// of thousands of headers through the couriers one by one) writes past it
+/// unserialized, as every pass did before the lease.
+pub(crate) const LEASE_S: u32 = 120;
+
+/// #31: take the lease, when it is free, expired, or this owner's. Binds:
+/// ?1 the owner, ?2 the term in seconds.
+pub(crate) const TAKE_LEASE_SQL: &str = "UPDATE sync_state SET lease_owner = ?1, \
+     lease_until = CAST(strftime('%s', 'now') AS INTEGER) + ?2 WHERE id = 1 AND \
+     (lease_owner IS NULL OR lease_owner = ?1 OR lease_until < CAST(strftime('%s', 'now') AS INTEGER))";
+
+/// #31: give the lease back, only when this owner holds it. Bind: ?1 the owner.
+pub(crate) const RELEASE_LEASE_SQL: &str =
+    "UPDATE sync_state SET lease_owner = NULL, lease_until = NULL WHERE id = 1 AND lease_owner = ?1";
+
+/// #31: what a writer's ask for the lease answered.
+#[derive(Debug)]
+pub(crate) enum Lease {
+    /// This writer holds it, as this owner.
+    Held(String),
+    /// Another writer holds it: write nothing, ask again later.
+    Busy,
+    /// The lease could not be read (migration 0015 not applied): the writer
+    /// goes on unserialized, as before the lease, and says so.
+    Unserialized,
+}
+
+/// #31: ask for the writer lease as `role` (`cron`, `tick`, `push`): one
+/// `UPDATE` that takes it only when it is free, expired or already this
+/// owner's. The owner is the role and eight random bytes, so two isolates
+/// never share one.
+pub(crate) async fn take_lease(db: &impl HeaderDb, role: &str) -> Lease {
+    let mut token = [0u8; 8];
+    if let Err(e) = getrandom::getrandom(&mut token) {
+        log_error!("{role}: no token for the writer lease, unserialized: {e}");
+        return Lease::Unserialized;
+    }
+    let owner = format!("{role}:{}", hex::encode(token));
+    match crate::d1::Query::new(TAKE_LEASE_SQL)
+        .bind(owner.as_str())
+        .bind(LEASE_S)
+        .run_changes(db)
+        .await
+    {
+        Ok(1) => Lease::Held(owner),
+        Ok(_) => Lease::Busy,
+        Err(e) => {
+            log_error!(
+                "{role}: the writer lease could not be taken (migration 0015 applied?), unserialized: {e:?}"
+            );
+            Lease::Unserialized
+        }
+    }
+}
+
+/// #31: give the lease back (a fault is loud; the term frees it).
+pub(crate) async fn release_lease(db: &impl HeaderDb, lease: Lease) {
+    if let Lease::Held(owner) = lease {
+        if let Err(e) = crate::d1::Query::new(RELEASE_LEASE_SQL)
+            .bind(owner.as_str())
+            .run(db)
+            .await
+        {
+            log_error!("the writer lease {owner} was not given back (it frees at its term): {e:?}");
+        }
+    }
 }
 
 /// The courier ladder of this deploy, for one cron tick or one request:
@@ -348,6 +438,25 @@ impl ChainSource for WocClient {
 
 /// The cron's body, on any store, chain source and webhook consumer.
 pub(crate) async fn run_cron(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    upstream_url: Option<&str>,
+    hooks: &impl TipWebhooks,
+) -> Result<()> {
+    // #31 (#32 ask 1): the pass holds the writer lease; a pass that finds it
+    // held writes nothing and the next tick asks again.
+    let lease = take_lease(db, "cron").await;
+    if let Lease::Busy = lease {
+        log!("Cron: another writer holds the store (the writer lease); this pass writes nothing");
+        return Ok(());
+    }
+    let result = run_cron_held(db, params, source, upstream_url, hooks).await;
+    release_lease(db, lease).await;
+    result
+}
+
+async fn run_cron_held(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,
@@ -804,7 +913,9 @@ pub(crate) const SQL_SEEN_AND_LIVE: &str = "SELECT s.last_seen_height AS seen, \
 
 /// #31: the store's tip sits below the height a courier or the push last
 /// named (`lastSeenHeight > heightLive`). A read fault answers `false` and
-/// is loud (migration 0007 not applied).
+/// is loud (migration 0007 not applied). The cron hands it to the object's
+/// `/wake` every tick (`PollState::note_behind`): one read a tick.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) async fn store_behind(db: &impl HeaderDb) -> bool {
     #[derive(serde::Deserialize)]
     struct Row {
@@ -872,22 +983,6 @@ async fn record_link_state(db: &impl HeaderDb, report: &storage::LinkReport) {
 
 /// #30: the link state (migration 0014). Bind: the JSON text.
 pub(crate) const RECORD_LINK_STATE_SQL: &str = "UPDATE sync_state SET link_state = ?1 WHERE id = 1";
-
-/// The source of a tick that reads no courier (`run_pushed_tick`): the link
-/// leg records the state and leaves the heal to the next poll.
-pub(crate) struct NoSource;
-
-impl ChainSource for NoSource {
-    async fn chain_info(&self) -> Result<WocChainInfo> {
-        Err(Error::RustError("no courier on this tick".into()))
-    }
-    async fn header_by_height(&self, _height: u32) -> Result<BlockHeader> {
-        Err(Error::RustError("no courier on this tick".into()))
-    }
-    async fn header_by_hash(&self, _hash: &str) -> Result<BlockHeader> {
-        Err(Error::RustError("no courier on this tick".into()))
-    }
-}
 
 /// P0-4: one step of the re-validation of the stored chain (after the deploy,
 /// from the last checkpoint; `storage::revalidate_step`), non-fatal and loud.

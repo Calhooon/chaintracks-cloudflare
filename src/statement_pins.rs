@@ -570,6 +570,45 @@ fn the_issue30_statements_are_the_new_literals() {
     }
 }
 
+/// #31, sync.rs: the store's tip against the seen height, one read a tick.
+pub(crate) const ISSUE31_SEEN_AND_LIVE: &str = "SELECT s.last_seen_height AS seen, (SELECT MAX(h.height) FROM headers h WHERE h.is_chain_tip = 1) AS live FROM sync_state s WHERE s.id = 1";
+/// #31, sync.rs: take the writer lease when it is free, expired or this owner's.
+pub(crate) const ISSUE31_TAKE_LEASE: &str = "UPDATE sync_state SET lease_owner = ?1, lease_until = CAST(strftime('%s', 'now') AS INTEGER) + ?2 WHERE id = 1 AND (lease_owner IS NULL OR lease_owner = ?1 OR lease_until < CAST(strftime('%s', 'now') AS INTEGER))";
+/// #31, sync.rs: give the writer lease back, only as its owner.
+pub(crate) const ISSUE31_RELEASE_LEASE: &str =
+    "UPDATE sync_state SET lease_owner = NULL, lease_until = NULL WHERE id = 1 AND lease_owner = ?1";
+/// #31, storage.rs: the parent links of the active rows of a span that has none.
+pub(crate) const ISSUE31_LINK_SPAN: &str = "UPDATE headers SET previous_header_id = (SELECT p.header_id FROM headers p WHERE p.hash = headers.previous_hash) WHERE is_active = 1 AND previous_header_id IS NULL AND height >= ?1 AND height <= ?2";
+/// The statements new in #31.
+pub(crate) const ISSUE31_VOCABULARY: [&str; 4] = [
+    ISSUE31_SEEN_AND_LIVE,
+    ISSUE31_TAKE_LEASE,
+    ISSUE31_RELEASE_LEASE,
+    ISSUE31_LINK_SPAN,
+];
+
+/// The #31 statements are the literals above and nothing in any earlier
+/// vocabulary.
+#[test]
+fn the_issue31_statements_are_the_new_literals() {
+    assert_eq!(crate::sync::SQL_SEEN_AND_LIVE, ISSUE31_SEEN_AND_LIVE);
+    assert_eq!(crate::sync::TAKE_LEASE_SQL, ISSUE31_TAKE_LEASE);
+    assert_eq!(crate::sync::RELEASE_LEASE_SQL, ISSUE31_RELEASE_LEASE);
+    assert_eq!(crate::storage::SQL_LINK_SPAN, ISSUE31_LINK_SPAN);
+    for s in ISSUE31_VOCABULARY {
+        assert!(
+            !MAIN_VOCABULARY.contains(&s)
+                && !ROUND5_VOCABULARY.contains(&s)
+                && !D5_VOCABULARY.contains(&s)
+                && !P04_VOCABULARY.contains(&s)
+                && !CT33_VOCABULARY.contains(&s)
+                && !LASTPASS_VOCABULARY.contains(&s)
+                && !ISSUE30_VOCABULARY.contains(&s),
+            "{s}"
+        );
+    }
+}
+
 /// The round-5 probes are the two literals above and nothing else.
 #[test]
 fn the_round_5_statements_are_the_two_new_literals() {
