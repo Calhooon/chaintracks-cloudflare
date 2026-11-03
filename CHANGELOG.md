@@ -16,6 +16,37 @@
   `0014_link_state.sql`, additive, one column, written only when it changes);
   `/admin/backfill` answers `leftInactive`, the heights where another row
   stays active.
+- The fix round of #31 (its two reads; issue #32, the trigger read from the
+  production logs). A tick the push covers heals a broken chain through the
+  courier ladder too: every tick of the 2026-11-02 stall took that branch,
+  and a linked chain asks no courier there. Only a push that advanced the
+  active chain (`active`, `activated`) holds the poll off: a re-sent tip the
+  store keeps inactive (`storedInactive`) no longer keeps the push "live"
+  past the quiet interval, and a store whose tip sat below `lastSeenHeight`
+  for more than one tick is polled behind a live push. The cron's pass, the
+  tick the push covers and a push through the door write under one writer
+  lease (migration `0015_writer_lease.sql`, additive, two columns, a 120 s
+  term); a writer that finds it held writes nothing (the next tick; the
+  object asks again, 15 times 2 s apart). The fast path of the activating
+  path sets the parent link of every active row of the run and of the child
+  above it, so no healed row keeps a null `previous_header_id`.
+- What it costs and how far it sees. Two D1 writes (the lease's take and
+  give-back) for each cron pass, each tick the push covers, and each push
+  that is not `known`: 2,880 a day at the minute cron. One read a tick (the
+  seen height against the tip, for the object's `/wake`). The link check
+  covers the top 400 active heights a pass; a break deeper is seen by no
+  pass, only by `/admin/linkcheck` (a slow full pass over the validated range
+  is issue #33 of this repository). A heal reads one header a height through
+  the ladder, at most one request a rung (three on main), at most 100
+  heights a pass, and only while the chain is broken: at most 300 courier
+  requests a pass. The catch-up's courier fallback goes through the parent
+  walk, so a header whose parent is not stored costs at most 36 more reads
+  by hash. The bulk writer's activation of a row stored inactive rewrites
+  that row's `chain_work` to the run's cumulative work, on every bulk writer
+  (the catch-up, `/admin/backfill`, `/admin/ingest`, a push, a heal); an
+  activation that replaced rows records `pending_reorg_from`, so the next
+  announce asks consumers to re-verify from it. `/admin/ingest` and
+  `/admin/backfill` (the operator's) do not take the lease.
 
 ## [0.7.1] - 2026-10-25
 
