@@ -202,6 +202,21 @@ impl Handed {
     }
 }
 
+/// #31: a writer's statements inside its writer lease: the first takes the
+/// lease and the last gives it back, as one owner (a random token, so no
+/// pin can name it). Answers the statements between them.
+pub(crate) fn leased(handed: Vec<Handed>) -> Vec<Handed> {
+    let (Some(Handed::Execute(take)), Some(Handed::Execute(give))) =
+        (handed.first(), handed.last())
+    else {
+        panic!("not a leased writer: {handed:?}");
+    };
+    assert_eq!(take.sql(), crate::sync::TAKE_LEASE_SQL);
+    assert_eq!(give.sql(), crate::sync::RELEASE_LEASE_SQL);
+    assert_eq!(take.params().first(), give.params().first(), "one owner");
+    handed[1..handed.len() - 1].to_vec()
+}
+
 /// One scripted interleaving: a future run against the inner database.
 type Interleave<'a> = Box<dyn FnOnce(&'a SqliteDb) -> Pin<Box<dyn Future<Output = ()> + 'a>> + 'a>;
 

@@ -449,7 +449,8 @@ use crate::statement_pins::{
 /// ONCE when the record is behind the couriers' answer (after the migration,
 /// or after an ingest that bypassed the cron); when the record is current it
 /// writes no courier record (round 5 LOW-4 kept; the #27 pass stamp is the
-/// pass's one write besides the #32 age). To red: `run_cron`, the idle path's
+/// pass's one write besides the #32 age, and #31's writer lease is taken
+/// before the pass and given back after it). To red: `run_cron`, the idle path's
 /// `if seen != Some(woc_height)` guard dropped (a write every tick) or the
 /// record dropped (the gate never passes on a quiet chain).
 #[tokio::test]
@@ -467,7 +468,7 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
         .await
         .unwrap();
     assert_eq!(
-        rec.handed()[before..].to_vec(),
+        crate::host_harness::leased(rec.handed()[before..].to_vec()),
         vec![
             Handed::Execute(Query::new(
                 "UPDATE chain_event_signal SET tick = tick + 1 WHERE id = 1"
@@ -527,7 +528,7 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
         .await
         .unwrap();
     assert_eq!(
-        rec.handed()[before..].to_vec(),
+        crate::host_harness::leased(rec.handed()[before..].to_vec()),
         vec![
             Handed::Execute(Query::new(
                 "UPDATE chain_event_signal SET tick = tick + 1 WHERE id = 1"
