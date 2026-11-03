@@ -1424,6 +1424,23 @@ async fn an_idle_cron_reads_the_tip_once_and_emits_age() {
             Handed::First(Query::new(D5_COURIER_HEALTH)),
             // P0-4: the re-validation state, one read a tick (complete here)
             Handed::First(Query::new(P04_VALIDATION_STATE)),
+            // #30: the link leg on the tip already read: the floor, the
+            // link check's count and broken links, the stored state
+            Handed::First(Query::new(
+                crate::statement_pins::ISSUE30_LOWEST_ACTIVE_HEIGHT
+            )),
+            Handed::First(
+                Query::new(crate::statement_pins::CT33_COUNT_ACTIVE_BETWEEN)
+                    .bind(H - 2)
+                    .bind(H + 1)
+            ),
+            Handed::All(
+                Query::new(crate::statement_pins::CT33_BROKEN_LINKS)
+                    .bind(H - 2)
+                    .bind(H + 1)
+                    .bind(1001u32)
+            ),
+            Handed::First(Query::new(crate::statement_pins::ISSUE30_LINK_STATE)),
             // #32: the legacy announce reads the verification ceiling.
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),

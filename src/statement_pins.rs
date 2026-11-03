@@ -516,6 +516,60 @@ fn the_lastpass_statements_are_the_two_new_literals() {
     }
 }
 
+/// #30, storage.rs: the bulk writer's read of the run's rows stored inactive.
+pub(crate) const ISSUE30_INACTIVE_HASHES_BETWEEN: &str =
+    "SELECT hash FROM headers WHERE is_active = 0 AND height >= ?1 AND height <= ?2";
+/// #30, storage.rs: activate a stored row of the run where nothing is active.
+pub(crate) const ISSUE30_ACTIVATE_STORED: &str =
+    "UPDATE headers SET is_active = 1, chain_work = ?1 WHERE hash = ?2 AND is_active = 0 AND NOT EXISTS (SELECT 1 FROM headers o WHERE o.height = ?3 AND o.is_active = 1)";
+/// #30, storage.rs: the link leg's floor, the lowest active height.
+pub(crate) const ISSUE30_LOWEST_ACTIVE_HEIGHT: &str =
+    "SELECT MIN(height) AS height FROM headers WHERE is_active = 1";
+/// #30, storage.rs: the link state read (the link leg and /getInfo).
+pub(crate) const ISSUE30_LINK_STATE: &str = "SELECT link_state FROM sync_state WHERE id = 1";
+/// #30, sync.rs: the link state write, only when the answer changed.
+pub(crate) const ISSUE30_RECORD_LINK_STATE: &str =
+    "UPDATE sync_state SET link_state = ?1 WHERE id = 1";
+/// The statements new in #30.
+pub(crate) const ISSUE30_VOCABULARY: [&str; 5] = [
+    ISSUE30_INACTIVE_HASHES_BETWEEN,
+    ISSUE30_ACTIVATE_STORED,
+    ISSUE30_LOWEST_ACTIVE_HEIGHT,
+    ISSUE30_LINK_STATE,
+    ISSUE30_RECORD_LINK_STATE,
+];
+
+/// The #30 statements are the literals above and nothing in any earlier
+/// vocabulary.
+#[test]
+fn the_issue30_statements_are_the_new_literals() {
+    assert_eq!(
+        crate::storage::SQL_INACTIVE_HASHES_BETWEEN,
+        ISSUE30_INACTIVE_HASHES_BETWEEN
+    );
+    assert_eq!(crate::storage::SQL_ACTIVATE_STORED, ISSUE30_ACTIVATE_STORED);
+    assert_eq!(
+        crate::storage::SQL_LOWEST_ACTIVE_HEIGHT,
+        ISSUE30_LOWEST_ACTIVE_HEIGHT
+    );
+    assert_eq!(crate::storage::SQL_LINK_STATE, ISSUE30_LINK_STATE);
+    assert_eq!(
+        crate::sync::RECORD_LINK_STATE_SQL,
+        ISSUE30_RECORD_LINK_STATE
+    );
+    for s in ISSUE30_VOCABULARY {
+        assert!(
+            !MAIN_VOCABULARY.contains(&s)
+                && !ROUND5_VOCABULARY.contains(&s)
+                && !D5_VOCABULARY.contains(&s)
+                && !P04_VOCABULARY.contains(&s)
+                && !CT33_VOCABULARY.contains(&s)
+                && !LASTPASS_VOCABULARY.contains(&s),
+            "{s}"
+        );
+    }
+}
+
 /// The round-5 probes are the two literals above and nothing else.
 #[test]
 fn the_round_5_statements_are_the_two_new_literals() {

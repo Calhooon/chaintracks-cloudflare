@@ -478,6 +478,32 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
             Handed::Execute(Query::new(D5_RECORD_SEEN).bind(H)),
             // P0-4: the re-validation state, one read a tick (complete here)
             Handed::First(Query::new(P04_VALIDATION_STATE)),
+            // #30: the link leg on the tip already read: the floor, the
+            // link check's count and broken links, the stored state
+            Handed::First(Query::new(
+                crate::statement_pins::ISSUE30_LOWEST_ACTIVE_HEIGHT
+            )),
+            Handed::First(
+                Query::new(crate::statement_pins::CT33_COUNT_ACTIVE_BETWEEN)
+                    .bind(H - 2)
+                    .bind(H)
+            ),
+            Handed::All(
+                Query::new(crate::statement_pins::CT33_BROKEN_LINKS)
+                    .bind(H - 2)
+                    .bind(H)
+                    .bind(1001u32)
+            ),
+            Handed::First(Query::new(crate::statement_pins::ISSUE30_LINK_STATE)),
+            // the state NULL before the first pass: written once
+            Handed::Execute(
+                Query::new(crate::statement_pins::ISSUE30_RECORD_LINK_STATE).bind(
+                    serde_json::json!({
+                        "from": H - 2, "to": H, "linked": true, "broken": [], "brokenCount": 0
+                    })
+                    .to_string()
+                )
+            ),
             // #32: the legacy announce reads the verification ceiling.
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),
@@ -510,6 +536,22 @@ async fn an_idle_cron_records_the_seen_height_once_when_the_record_is_behind() {
             Handed::First(Query::new(MAIN_CHAIN_TIP)),
             Handed::First(Query::new(D5_COURIER_HEALTH)),
             Handed::First(Query::new(P04_VALIDATION_STATE)),
+            // #30: the link leg reads; the state is current: no write
+            Handed::First(Query::new(
+                crate::statement_pins::ISSUE30_LOWEST_ACTIVE_HEIGHT
+            )),
+            Handed::First(
+                Query::new(crate::statement_pins::CT33_COUNT_ACTIVE_BETWEEN)
+                    .bind(H - 2)
+                    .bind(H)
+            ),
+            Handed::All(
+                Query::new(crate::statement_pins::CT33_BROKEN_LINKS)
+                    .bind(H - 2)
+                    .bind(H)
+                    .bind(1001u32)
+            ),
+            Handed::First(Query::new(crate::statement_pins::ISSUE30_LINK_STATE)),
             // #32: the legacy announce reads the verification ceiling.
             Handed::First(Query::new(P04_VALIDATION_STATE)),
             Handed::First(Query::new(ROUND2_ANNOUNCED_TIP)),
