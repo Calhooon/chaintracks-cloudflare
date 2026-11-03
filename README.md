@@ -54,6 +54,30 @@ writes of the chain-event feed are separate. `/getInfo` reads the stamp with
 one more read of the same row; before migration 0013 it omits `lastPassAt`
 and names the missing column in `syncSchemaFault`, and the cron still syncs.
 
+## The link state on `/getInfo`
+
+Every pass (idle passes and ticks the push covers included) checks the links
+of the top 400 heights of the active chain: each active row must be the
+parent the active row above it names. `/getInfo` carries the answer as
+`linkState` (migration 0014): `from`, `to`, `linked`, `broken` (the first 32
+heights whose active row the next height does not name) and `brokenCount`.
+`linked: false` is a served chain with a hole, a read and not a stall a
+consumer finds (#30, the stall of 2026-11-02).
+
+A poll that finds the chain broken heals it with no operator: from the
+highest linked active row it walks forward by height through the courier
+ladder (at most 100 heights a pass) and hands the run to the path
+`POST /admin/ingest` runs, which activates it under the stored child that
+names it. A height no courier serves is recorded as `lastSyncError` and
+`linkState` stays `linked: false`; a tick the push covers records the state
+and leaves the heal to the next poll.
+
+The load: four reads a pass (three bounded by the window, about 1,200 rows,
+and the stored state), and a write of the `sync_state` row only when the answer changed (a new tip), so an
+idle pass on a linked chain still writes `lastPassAt` alone. Before migration
+0014 the leg logs, the cron still syncs, and `/getInfo` names the column in
+`syncSchemaFault`.
+
 ## Vars
 
 The deploy's `[vars]` and secrets that shape the feed and the header routes

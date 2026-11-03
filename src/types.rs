@@ -240,6 +240,14 @@ pub struct ChaintracksInfo {
     /// `lastSyncError` and leaves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pass_at: Option<String>,
+    /// #30: the link check of the top of the active chain (the
+    /// `storage::LINK_WINDOW` heights under the tip) as the last pass read
+    /// it (migration 0014): `from`, `to`, `linked`, `broken` (the heights
+    /// whose active row the next height does not name, the first 32) and
+    /// `brokenCount`. `linked: false` is a served chain with a hole the
+    /// pass could not heal. Absent until the first pass after the migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_state: Option<serde_json::Value>,
     /// Height recorded at the last successful sync.
     pub last_synced_height: Option<u32>,
     /// Consecutive tip announces no consumer accepted (M19B-G2 round 2; the

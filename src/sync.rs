@@ -109,6 +109,14 @@ pub(crate) async fn run_pushed_tick(
 ) -> Result<()> {
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
+    // #30: the link state is read on this tick too; a heal reads the
+    // couriers, so it waits for the next poll.
+    match storage::find_chain_tip(db).await {
+        Ok(tip) => {
+            link_leg(db, params, None::<&NoSource>, tip.as_ref()).await;
+        }
+        Err(e) => log_error!("Cron: the link check's tip read failed: {e:?}"),
+    }
     finish_sync(db, hooks, None).await;
     // #27: a tick the push covers is a completed pass too (the push is the
     // sync source while it is live), so `lastPassAt` stays a minute old.
@@ -450,6 +458,11 @@ async fn run_cron_inner(
         // the ladder answering).
         keep_seen_current(db, woc_height).await;
         revalidate(db, params).await;
+        // #30: the link leg on the tip read once (LOW-4); a heal moves the
+        // tip, so the announce reads it again.
+        if link_leg(db, params, Some(source), tip.as_ref()).await {
+            tip = None;
+        }
         if let Some(r) = source.report() {
             log!("Cron: idle at {our_height}; couriers: {r}");
         }
@@ -537,8 +550,12 @@ async fn run_cron_inner(
                         match source.header_by_height(h).await {
                             Ok(header) => {
                                 // P0-4: a refusal is recorded and ends the
-                                // span; the tail still runs.
-                                if let Err(e) = storage::insert_header(db, params, &header).await {
+                                // span; the tail still runs. #30: through
+                                // the parent walk, so a row an aborted walk
+                                // left inactive is resumed, not a dupe.
+                                if let Err(e) =
+                                    insert_with_parent_backfill(db, params, source, header).await
+                                {
                                     log_error!(
                                         "Cron: the header at {h} could not be ingested: {e:?}"
                                     );
@@ -604,7 +621,11 @@ async fn run_cron_inner(
         }
     }
 
-    let new_tip = storage::find_chain_tip(db).await?;
+    let mut new_tip = storage::find_chain_tip(db).await?;
+    // #30: the link leg; a heal moves the tip, so the announce reads it again.
+    if link_leg(db, params, Some(source), new_tip.as_ref()).await {
+        new_tip = storage::find_chain_tip(db).await?;
+    }
     let new_height = new_tip.as_ref().map_or(0, |t| t.height);
     if new_height > our_height {
         log!(
@@ -621,6 +642,217 @@ async fn run_cron_inner(
 
     // #27: the pass with work completed; `run_cron` stamps `last_pass_at`.
     Ok(Pass::Completed)
+}
+
+/// #30: the heights one heal fetches through the ladder, one courier read a
+/// height: the issue's hole was 70 deep; a deeper one heals over passes.
+pub(crate) const HEAL_SPAN: u32 = 100;
+
+/// #30: the most broken heights `linkState` lists (`brokenCount` counts all).
+const LINK_STATE_BROKEN_CAP: usize = 32;
+
+/// #30 (the stall of 2026-11-02 18:48Z): the link leg of every pass. The
+/// link check of the top of the active chain under `tip`, the pass's own
+/// read of it (`storage::link_state`; nothing on an empty store); when it
+/// is broken and a `source` is given, the heal (`heal_links`) and the check
+/// again; then the answer recorded for `/getInfo` (`linkState`), written
+/// only when it changed. Loud and non-fatal, like the other legs. Answers
+/// whether the heal moved the chain.
+pub(crate) async fn link_leg(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: Option<&impl ChainSource>,
+    tip: Option<&BlockHeader>,
+) -> bool {
+    let Some(tip) = tip else {
+        return false;
+    };
+    let mut report = match storage::link_state(db, tip.height).await {
+        Ok(report) => report,
+        Err(e) => {
+            log_error!("Cron: the link check failed: {e:?}");
+            return false;
+        }
+    };
+    let mut healed = false;
+    if let (false, Some(source)) = (report.linked, source) {
+        healed = heal_links(db, params, source, &report).await;
+        if healed {
+            let again = match storage::find_chain_tip(db).await {
+                Ok(Some(tip)) => storage::link_state(db, tip.height).await.map(Some),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            match again {
+                Ok(Some(again)) => report = again,
+                Ok(None) => {}
+                Err(e) => log_error!("Cron: the link check after the heal failed: {e:?}"),
+            }
+        }
+    }
+    if !report.linked {
+        log_error!(
+            "Cron: THE ACTIVE CHAIN IS NOT LINKED in {}..={}: {} broken, the first at {}",
+            report.from,
+            report.to,
+            report.broken.len(),
+            report.broken[0].height
+        );
+    }
+    record_link_state(db, &report).await;
+    healed
+}
+
+/// #30: walk FORWARD by height from the highest linked active row under the
+/// first broken link, through the ladder (`fetch_span`, at most `HEAL_SPAN`
+/// heights), and hand the run to the activating path (`storage::ingest_pushed`,
+/// the operator's `POST /admin/ingest`): a run under a stored active child
+/// that names it is activated with the child relinked; a run with no such
+/// child is written as the bulk writer writes, activating the rows stored
+/// inactive where nothing is active. The parent walk (`insert_with_parent_backfill`)
+/// goes BACK from a new tip, 36 at most: a hole deeper than that under the
+/// tip, or one no new tip reaches, was never healed without an operator.
+/// Answers whether the run landed; a fault is recorded (`lastSyncError`).
+async fn heal_links(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    report: &storage::LinkReport,
+) -> bool {
+    let Some(lowest) = report.broken.first().map(|b| b.height) else {
+        return false;
+    };
+    // The row below the first broken link is the highest the walk trusts:
+    // the link check found its own link (or it is the window's floor).
+    let floor = lowest.saturating_sub(1);
+    let end = report.to.min(floor.saturating_add(HEAL_SPAN));
+    if end <= floor {
+        return false;
+    }
+    let fetched = fetch_span(source, floor + 1, end).await;
+    if fetched.is_empty() {
+        record_fault(
+            db,
+            &format!(
+                "link heal: no courier served the header at {} (the chain is not linked there)",
+                floor + 1
+            ),
+        )
+        .await;
+        return false;
+    }
+    let active: Vec<BlockHeader> =
+        match crate::d1::Query::new(storage::sql_active_headers_between())
+            .bind(floor + 1)
+            .bind(end)
+            .all::<storage::HeaderRow>(db)
+            .await
+        {
+            Ok(rows) => rows.into_iter().map(|r| r.into_block_header()).collect(),
+            Err(e) => {
+                log_error!("Cron: link heal: the active rows could not be read: {e:?}");
+                return false;
+            }
+        };
+    // The child: the highest fetched header the active chain already holds.
+    // The run under it is what the activating path makes the active rows.
+    let child = fetched.iter().rposition(|h| {
+        active
+            .iter()
+            .any(|r| r.height == h.height && r.hash.eq_ignore_ascii_case(&h.hash))
+    });
+    let run = match child {
+        Some(k) if k > 0 => &fetched[..k],
+        _ => &fetched[..],
+    };
+    let (first, last) = (run[0].height, run[run.len() - 1].height);
+    match storage::ingest_pushed(db, params, run).await {
+        Ok(out) if out.outcome != "storedInactive" => {
+            log!(
+                "Cron: link heal: {first}..={last} {} ({} canonicalized)",
+                out.outcome,
+                out.canonicalized
+            );
+            true
+        }
+        Ok(out) => {
+            record_fault(
+                db,
+                &format!(
+                    "link heal: {first}..={last} stored inactive: {}",
+                    out.reason.unwrap_or_default()
+                ),
+            )
+            .await;
+            false
+        }
+        Err(storage::IngestError::Refused(e)) | Err(storage::IngestError::Store(e)) => {
+            record_fault(db, &format!("link heal: {first}..={last}: {e}")).await;
+            false
+        }
+    }
+}
+
+/// #30: `linkState`, written only when it differs from what stands, so an
+/// idle pass on a linked chain writes nothing new (#27's pin). A read or
+/// write fault is loud (migration 0014 not applied: `/getInfo` names it).
+async fn record_link_state(db: &impl HeaderDb, report: &storage::LinkReport) {
+    let state = serde_json::json!({
+        "from": report.from,
+        "to": report.to,
+        "linked": report.linked,
+        "broken": report
+            .broken
+            .iter()
+            .take(LINK_STATE_BROKEN_CAP)
+            .map(|b| b.height)
+            .collect::<Vec<_>>(),
+        "brokenCount": report.broken.len(),
+    })
+    .to_string();
+    #[derive(serde::Deserialize)]
+    struct LinkRow {
+        link_state: Option<String>,
+    }
+    match crate::d1::Query::new(storage::SQL_LINK_STATE)
+        .first::<LinkRow>(db)
+        .await
+    {
+        Ok(Some(LinkRow {
+            link_state: Some(stored),
+        })) if stored == state => {}
+        Ok(_) => {
+            if let Err(e) = crate::d1::Query::new(RECORD_LINK_STATE_SQL)
+                .bind(state)
+                .run(db)
+                .await
+            {
+                log_error!("Cron: could not record the link state: {e:?}");
+            }
+        }
+        Err(e) => {
+            log_error!("Cron: could not read the link state (migration 0014 applied?): {e:?}")
+        }
+    }
+}
+
+/// #30: the link state (migration 0014). Bind: the JSON text.
+pub(crate) const RECORD_LINK_STATE_SQL: &str = "UPDATE sync_state SET link_state = ?1 WHERE id = 1";
+
+/// The source of a tick that reads no courier (`run_pushed_tick`): the link
+/// leg records the state and leaves the heal to the next poll.
+pub(crate) struct NoSource;
+
+impl ChainSource for NoSource {
+    async fn chain_info(&self) -> Result<WocChainInfo> {
+        Err(Error::RustError("no courier on this tick".into()))
+    }
+    async fn header_by_height(&self, _height: u32) -> Result<BlockHeader> {
+        Err(Error::RustError("no courier on this tick".into()))
+    }
+    async fn header_by_hash(&self, _hash: &str) -> Result<BlockHeader> {
+        Err(Error::RustError("no courier on this tick".into()))
+    }
 }
 
 /// P0-4: one step of the re-validation of the stored chain (after the deploy,
@@ -722,17 +954,22 @@ pub(crate) async fn insert_with_parent_backfill(
         // previous backfill aborted mid-walk (crash / WoC error after the
         // orphan row landed). Without this repair the dupe short-circuit
         // made the wedge permanent ; the walk was never re-attempted.
+        // #30: a dupe stored INACTIVE resumes too. A row stored on top of
+        // that orphan (a rung's next tip, the walk's own branch) is linked
+        // to it, with the orphan's work under its own, and stays inactive
+        // when the orphan is relinked: keyed on the link alone, the poll
+        // read it as a dupe every pass and the tip never passed the orphan.
         let stored_orphan = result.dupe
             && header.height > 0
             && matches!(
                 storage::find_header_for_hash(db, &header.hash).await?,
-                Some(ref h) if h.previous_header_id.is_none()
+                Some(ref h) if h.previous_header_id.is_none() || !h.is_active
             );
         if !stored_orphan {
             return Ok(result);
         }
         log!(
-            "Cron: stored header {} at {} is an unlinked orphan ; resuming backfill",
+            "Cron: stored header {} at {} is unlinked or inactive ; resuming backfill",
             header.hash,
             header.height
         );

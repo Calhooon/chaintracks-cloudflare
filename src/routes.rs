@@ -880,6 +880,10 @@ async fn admin_backfill(
     console_log!("backfill: couriers: {}", ladder.summary());
     let fetched = headers.len() as u32;
     let params = crate::sync::chain_params(env, chain)?;
+    // #30: the write activates a row it finds stored inactive where no row
+    // is active at its height (`insert_headers_batch`); the answer names
+    // the heights where another row stays active (a competitor: the live
+    // path, or `POST /admin/ingest` under a child that names the run, decides).
     let inserted = if headers.is_empty() {
         0
     } else {
@@ -888,12 +892,14 @@ async fn admin_backfill(
             Err(e) => return wrap_error(&format!("{e}"), 422),
         }
     };
+    let left_inactive = storage::heights_not_served(db, &headers).await?;
 
     wrap_success(serde_json::json!({
         "from": from,
         "to": to,
         "fetched": fetched,
         "inserted": inserted,
+        "leftInactive": left_inactive,
         "nextFrom": from + fetched,
     }))
 }

@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+- An orphan or broken tip heals without an operator (#30, the production stall
+  of 2026-11-02 18:48Z to 2026-11-03 06:03Z at 973791). A bulk write
+  (`insert_headers_batch`: the upstream catch-up, `/admin/backfill`, a push)
+  activates the rows of its run it finds stored inactive where no row is
+  active at their height, instead of skipping them under the active rows it
+  writes above them; a dupe the poll reads that is stored inactive resumes
+  the parent walk as an unlinked one did, and the catch-up's courier fallback
+  goes through that walk; every pass checks the links of the top 400 active
+  heights and a poll heals a broken one forward by height through the ladder
+  (100 heights a pass) and the activating path of `POST /admin/ingest`.
+  `/getInfo` carries the result as `linkState` (migration
+  `0014_link_state.sql`, additive, one column, written only when it changes);
+  `/admin/backfill` answers `leftInactive`, the heights where another row
+  stays active.
+
 ## [0.7.1] - 2026-10-25
 
 - `/getInfo` carries `lastPassAt` (#27, asked by bsv-low #877): the end of the

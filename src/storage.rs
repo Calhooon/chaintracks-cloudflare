@@ -145,6 +145,10 @@ pub(crate) const SQL_COURIER_HEALTH: &str =
 /// the missing column in `syncSchemaFault`. One read a `/getInfo` call.
 pub(crate) const SQL_LAST_PASS: &str = "SELECT last_pass_at FROM sync_state WHERE id = 1";
 
+/// #30: the link state of the last pass (migration 0014) on `/getInfo`, its
+/// own read like the pass stamp's.
+pub(crate) const SQL_LINK_STATE: &str = "SELECT link_state FROM sync_state WHERE id = 1";
+
 /// The announce delivery counters (`/getInfo`, since M19B-G2 round 2):
 /// consecutive undelivered announces, and the lifetime stuck count.
 pub(crate) const SQL_ANNOUNCE_COUNTERS: &str =
@@ -192,6 +196,18 @@ pub(crate) const SQL_RELINK_HEADER: &str =
 
 /// Rewrite one header's cumulative work (the repair walk).
 pub(crate) const SQL_SET_CHAIN_WORK: &str = "UPDATE headers SET chain_work = ? WHERE header_id = ?";
+
+/// #30: the hashes stored inactive in `[?1, ?2]` (seeks
+/// `idx_headers_active_height`; the bulk writer's one read for them).
+pub(crate) const SQL_INACTIVE_HASHES_BETWEEN: &str =
+    "SELECT hash FROM headers WHERE is_active = 0 AND height >= ?1 AND height <= ?2";
+
+/// #30: activate a stored row the bulk writer carries, with the run's
+/// cumulative work, only where no row is active at its height. Binds: ?1 the
+/// work, ?2 the hash, ?3 the height.
+pub(crate) const SQL_ACTIVATE_STORED: &str =
+    "UPDATE headers SET is_active = 1, chain_work = ?1 WHERE hash = ?2 AND is_active = 0 \
+     AND NOT EXISTS (SELECT 1 FROM headers o WHERE o.height = ?3 AND o.is_active = 1)";
 
 /// Set a row's parent link to the row with the parent's hash (the operator
 /// ingest, #33). Binds: ?1 the parent's hash, ?2 the child's hash.
@@ -453,6 +469,22 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
             None
         }
     };
+    // #30: the link state, loud on a read fault like the others (a missing
+    // column names migration 0014 in `syncSchemaFault`).
+    #[derive(serde::Deserialize)]
+    struct LinkRow {
+        link_state: Option<String>,
+    }
+    let link_state = match Query::new(SQL_LINK_STATE).first::<LinkRow>(db).await {
+        Ok(row) => row
+            .and_then(|r| r.link_state)
+            .and_then(|text| serde_json::from_str(&text).ok()),
+        Err(e) => {
+            log_error!("get_info: link state read failed (migration 0014 applied?): {e}");
+            sync_schema_fault.get_or_insert_with(|| format!("{e}"));
+            None
+        }
+    };
     let rung_tips = match crate::rungs::read(db).await {
         Ok(tips) => tips,
         Err(e) => {
@@ -470,6 +502,7 @@ pub async fn get_info(db: &impl HeaderDb, chain: &Chain) -> worker::Result<Chain
         storage_type: "d1".to_string(),
         last_synced_at: sync.as_ref().and_then(|r| r.updated_at.clone()),
         last_pass_at,
+        link_state,
         last_synced_height: sync
             .as_ref()
             .and_then(|r| r.last_synced_height.map(|v| v as u32)),
@@ -1145,6 +1178,25 @@ pub async fn insert_headers_batch(
         }
     }
 
+    // #30: a header of the run already stored inactive (the orphan an aborted
+    // parent walk left, the rows the minute walks stored on top of it) is
+    // activated where no row is active at its height. `INSERT OR IGNORE`
+    // alone skipped it and wrote every row above it active: the tip of
+    // 2026-11-02 18:48Z stood over 973790 with no active row there.
+    #[derive(serde::Deserialize)]
+    struct HashRow {
+        hash: String,
+    }
+    let stored_inactive: std::collections::HashSet<String> =
+        Query::new(SQL_INACTIVE_HASHES_BETWEEN)
+            .bind(first.height)
+            .bind(last_height)
+            .all::<HashRow>(db)
+            .await?
+            .into_iter()
+            .map(|r| r.hash.to_ascii_lowercase())
+            .collect();
+
     let mut inserted = 0u32;
     let mut batch = BatchCollector::new(db);
 
@@ -1178,6 +1230,23 @@ pub async fn insert_headers_batch(
         };
         prev_hash_in_batch = Some(header.hash.clone());
 
+        // D1 limit: 100 statements per batch. Execute and start a new batch
+        // before a header whose statements would pass it.
+        let activate = stored_inactive.contains(&header.hash.to_ascii_lowercase());
+        if batch.len() + 1 + usize::from(activate) > 100 {
+            batch.execute().await?;
+            batch = BatchCollector::new(db);
+        }
+        if activate {
+            batch.add(
+                SQL_ACTIVATE_STORED,
+                vec![
+                    QVal::Text(chain_work.clone()),
+                    QVal::Text(header.hash.clone()),
+                    QVal::Int(header.height as i64),
+                ],
+            );
+        }
         batch.add(
             SQL_INSERT_HEADER,
             vec![
@@ -1197,12 +1266,6 @@ pub async fn insert_headers_batch(
         );
 
         inserted += 1;
-
-        // D1 limit: 100 statements per batch. Execute and start new batch.
-        if batch.len() >= 100 {
-            batch.execute().await?;
-            batch = BatchCollector::new(db);
-        }
     }
 
     // Execute remaining statements
@@ -1495,6 +1558,59 @@ pub async fn link_check(
     to: Option<u32>,
 ) -> worker::Result<LinkReport> {
     link_check_spans(db, from, to, LINK_SPAN).await
+}
+
+/// #30: the heights under the tip the pass's link leg checks.
+pub(crate) const LINK_WINDOW: u32 = 400;
+
+/// #30: the lowest active height (a store bootstrapped from a checkpoint
+/// holds no row under its anchor; one index seek).
+pub(crate) const SQL_LOWEST_ACTIVE_HEIGHT: &str =
+    "SELECT MIN(height) AS height FROM headers WHERE is_active = 1";
+
+/// #30: the link check of the top `LINK_WINDOW` heights of the active chain,
+/// ending at the tip (the caller's read of it) and never below the lowest
+/// active row (the anchor's parent is no broken link). Three reads, each
+/// bounded by the window (the floor, the count, and the children whose
+/// parent is not the row they name, each with its one index seek).
+pub(crate) async fn link_state(db: &impl HeaderDb, tip: u32) -> worker::Result<LinkReport> {
+    #[derive(serde::Deserialize)]
+    struct Lowest {
+        height: Option<f64>,
+    }
+    let lowest = Query::new(SQL_LOWEST_ACTIVE_HEIGHT)
+        .first::<Lowest>(db)
+        .await?
+        .and_then(|r| r.height)
+        .map_or(0, |h| h as u32);
+    let from = tip.saturating_sub(LINK_WINDOW).max(lowest);
+    link_check(db, from, Some(tip)).await
+}
+
+/// #30: the heights of `headers` whose active row is not that header after a
+/// write (the operator's backfill answers them as `leftInactive`: another row
+/// is active there, so the run is a competitor the live path decides). One
+/// read of the span.
+pub async fn heights_not_served(
+    db: &impl HeaderDb,
+    headers: &[BlockHeader],
+) -> worker::Result<Vec<u32>> {
+    let (Some(first), Some(last)) = (headers.first(), headers.last()) else {
+        return Ok(Vec::new());
+    };
+    let active: std::collections::HashSet<String> = Query::new(sql_active_headers_between())
+        .bind(first.height)
+        .bind(last.height)
+        .all::<HeaderRow>(db)
+        .await?
+        .into_iter()
+        .map(|r| r.into_block_header().hash.to_ascii_lowercase())
+        .collect();
+    Ok(headers
+        .iter()
+        .filter(|h| !active.contains(&h.hash.to_ascii_lowercase()))
+        .map(|h| h.height)
+        .collect())
 }
 
 pub(crate) async fn link_check_spans(
