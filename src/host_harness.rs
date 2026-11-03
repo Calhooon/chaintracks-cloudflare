@@ -214,6 +214,10 @@ pub(crate) struct Recorder<'a> {
     handed: RefCell<Vec<Handed>>,
     interleave: RefCell<Option<(String, Interleave<'a>)>>,
     fault: RefCell<Option<String>>,
+    /// The reads answered so far (`first` and `all`), and the one scripted
+    /// interleaving due after the read with that ordinal (`after_read`).
+    reads: Cell<u32>,
+    nth: RefCell<Option<(u32, Interleave<'a>)>>,
 }
 
 impl<'a> Recorder<'a> {
@@ -223,6 +227,37 @@ impl<'a> Recorder<'a> {
             handed: RefCell::new(Vec::new()),
             interleave: RefCell::new(None),
             fault: RefCell::new(None),
+            reads: Cell::new(0),
+            nth: RefCell::new(None),
+        }
+    }
+
+    /// Run `hook` once, right after the `n`th read (`first` or `all`, from 1)
+    /// answers: a race pin can walk the other writer through every read of
+    /// this one.
+    pub fn after_read<F, Fut>(&self, n: u32, hook: F)
+    where
+        F: FnOnce(&'a SqliteDb) -> Fut + 'a,
+        Fut: Future<Output = ()> + 'a,
+    {
+        let boxed: Interleave<'a> = Box::new(move |db| Box::pin(hook(db)));
+        *self.nth.borrow_mut() = Some((n, boxed));
+    }
+
+    /// The reads answered so far.
+    pub fn reads(&self) -> u32 {
+        self.reads.get()
+    }
+
+    fn due_after_read(&self) -> Option<Interleave<'a>> {
+        self.reads.set(self.reads.get() + 1);
+        let mut slot = self.nth.borrow_mut();
+        match slot.take() {
+            Some((n, hook)) if n == self.reads.get() => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
         }
     }
 
@@ -295,12 +330,19 @@ impl<'a> HeaderDb for Recorder<'a> {
         if let Some(hook) = self.due_after(q.sql()) {
             hook(self.inner).await;
         }
+        if let Some(hook) = self.due_after_read() {
+            hook(self.inner).await;
+        }
         answer
     }
 
     async fn all<T: DeserializeOwned>(&self, q: Query) -> worker::Result<Vec<T>> {
         self.handed.borrow_mut().push(Handed::All(q.clone()));
-        self.inner.all::<T>(q).await
+        let answer = self.inner.all::<T>(q).await;
+        if let Some(hook) = self.due_after_read() {
+            hook(self.inner).await;
+        }
+        answer
     }
 
     async fn execute(&self, q: Query) -> worker::Result<u32> {

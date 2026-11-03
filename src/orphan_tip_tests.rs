@@ -16,7 +16,9 @@
 //! consumer reads on `/getInfo`.
 
 use crate::consensus::ChainParams;
-use crate::host_harness::{block_hash, flags, header, RecordedWebhooks, ScriptedChain, SqliteDb};
+use crate::host_harness::{
+    block_hash, flags, header, header_id, RecordedWebhooks, ScriptedChain, SqliteDb,
+};
 use crate::storage::{
     self, find_chain_tip, find_header_for_height, insert_header, insert_headers_batch,
     update_chain_tip_to_highest, SQL_INSERT_HEADER,
@@ -227,6 +229,104 @@ async fn the_poll_heals_a_hole_under_the_tip_deeper_than_the_walk() {
     cron(&db, &source).await;
     assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().hash, c[61].hash);
     served_and_linked(&db, &c, 61).await;
+}
+
+/// #31 (Read B's residue): the run a heal hands the activating path lands
+/// with every row's parent link set, the child above it included. The fast
+/// path of `canonicalize_pushed` (every pushed row the sole active row at
+/// its height) set no link, so the healed rows (bulk rows: the link null)
+/// and the child kept `previous_header_id` null: linked by hash for the
+/// link check, unlinked for every walk by id. To red:
+/// `storage::canonicalize_pushed`, the fast path's `SQL_LINK_SPAN` dropped.
+#[tokio::test]
+async fn the_heal_links_every_row_it_heals_by_id() {
+    let c = chain(61);
+    let db = store_with_a_hole_under_the_tip(&c).await;
+    let source = ScriptedChain::new();
+    publish(&source, &c);
+    source.tip(X + 61, &c[61].hash);
+    cron(&db, &source).await;
+    served_and_linked(&db, &c, 61).await;
+    for h in &c[1..=61] {
+        let row = storage::find_header_for_hash(&db, &h.hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.previous_header_id,
+            Some(header_id(&db, &h.previous_hash)),
+            "the row at {} names its parent's id",
+            h.height
+        );
+    }
+}
+
+/// The active rows at `height`, read raw.
+fn active_at(db: &SqliteDb, height: u32) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM headers WHERE height = ?1 AND is_active = 1",
+            [height],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// #31 (Read A's plant 1): a row the bulk writer finds stored inactive at a
+/// height where a rival is already active stays inactive: one height, one
+/// active row. The shape is the one production logged at 18:48:50Z (an
+/// active row at 973792 that does not name the tip 973791 as its parent)
+/// under a push of the chain's own 973792, stored inactive. To red:
+/// `storage::SQL_ACTIVATE_STORED`, the `NOT EXISTS` guard dropped (two
+/// active rows at the height, and the push answers `storedInactive` over
+/// them).
+#[tokio::test]
+async fn a_row_stored_inactive_under_an_active_rival_stays_the_one_inactive_row() {
+    let c = chain(12);
+    let db = linked_store(&c, 11).await;
+    let rival = header(
+        X + 12,
+        "#31 rival",
+        &block_hash("a parent the store never held"),
+    );
+    raw_row(&db, &rival, true);
+    raw_row(&db, &c[12], false);
+    let source = ScriptedChain::new();
+    publish(&source, &c);
+    let pushed = crate::push::ingest_announced(
+        &db,
+        params(),
+        &source,
+        &RecordedWebhooks::new("", ""),
+        c[12].clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pushed.outcome, "storedInactive", "{pushed:?}");
+    assert_eq!(active_at(&db, X + 12), 1, "one active row at the height");
+    assert_eq!(flags(&db, &rival.hash), (true, false));
+    assert_eq!(flags(&db, &c[12].hash), (false, false));
+}
+
+/// #31 (Read A's plant 2): the bulk writer activates a row it finds stored
+/// inactive at the LAST height of its run (the read of the stored rows
+/// covers the run's top height). To red: `storage::SQL_INACTIVE_HASHES_BETWEEN`,
+/// `height <= ?2` read as `height < ?2`.
+#[tokio::test]
+async fn the_bulk_writer_activates_a_row_stored_inactive_at_the_top_of_its_run() {
+    let c = chain(14);
+    let db = linked_store(&c, 10).await;
+    for h in &c[11..=14] {
+        raw_row(&db, h, false);
+    }
+    insert_headers_batch(&db, params(), &c[11..=14])
+        .await
+        .unwrap();
+    for h in &c[11..=14] {
+        assert!(flags(&db, &h.hash).0, "{} active", h.height);
+    }
+    update_chain_tip_to_highest(&db).await.unwrap();
+    served_and_linked(&db, &c, 14).await;
 }
 
 /// `/getInfo`'s `linkState` as a consumer reads it.

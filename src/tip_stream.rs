@@ -91,6 +91,9 @@ pub(crate) struct StreamState {
     pub last_fault: Option<String>,
     /// Courier requests the door's parent walk made.
     pub walk_requests: u32,
+    /// #31: tip events the door turned away because another writer held the
+    /// store (`"busy"`; the object asked again).
+    pub busy: u32,
 }
 
 impl StreamState {
@@ -98,6 +101,18 @@ impl StreamState {
     /// heartbeat interval.
     pub fn live(&self, now: u64, heartbeat_ms: u64) -> bool {
         self.reading && now.saturating_sub(self.last_beat_at) <= heartbeat_ms
+    }
+
+    /// One answer of the door (`push::Announced::outcome`) at `now`: the
+    /// counters, and `last_push_at`, which `poll_due` reads as the push
+    /// being heard.
+    pub fn ingested(&mut self, outcome: &str, now: u64) {
+        if outcome != "known" {
+            self.stored += 1;
+            self.last_push_at = now;
+        } else {
+            self.known += 1;
+        }
     }
 
     /// The cron should bring the alarm forward: the stream is not live and
@@ -121,6 +136,20 @@ pub(crate) struct PollState {
     /// The courier requests the polls made (`CourierLadder::requests`).
     pub poll_requests: u32,
     pub last_reason: Option<String>,
+    /// #31: the cron ticks in a row that found the store's tip below the
+    /// height the couriers or the push last named (`sync::store_behind`).
+    pub behind_ticks: u32,
+}
+
+impl PollState {
+    /// #31: one cron tick's answer to "is the store behind the seen tip".
+    pub fn note_behind(&mut self, behind: bool) {
+        self.behind_ticks = if behind {
+            self.behind_ticks.saturating_add(1)
+        } else {
+            0
+        };
+    }
 }
 
 /// Whether this cron tick asks the couriers, and why: always while the
@@ -451,9 +480,8 @@ mod object {
                     st.drops_in_row = 0;
                     st.last_tip_height = a.tip_height;
                     st.last_tip_hash = a.tip_hash.clone();
+                    st.ingested(a.outcome, now_ms());
                     if a.stored() {
-                        st.stored += 1;
-                        st.last_push_at = now_ms();
                         log!(
                             "tip stream: {} (walked {}){}, the tip {} {}",
                             a.outcome,
@@ -468,8 +496,6 @@ mod object {
                         {
                             log_error!("Chain-event outbox error (cursor retained): {e:?}");
                         }
-                    } else {
-                        st.known += 1;
                     }
                 }
                 Err(IngestError::Refused(e)) => {
@@ -652,5 +678,70 @@ mod tests {
             }
         }
         assert_eq!(runs, 6, "a quiet live hour polls six times, not sixty");
+    }
+
+    /// #31 (Read B's pump): only a push that advanced the active chain is a
+    /// push heard. A header the door keeps inactive (`storedInactive`), one
+    /// already served (`known`) and one a writer turned away (`busy`) leave
+    /// `last_push_at`, so a peer re-sending such a tip on every reconnect
+    /// cannot hold the poll off. To red: `StreamState::ingested`, the clock
+    /// moved on any write.
+    #[test]
+    fn only_a_push_that_advanced_the_chain_is_heard() {
+        let then = 1_000;
+        let now = 2_000;
+        for outcome in ["active", "activated"] {
+            let mut st = StreamState {
+                last_push_at: then,
+                ..Default::default()
+            };
+            st.ingested(outcome, now);
+            assert_eq!(st.last_push_at, now, "{outcome}");
+            assert_eq!(st.stored, 1, "{outcome}");
+        }
+        for outcome in ["storedInactive", "known", "busy"] {
+            let mut st = StreamState {
+                last_push_at: then,
+                ..Default::default()
+            };
+            st.ingested(outcome, now);
+            assert_eq!(st.last_push_at, then, "{outcome}");
+        }
+        let mut st = StreamState::default();
+        st.ingested("storedInactive", now);
+        st.ingested("known", now);
+        st.ingested("busy", now);
+        assert_eq!((st.stored, st.known, st.busy), (1, 1, 1));
+    }
+
+    /// #32 ask 2: the store's tip below the seen height for more than one
+    /// tick polls behind a live, heard push; one tick behind (a push's write
+    /// in flight) does not, and a tick level resets the count. To red:
+    /// `poll_due`, the behind count not read.
+    #[test]
+    fn the_poll_runs_when_the_store_sat_behind_the_seen_tip_for_two_ticks() {
+        let hb = HEARTBEAT_S * 1000;
+        let quiet = POLL_QUIET_S * 1000;
+        let now = 100_000_000;
+        let heard = StreamState {
+            reading: true,
+            last_beat_at: now - 1_000,
+            last_push_at: now - 1_000,
+            ..Default::default()
+        };
+        let mut poll = PollState {
+            last_poll_at: now - 1_000,
+            ..Default::default()
+        };
+        poll.note_behind(true);
+        assert_eq!(poll_due(&heard, &poll, now, hb, quiet), None, "one tick");
+        poll.note_behind(true);
+        assert_eq!(
+            poll_due(&heard, &poll, now, hb, quiet),
+            Some("the store sat behind the seen tip for more than one tick")
+        );
+        poll.note_behind(false);
+        assert_eq!(poll.behind_ticks, 0);
+        assert_eq!(poll_due(&heard, &poll, now, hb, quiet), None, "level again");
     }
 }

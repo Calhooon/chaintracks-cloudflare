@@ -149,7 +149,9 @@ async fn a_tick_the_push_covers_stamps_the_pass() {
     let hooks = RecordedWebhooks::new(HOOK, BEARER);
     quiet_store(&db, &hooks).await;
     plant(&db);
-    run_pushed_tick(&db, regtest(), &hooks).await.unwrap();
+    run_pushed_tick(&db, regtest(), &ScriptedChain::new(), &hooks)
+        .await
+        .unwrap();
     assert_ne!(last_pass_at(&db).as_deref(), Some(PLANTED));
 }
 

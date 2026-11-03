@@ -85,7 +85,8 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
         result
     } else {
         log!("Cron: the push is live; the couriers are not asked this tick");
-        run_pushed_tick(&db, &params, &tick).await
+        let ladder = courier_ladder(env, &chain);
+        run_pushed_tick(&db, &params, &ladder, &tick).await
     };
     if let Err(e) = crate::events::deliver(&db, &EventWebhookConfig(env, tick.feed)).await {
         log_error!("Chain-event outbox error (cursor retained): {e:?}");
@@ -101,12 +102,14 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
 /// E5: a cron tick the push covers. Everything of the cron that reads no
 /// courier still runs: the tip's age (#32), one step of the re-validation
 /// (P0-4), the announce (a refused delivery is retried every minute) and the
-/// cumulative-work repair.
+/// cumulative-work repair. `source` is the deploy's courier ladder.
 pub(crate) async fn run_pushed_tick(
     db: &impl HeaderDb,
     params: &ChainParams,
+    source: &impl ChainSource,
     hooks: &impl TipWebhooks,
 ) -> Result<()> {
+    let _ = source;
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
     // #30: the link state is read on this tick too; a heal reads the
@@ -788,6 +791,37 @@ async fn heal_links(
         }
         Err(storage::IngestError::Refused(e)) | Err(storage::IngestError::Store(e)) => {
             record_fault(db, &format!("link heal: {first}..={last}: {e}")).await;
+            false
+        }
+    }
+}
+
+/// #31: the store's tip and the highest height a courier or the push named,
+/// in one read (`/getInfo`'s `heightLive` and `lastSeenHeight`).
+pub(crate) const SQL_SEEN_AND_LIVE: &str = "SELECT s.last_seen_height AS seen, \
+     (SELECT MAX(h.height) FROM headers h WHERE h.is_chain_tip = 1) AS live \
+     FROM sync_state s WHERE s.id = 1";
+
+/// #31: the store's tip sits below the height a courier or the push last
+/// named (`lastSeenHeight > heightLive`). A read fault answers `false` and
+/// is loud (migration 0007 not applied).
+pub(crate) async fn store_behind(db: &impl HeaderDb) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        seen: Option<f64>,
+        live: Option<f64>,
+    }
+    match crate::d1::Query::new(SQL_SEEN_AND_LIVE)
+        .first::<Row>(db)
+        .await
+    {
+        Ok(Some(Row {
+            seen: Some(seen),
+            live,
+        })) => seen > live.unwrap_or(0.0),
+        Ok(_) => false,
+        Err(e) => {
+            log_error!("Cron: could not read the seen height (migration 0007 applied?): {e:?}");
             false
         }
     }

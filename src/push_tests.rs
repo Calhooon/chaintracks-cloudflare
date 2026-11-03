@@ -287,8 +287,8 @@ async fn a_push_beyond_the_walk_limit_is_refused_and_nothing_is_stored() {
         .contains("no stored row within"));
 }
 
-/// E5 item 3: a cron tick the push covers asks no courier (it is handed
-/// none) and still does the rest of the cron's work: a tip that moved
+/// E5 item 3: a cron tick the push covers asks no courier on a linked chain
+/// (the ladder it is handed is read only by a heal, #31) and still does the rest of the cron's work: a tip that moved
 /// without an announce (a backfill, a push whose announce was refused) is
 /// announced on the tick.
 #[tokio::test]
@@ -302,18 +302,20 @@ async fn a_tick_the_push_covers_asks_no_courier_and_still_announces() {
     update_chain_tip_to_highest(&db).await.unwrap();
     let hooks = hooks();
 
-    crate::sync::run_pushed_tick(&db, regtest(), &hooks)
+    let couriers = ScriptedChain::new();
+    crate::sync::run_pushed_tick(&db, regtest(), &couriers, &hooks)
         .await
         .unwrap();
 
     let posts = hooks.take();
     assert_eq!(posts.len(), 1, "{posts:?}");
     assert!(posts[0].body.contains(&next.hash), "{}", posts[0].body);
-    crate::sync::run_pushed_tick(&db, regtest(), &hooks)
+    crate::sync::run_pushed_tick(&db, regtest(), &couriers, &hooks)
         .await
         .unwrap();
     assert!(
         hooks.take().is_empty(),
         "the same tip is not announced twice"
     );
+    assert_eq!(couriers.calls(), 0, "a linked chain asks no courier");
 }

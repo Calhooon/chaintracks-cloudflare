@@ -47,7 +47,9 @@ async fn a_same_tip_tick_journals_nothing_under_feed_2_and_tip_age_under_feed_1(
     sync::run_cron(&db, &params, &source, None, &hooks)
         .await
         .unwrap();
-    sync::run_pushed_tick(&db, &params, &hooks).await.unwrap();
+    sync::run_pushed_tick(&db, &params, &source, &hooks)
+        .await
+        .unwrap();
     assert!(
         kinds(&db, before).is_empty(),
         "feed 2: a same tip writes no row"
