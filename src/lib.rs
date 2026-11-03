@@ -77,6 +77,8 @@ mod sync;
 mod tip_stream;
 mod types;
 mod woc;
+#[cfg(test)]
+mod writers_tests;
 
 /// Chaintracks ; BSV block header tracking on Cloudflare Workers.
 ///
