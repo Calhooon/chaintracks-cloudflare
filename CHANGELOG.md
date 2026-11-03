@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.2] - 2026-11-03
 
 - An orphan or broken tip heals without an operator (#30, the production stall
   of 2026-11-02 18:48Z to 2026-11-03 06:03Z at 973791). A bulk write
