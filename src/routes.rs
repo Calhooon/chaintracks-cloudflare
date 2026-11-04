@@ -742,6 +742,12 @@ async fn handle_v2(
     }
 }
 
+/// #34: an operator write the writer lease turned away (503): a cron pass,
+/// a push, a read-through's hand-off or another operator call holds the
+/// store; nothing was written.
+const LEASE_HELD: &str =
+    "another writer holds the store (the writer lease); nothing was written, run again";
+
 /// Admin endpoint: ingest operator-pushed headers.
 /// Usage: POST /admin/ingest?start=942761 with the body a hex string of
 /// concatenated 80-byte headers (heights assigned sequentially from start).
@@ -780,8 +786,9 @@ async fn admin_ingest(
     }
     // P0-4: the operator's push meets the node's rules like any courier's.
     let params = crate::sync::chain_params(env, chain)?;
-    let out = match storage::ingest_pushed(db, &params, &headers).await {
-        Ok(out) => out,
+    let out = match crate::sync::admin_ingest_write(db, &params, &headers).await {
+        Ok(Some(out)) => out,
+        Ok(None) => return wrap_error(LEASE_HELD, 503),
         Err(storage::IngestError::Refused(e)) => return wrap_error(&format!("{e}"), 422),
         Err(storage::IngestError::Store(e)) => return Err(e),
     };
@@ -884,15 +891,11 @@ async fn admin_backfill(
     // is active at its height (`insert_headers_batch`); the answer names
     // the heights where another row stays active (a competitor: the live
     // path, or `POST /admin/ingest` under a child that names the run, decides).
-    let inserted = if headers.is_empty() {
-        0
-    } else {
-        match storage::insert_headers_batch(db, &params, &headers).await {
-            Ok(n) => n,
-            Err(e) => return wrap_error(&format!("{e}"), 422),
-        }
+    let (inserted, left_inactive) = match crate::sync::backfill_write(db, &params, &headers).await {
+        Ok(Some(written)) => written,
+        Ok(None) => return wrap_error(LEASE_HELD, 503),
+        Err(e) => return wrap_error(&format!("{e}"), 422),
     };
-    let left_inactive = storage::heights_not_served(db, &headers).await?;
 
     wrap_success(serde_json::json!({
         "from": from,

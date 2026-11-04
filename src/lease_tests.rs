@@ -17,7 +17,10 @@ use crate::storage::{
     self, find_chain_tip, find_header_for_height, insert_header, update_chain_tip_to_highest,
     SQL_INSERT_HEADER,
 };
-use crate::sync::{bulk_write, read_through, run_cron, run_pushed_tick, set_lease_term};
+use crate::sync::{
+    admin_ingest_write, backfill_write, bulk_write, read_through, run_cron, run_pushed_tick,
+    set_lease_term, ChainSource,
+};
 use crate::tip_stream::{
     poll_due, through_the_lease, PollState, StreamState, BUSY_TRIES, HEARTBEAT_S, POLL_QUIET_S,
 };
@@ -223,7 +226,7 @@ async fn race(outer: Outer, n: Option<u32>) -> (Option<String>, Vec<String>, u32
 
 /// Item 1: the public read-through (`routes::ensure_fresh_header` through
 /// `sync::read_through`) and the cron's pass racing on one height, in both
-/// orders, the second writer landing after every read of the first: the
+/// orders, the other writer landing after every read of the outer one: the
 /// store serves the network's chain afterwards and no write of the
 /// `headers` table lands outside its writer's lease. Before #34 the
 /// read-through wrote active rows with no lease at all. To red:
@@ -404,7 +407,7 @@ async fn a_push_still_busy_after_its_tries_is_logged_and_counted_once() {
 /// (973788); the cron's poll syncs the reorg `n8 ..= n11` (+3, 973791);
 /// the push of `n13` and `n14` is refused (its ancestry not to be had:
 /// 18:48:50.8Z and 18:48:51.8Z); then the ticks behind a live push. The
-/// first refused push raises the seen height to its own, so the behind rule
+/// earlier refused push raises the seen height to its own, so the behind rule
 /// counts from the next tick and the second tick polls, and the store
 /// follows the network. Before #34 a refusal left the seen height at the
 /// poll's 973791 and no tick polled before the quiet interval. To red:
@@ -431,7 +434,7 @@ async fn a_refused_push_raises_the_seen_height_and_the_behind_rule_fires() {
             "{refused:?}"
         );
         if i == 0 {
-            assert_eq!(seen_height(&db), Some(X + 13), "the first refused push");
+            assert_eq!(seen_height(&db), Some(X + 13), "the earlier refused push");
         }
     }
     // The couriers have the network's chain by the next tick.
@@ -509,4 +512,380 @@ async fn a_heal_over_300_broken_heights_stays_inside_a_2_s_term() {
     assert_eq!(unleased, Vec::<String>::new(), "after {passes} passes");
     assert_eq!(off_chain(&db, &c).await, None, "after {passes} passes");
     assert!(passes > 3, "the heal spread over passes: {passes}");
+}
+
+// ─── The fix round (lane/ct-34-b) on PR #36 ─────────────────────────────────
+
+/// A courier ladder that answers `open` reads and then never again: the
+/// request it serves is still in flight when the harness drops it.
+struct Gate<'a> {
+    inner: &'a ScriptedChain,
+    open: Cell<u32>,
+}
+
+impl<'a> Gate<'a> {
+    fn new(inner: &'a ScriptedChain, open: u32) -> Self {
+        Self {
+            inner,
+            open: Cell::new(open),
+        }
+    }
+
+    async fn pass(&self) {
+        if self.open.get() == 0 {
+            std::future::pending::<()>().await;
+        }
+        self.open.set(self.open.get() - 1);
+    }
+}
+
+impl ChainSource for Gate<'_> {
+    async fn chain_info(&self) -> worker::Result<crate::woc::WocChainInfo> {
+        self.inner.chain_info().await
+    }
+
+    async fn header_by_height(&self, height: u32) -> worker::Result<BlockHeader> {
+        self.pass().await;
+        self.inner.header_by_height(height).await
+    }
+
+    async fn header_by_hash(&self, hash: &str) -> worker::Result<BlockHeader> {
+        self.pass().await;
+        self.inner.header_by_hash(hash).await
+    }
+}
+
+/// The writer lease's holder while its term stands, `None` when it is free.
+fn live_lease(db: &SqliteDb) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT lease_owner FROM sync_state WHERE id = 1 \
+             AND lease_until >= CAST(strftime('%s', 'now') AS INTEGER)",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// The read-through's half that runs on the request's own life
+/// (`routes::ensure_fresh_header`): the tip read, then the read-through.
+async fn the_request(db: &SqliteDb, source: &impl ChainSource, height: u32) {
+    let hooks = RecordedWebhooks::new("", "");
+    let tip = find_chain_tip(db).await.unwrap().unwrap().height;
+    let _ = read_through(db, params(), source, &hooks, tip, height).await;
+}
+
+/// R1 (Read B on PR #36, `sync.rs:1315` with `:160` at 7b1c2d5): a public
+/// read-through whose caller goes away mid-flight (LOW's 2 s deadline; the
+/// harness drops the request at its third courier read) leaves the writer
+/// lease free within one second, and the cron's next pass runs and lands
+/// the chain. At 7b1c2d5 the read-through held the cron's 120 s lease
+/// across its courier reads, and a request that ended there left it held:
+/// every pass refused for two minutes.
+#[tokio::test]
+async fn a_read_through_whose_caller_goes_away_leaves_the_lease_free() {
+    let net = branch(&[root()], 0, 6, "#34b gone");
+    let db = linked_store(&net[..=2]).await;
+    let source = published(&net);
+    let gate = Gate::new(&source, 2);
+    {
+        use futures_util::FutureExt;
+        let request = the_request(&db, &gate, X + 6);
+        assert!(
+            request.now_or_never().is_none(),
+            "the request is in flight at its third courier read"
+        );
+    }
+    let gone = std::time::Instant::now();
+    while live_lease(&db).is_some() && gone.elapsed() < std::time::Duration::from_secs(1) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        live_lease(&db),
+        None,
+        "the lease is free within one second of the caller going away"
+    );
+    assert!(cron_pass(&db, &source).await, "the cron's next pass runs");
+    assert_eq!(off_chain(&db, &net).await, None);
+}
+
+/// The lease's term lapses under its holder after the holder's `n`th read:
+/// with `successor`, another writer has taken it since.
+fn lapse(db: &SqliteDb, successor: bool) {
+    let sql = if successor {
+        "UPDATE sync_state SET lease_owner = 'cron:successor', \
+         lease_until = CAST(strftime('%s', 'now') AS INTEGER) + 120 WHERE id = 1"
+    } else {
+        "UPDATE sync_state SET lease_until = CAST(strftime('%s', 'now') AS INTEGER) - 2 WHERE id = 1"
+    };
+    db.conn().execute(sql, []).unwrap();
+}
+
+/// The fence (Read B's (3) on PR #36): a cron pass whose term lapses after
+/// any one of its reads (forced: the term passed, and in the second run a
+/// successor took the lease) writes nothing to the `headers` table after
+/// the lapse; the successor's pass then completes and the store serves the
+/// network's chain. At 7b1c2d5 only the heal read the term, and a holder
+/// past it kept writing beside its successor.
+#[tokio::test]
+async fn a_holder_past_its_term_writes_nothing_after_the_lapse() {
+    let net = branch(&[root()], 0, 9, "#34b fence");
+    let hooks = RecordedWebhooks::new("", "");
+    let reads = {
+        let db = linked_store(&net[..=2]).await;
+        let rec = Recorder::new(&db);
+        run_cron(&rec, params(), &published(&net), None, &hooks)
+            .await
+            .unwrap();
+        rec.reads()
+    };
+    assert!(reads > 10, "reads {reads}");
+    let mut failures = Vec::new();
+    for successor in [false, true] {
+        for n in 1..=reads {
+            let db = linked_store(&net[..=2]).await;
+            let source = published(&net);
+            {
+                let rec = Recorder::new(&db);
+                rec.after_read(n, move |db| async move { lapse(db, successor) });
+                let g = Guard::new(&rec, &db, "holder");
+                let _ = run_cron(&g, params(), &source, None, &hooks).await;
+                if let Some(w) = g.unleased().first() {
+                    failures.push(format!("successor {successor}, lapsed after read {n}: {w}"));
+                }
+            }
+            give_back(&db);
+            let g = Guard::new(&db, &db, "successor");
+            let ran = run_cron(&g, params(), &source, None, &hooks).await;
+            let state = off_chain(&db, &net).await;
+            if !matches!(ran, Ok(true)) || !g.unleased().is_empty() || state.is_some() {
+                failures.push(format!(
+                    "successor {successor}, lapsed after read {n}: the successor {ran:?} {state:?} {:?}",
+                    g.unleased()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Read B's (1) on PR #36 (`routes.rs:783` at 7b1c2d5): `POST
+/// /admin/ingest` runs the writer the heal runs (`storage::ingest_pushed`),
+/// so it takes the lease as the pass does: held elsewhere, it writes
+/// nothing and says so (`None`, the route's 503 with its reason); free, it
+/// writes under its own lease.
+#[tokio::test]
+async fn the_admin_ingest_write_takes_the_lease() {
+    let c = branch(&[root()], 0, 6, "#34b ingest");
+    let db = linked_store(&c[..=2]).await;
+    held_elsewhere(&db);
+    let g = Guard::new(&db, &db, "admin-ingest");
+    let answer = admin_ingest_write(&g, params(), &c[3..]).await;
+    assert!(
+        matches!(answer, Ok(None)),
+        "the lease held elsewhere: refused, nothing written: {answer:?}"
+    );
+    assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
+    give_back(&db);
+    let answer = admin_ingest_write(&g, params(), &c[3..])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.outcome, "active");
+    assert_eq!(g.unleased(), Vec::<String>::new());
+    assert_eq!(off_chain(&db, &c).await, None);
+}
+
+/// Read B's (1) on PR #36 (`routes.rs:890` at 7b1c2d5): `/admin/backfill`'s
+/// write (`insert_headers_batch`, which activates rows stored inactive)
+/// takes the lease after its courier reads, as `/admin/bulk-sync` does:
+/// held elsewhere, nothing written and the route's 503; free, under its own
+/// lease.
+#[tokio::test]
+async fn the_admin_backfill_write_takes_the_lease() {
+    let c = branch(&[root()], 0, 6, "#34b backfill");
+    let db = linked_store(&c[..=2]).await;
+    held_elsewhere(&db);
+    let g = Guard::new(&db, &db, "admin-backfill");
+    let answer = backfill_write(&g, params(), &c[3..]).await.unwrap();
+    assert_eq!(answer, None, "the lease held elsewhere: nothing written");
+    assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
+    give_back(&db);
+    let answer = backfill_write(&g, params(), &c[3..]).await.unwrap();
+    assert_eq!(answer, Some((4, Vec::new())));
+    assert_eq!(g.unleased(), Vec::<String>::new());
+    assert_eq!(off_chain(&db, &c).await, None);
+}
+
+/// The heal's passes over `db` until the store serves `c` (at most
+/// `bound`), each through its own `Guard`: the passes, and every write that
+/// landed outside its lease.
+async fn heal_passes(
+    db: &SqliteDb,
+    c: &[BlockHeader],
+    source: &ScriptedChain,
+    bound: u32,
+) -> (u32, Vec<String>) {
+    let mut unleased = Vec::new();
+    let mut passes = 0;
+    while off_chain(db, c).await.is_some() && passes < bound {
+        passes += 1;
+        let g = Guard::new(db, db, "cron");
+        let _ = run_cron(&g, params(), source, None, &RecordedWebhooks::new("", "")).await;
+        unleased.extend(g.unleased());
+    }
+    (passes, unleased)
+}
+
+/// R2 (Read B on PR #36, `sync.rs:1008` at 7b1c2d5): rival rows active over
+/// `c11 ..= c40` (a branch `r` whose lowest row names no stored block, so
+/// two links break: at `c10` and at `c40`, which `c41` names), the
+/// network's `c41 ..= c50` above them, a courier read taking 35 ms, a 2 s
+/// term. The heal yields pass after pass; each yield keeps what it read,
+/// so the next pass goes on from it, and the chain ends linked and served
+/// within 12 passes with no write outside the lease. At 7b1c2d5 a yielded
+/// run over the rival rows ended `storedInactive` and every pass read the
+/// same heights again with no progress.
+#[tokio::test]
+async fn a_heal_over_rival_active_rows_moves_pass_after_pass() {
+    let c = branch(&[root()], 0, 50, "#34b network");
+    let db = linked_store(&c[..=10]).await;
+    let mut rival = vec![header(
+        X + 11,
+        "#34b rival 11",
+        &block_hash("nobody has it"),
+    )];
+    for i in 12..=40 {
+        let parent = rival[rival.len() - 1].hash.clone();
+        rival.push(header(X + i, &format!("#34b rival {i}"), &parent));
+    }
+    for h in rival.iter().chain(&c[41..]) {
+        raw_row(&db, h, true);
+    }
+    update_chain_tip_to_highest(&db).await.unwrap();
+    storage::repair_cumulative_work(&db, 144).await.unwrap();
+    let report = storage::link_check(&db, X, None).await.unwrap();
+    assert_eq!(
+        report
+            .broken
+            .iter()
+            .map(|b| b.height - X)
+            .collect::<Vec<_>>(),
+        vec![10, 40],
+        "{report:?}"
+    );
+    let source = published(&c);
+    source.set_delay_ms(35);
+    set_lease_term(Some(2));
+    let (passes, unleased) = heal_passes(&db, &c, &source, 12).await;
+    set_lease_term(None);
+    assert_eq!(unleased, Vec::<String>::new(), "after {passes} passes");
+    assert_eq!(off_chain(&db, &c).await, None, "after {passes} passes");
+    assert!(passes > 1, "the heal yielded and went on: {passes} passes");
+}
+
+/// #37 (inside R2's reach): a hole two heights deep under bulk rows
+/// (`c11` and `c12` missing, `c13 ..= c20` active with no link) heals in
+/// one pass. At 7b1c2d5 the heal took the missing `c11` as its floor, the
+/// run it read stood on nothing (`PrevNotFound`), and every pass read up
+/// to 100 heights through the ladder for no progress.
+#[tokio::test]
+async fn a_hole_two_heights_deep_heals_in_one_pass() {
+    let c = branch(&[root()], 0, 20, "#37 hole");
+    let db = linked_store(&c[..=10]).await;
+    for h in &c[13..] {
+        raw_row(&db, h, true);
+    }
+    update_chain_tip_to_highest(&db).await.unwrap();
+    let source = published(&c);
+    let (passes, unleased) = heal_passes(&db, &c, &source, 3).await;
+    assert_eq!(unleased, Vec::<String>::new());
+    assert_eq!(off_chain(&db, &c).await, None, "after {passes} passes");
+    assert_eq!(passes, 1);
+}
+
+/// A tip event through the door as the object's session hands it
+/// (`tip_stream`'s `tip`): turned away (`busy`) it is asked no more here.
+async fn the_object_pushes(
+    db: &SqliteDb,
+    source: &ScriptedChain,
+    _st: &mut StreamState,
+    h: &BlockHeader,
+) -> Result<crate::push::Announced, storage::IngestError> {
+    ingest_announced(
+        db,
+        params(),
+        source,
+        &RecordedWebhooks::new("", ""),
+        h.clone(),
+    )
+    .await
+}
+
+/// Item 5 of the round (Read B's risk on PR #36): #32's log order
+/// (2026-11-02 18:48Z). The store at `b8`; the cron's poll syncs the reorg
+/// `n8 ..= n11` (+3); the push of `n13` and `n14` is refused, its ancestry
+/// not to be had (18:48:50.8Z and 18:48:51.8Z). A refused push is a hint
+/// to poll and never the store's height: the seen height and
+/// `/getPresentHeight` stay at the poll's `n11`, and the behind rule still
+/// fires at the second tick, so the store follows the network. At 7b1c2d5
+/// the refusal raised the seen height (and `/getPresentHeight`) to its own
+/// unproven height, up to 37 above the tip.
+#[tokio::test]
+async fn a_refused_push_is_a_hint_to_poll_never_the_present_height() {
+    let stored = branch(&[root()], 0, 8, "#32 stored");
+    let net = branch(&stored, 7, 7, "#32 network");
+    let db = linked_store(&stored).await;
+    let source = published(&net[..=11]);
+    assert!(cron_pass(&db, &source).await, "18:48:44 the poll");
+    assert_eq!(seen_height(&db), Some(X + 11));
+
+    let mut st = StreamState {
+        reading: true,
+        last_beat_at: T0 + 120_000,
+        last_push_at: T0 - 10_000,
+        last_tip_height: X + 11,
+        ..Default::default()
+    };
+    for h in [&net[13], &net[14]] {
+        let refused = the_object_pushes(&db, &source, &mut st, h).await;
+        assert!(
+            matches!(refused, Err(storage::IngestError::Refused(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            seen_height(&db),
+            Some(X + 11),
+            "a refused push, {}",
+            h.height - X
+        );
+        assert_eq!(storage::present_height(&db).await.unwrap(), Some(X + 11));
+    }
+    for h in &net[12..] {
+        source.publish(h);
+    }
+    source.tip(net[14].height, &net[14].hash);
+
+    let mut poll = PollState {
+        last_poll_at: T0 - 3_000,
+        ..Default::default()
+    };
+    let mut log = Vec::new();
+    for tick in 1..=3u64 {
+        let due = a_cron_tick(&db, &source, &st, &mut poll, T0 + tick * 50_000).await;
+        log.push((tick, due));
+    }
+    assert_eq!(
+        log,
+        vec![
+            (1, None),
+            (
+                2,
+                Some("the store sat behind the seen tip for more than one tick")
+            ),
+            (3, None),
+        ]
+    );
+    assert_eq!(off_chain(&db, &net).await, None);
 }
