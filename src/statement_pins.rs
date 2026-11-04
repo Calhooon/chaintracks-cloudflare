@@ -653,3 +653,69 @@ fn the_round_5_statements_are_the_two_new_literals() {
         );
     }
 }
+
+/// #34 (lane/ct-34-b): the writer lease's fence (`sync::FENCE_SQL`).
+pub(crate) const ISSUE34B_FENCE: &str = "UPDATE sync_state SET id = 2 WHERE id = 1 AND NOT (lease_owner IS ?1 AND COALESCE(lease_until, 0) >= CAST(strftime('%s', 'now') AS INTEGER))";
+
+/// The fence is the literal above, in no earlier vocabulary, and on the
+/// real schema it changes nothing for the holder inside its term, and fails
+/// (the one row's `CHECK (id = 1)`) for a holder past its term, for another
+/// owner and for a lease given back; a failure rolls back the write it heads.
+#[test]
+fn the_issue34b_fence_is_the_new_literal_and_fails_the_lapsed() {
+    assert_eq!(crate::sync::FENCE_SQL, ISSUE34B_FENCE);
+    let s = ISSUE34B_FENCE;
+    assert!(
+        !MAIN_VOCABULARY.contains(&s)
+            && !ROUND5_VOCABULARY.contains(&s)
+            && !D5_VOCABULARY.contains(&s)
+            && !P04_VOCABULARY.contains(&s)
+            && !CT33_VOCABULARY.contains(&s)
+            && !LASTPASS_VOCABULARY.contains(&s)
+            && !ISSUE30_VOCABULARY.contains(&s)
+            && !ISSUE31_VOCABULARY.contains(&s)
+            && s != ISSUE34_LEASE_LEFT
+    );
+    let db = crate::host_harness::SqliteDb::migrated();
+    let conn = db.conn();
+    conn.execute(ISSUE31_TAKE_LEASE, rusqlite::params!["cron:t", 120])
+        .unwrap();
+    assert_eq!(conn.execute(s, ["cron:t"]).unwrap(), 0, "the holder passes");
+    let refused = |owner: &str| {
+        conn.execute(s, [owner])
+            .unwrap_err()
+            .to_string()
+            .contains("CHECK constraint failed")
+    };
+    assert!(refused("push:u"), "another owner is refused");
+    conn.execute(
+        "UPDATE sync_state SET lease_until = CAST(strftime('%s', 'now') AS INTEGER) - 1 WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    assert!(refused("cron:t"), "a holder past its term is refused");
+    conn.execute(
+        "UPDATE sync_state SET lease_owner = NULL, lease_until = NULL WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    assert!(refused("cron:t"), "a lease given back is no holder's");
+    // In one batch (one transaction, as D1's), the refusal takes the write
+    // it heads with it.
+    let count = |db: &crate::host_harness::SqliteDb| -> i64 {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM headers", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = count(&db);
+    let row = crate::d1::Query::new(
+        "INSERT INTO headers (previous_hash, height, is_active, is_chain_tip, hash, chain_work, version, merkle_root, time, bits, nonce) VALUES ('p', 1, 0, 0, 'h', 'w', 1, 'r', 1, 1, 1)",
+    );
+    let fenced = futures_util::FutureExt::now_or_never(crate::d1::HeaderDb::batch(
+        &db,
+        vec![crate::d1::Query::new(s).bind("cron:t"), row],
+    ))
+    .unwrap();
+    assert!(fenced.is_err(), "{fenced:?}");
+    assert_eq!(count(&db), before, "the fenced write did not land");
+}

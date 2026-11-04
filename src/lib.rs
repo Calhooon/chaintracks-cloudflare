@@ -89,9 +89,9 @@ mod writers_tests;
 /// and cron triggers for WhatsOnChain polling.
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
-    routes::handle_request(req, &env).await
+    routes::handle_request(req, &env, &ctx).await
 }
 
 #[event(scheduled)]

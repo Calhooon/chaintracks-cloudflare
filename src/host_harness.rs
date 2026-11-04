@@ -171,14 +171,18 @@ impl HeaderDb for SqliteDb {
             .map_err(sql_err)
     }
 
-    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+    async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>> {
         // One batch is one transaction, as a D1 `batch` is.
         let tx = self.conn.unchecked_transaction().map_err(sql_err)?;
+        let mut changed = Vec::with_capacity(stmts.len());
         for q in &stmts {
-            tx.execute(q.sql(), rusqlite::params_from_iter(q.params()))
-                .map_err(sql_err)?;
+            changed.push(
+                tx.execute(q.sql(), rusqlite::params_from_iter(q.params()))
+                    .map_err(sql_err)? as u32,
+            );
         }
-        tx.commit().map_err(sql_err)
+        tx.commit().map_err(sql_err)?;
+        Ok(changed)
     }
 }
 
@@ -321,9 +325,9 @@ impl<D: HeaderDb> HeaderDb for Guard<'_, D> {
         result
     }
 
-    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+    async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>> {
         let found: Vec<String> = stmts.iter().filter_map(|q| self.check(q.sql())).collect();
-        let result = self.inner.batch(stmts).await;
+        let result = self.inner.batch_changes(stmts).await;
         self.landed(found, &result);
         result
     }
@@ -477,9 +481,9 @@ impl<'a> HeaderDb for Recorder<'a> {
         self.inner.execute(q).await
     }
 
-    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+    async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>> {
         self.handed.borrow_mut().push(Handed::Batch(stmts.clone()));
-        self.inner.batch(stmts).await
+        self.inner.batch_changes(stmts).await
     }
 }
 

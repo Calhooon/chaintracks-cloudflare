@@ -12,7 +12,7 @@ use crate::consensus::ChainParams;
 use crate::host_harness::{
     block_hash, header, Guard, RecordedWebhooks, Recorder, ScriptedChain, SqliteDb,
 };
-use crate::push::ingest_announced;
+use crate::push::{hand_over, ingest_announced};
 use crate::storage::{
     self, find_chain_tip, find_header_for_height, insert_header, update_chain_tip_to_highest,
     SQL_INSERT_HEADER,
@@ -67,6 +67,11 @@ async fn linked_store(c: &[BlockHeader]) -> SqliteDb {
 /// One row written past the rules (a bulk row: `previous_header_id` null,
 /// its own work), active or not.
 fn raw_row(db: &SqliteDb, h: &BlockHeader, active: bool) {
+    raw_row_worked(db, h, active, &crate::types::calculate_work(h.bits));
+}
+
+/// `raw_row` carrying `work` as its chain work.
+fn raw_row_worked(db: &SqliteDb, h: &BlockHeader, active: bool, work: &str) {
     db.conn()
         .execute(
             SQL_INSERT_HEADER,
@@ -77,7 +82,7 @@ fn raw_row(db: &SqliteDb, h: &BlockHeader, active: bool) {
                 i64::from(active),
                 0,
                 h.hash,
-                crate::types::calculate_work(h.bits),
+                work,
                 h.version,
                 h.merkle_root,
                 h.time,
@@ -162,14 +167,19 @@ enum Outer {
 }
 
 /// The read-through as `routes::ensure_fresh_header` runs it: the tip read,
-/// then `tip + 1 ..= height` through the ladder.
+/// `tip + 1 ..= height` through the ladder and judged, then (#34,
+/// lane/ct-34-b) the run handed to the push's door as the request's
+/// `waitUntil` hands it.
 async fn read_through_to(db: &impl crate::d1::HeaderDb, source: &ScriptedChain, height: u32) {
     let hooks = RecordedWebhooks::new("", "");
     let tip = find_chain_tip(db).await.unwrap().unwrap().height;
     if height > tip {
-        read_through(db, params(), source, &hooks, tip, height)
+        let fetched = read_through(db, params(), source, tip, height)
             .await
             .unwrap();
+        if fetched.hand {
+            hand_over(db, params(), source, &hooks, fetched.run, 2, || async {}).await;
+        }
     }
 }
 
@@ -289,7 +299,7 @@ async fn a_cron_tick(
     now: u64,
 ) -> Option<&'static str> {
     let hooks = RecordedWebhooks::new("", "");
-    poll.note_behind(crate::sync::store_behind(db).await);
+    poll.note_behind_or_hinted(crate::sync::store_behind(db).await, st);
     let due = poll_due(st, poll, now, HB, QUIET);
     poll.woke(due, now);
     if due.is_some() {
@@ -359,6 +369,7 @@ async fn a_push_still_busy_after_its_tries_is_logged_and_counted_once() {
         &mut st,
         &c[3],
         BUSY_TRIES,
+        "tip stream",
         || ingest_announced(&db, params(), &source, &hooks, c[3].clone()),
         || {
             waits.set(waits.get() + 1);
@@ -388,6 +399,7 @@ async fn a_push_still_busy_after_its_tries_is_logged_and_counted_once() {
         &mut st,
         &c[3],
         BUSY_TRIES,
+        "tip stream",
         || ingest_announced(&db, params(), &source, &hooks, c[3].clone()),
         || {
             give_back(&db);
@@ -401,82 +413,21 @@ async fn a_push_still_busy_after_its_tries_is_logged_and_counted_once() {
     assert_eq!((st.busy, st.last_fault.as_deref()), (1, None));
 }
 
-// ─── Item 4: refused pushes raise the seen height ──────────────────────────
-
-/// Item 4, #32's log order (2026-11-02 18:48Z): the store at `b8`
-/// (973788); the cron's poll syncs the reorg `n8 ..= n11` (+3, 973791);
-/// the push of `n13` and `n14` is refused (its ancestry not to be had:
-/// 18:48:50.8Z and 18:48:51.8Z); then the ticks behind a live push. The
-/// earlier refused push raises the seen height to its own, so the behind rule
-/// counts from the next tick and the second tick polls, and the store
-/// follows the network. Before #34 a refusal left the seen height at the
-/// poll's 973791 and no tick polled before the quiet interval. To red:
-/// `push::ingest_announced`, the seen height noted after a write alone.
-#[tokio::test]
-async fn a_refused_push_raises_the_seen_height_and_the_behind_rule_fires() {
-    let stored = branch(&[root()], 0, 8, "#32 stored");
-    let net = branch(&stored, 7, 7, "#32 network");
-    let db = linked_store(&stored).await;
-    let source = published(&net[..=11]);
-    let hooks = RecordedWebhooks::new("", "");
-    assert!(cron_pass(&db, &source).await, "18:48:44 the poll");
-    assert_eq!(
-        find_chain_tip(&db).await.unwrap().unwrap().hash,
-        net[11].hash
-    );
-    assert_eq!(seen_height(&db), Some(X + 11));
-
-    // 18:48:50.8 and 18:48:51.8: the pushes above a parent no courier serves.
-    for (i, h) in [&net[13], &net[14]].into_iter().enumerate() {
-        let refused = ingest_announced(&db, params(), &source, &hooks, h.clone()).await;
-        assert!(
-            matches!(refused, Err(storage::IngestError::Refused(_))),
-            "{refused:?}"
-        );
-        if i == 0 {
-            assert_eq!(seen_height(&db), Some(X + 13), "the earlier refused push");
-        }
-    }
-    // The couriers have the network's chain by the next tick.
-    for h in &net[12..] {
-        source.publish(h);
-    }
-    source.tip(net[14].height, &net[14].hash);
-
-    let st = StreamState {
-        reading: true,
-        last_beat_at: T0 + 120_000,
-        last_push_at: T0 - 10_000,
-        ..Default::default()
-    };
-    let mut poll = PollState {
-        last_poll_at: T0 - 3_000,
-        ..Default::default()
-    };
-    let mut log = Vec::new();
-    for tick in 1..=3u64 {
-        let due = a_cron_tick(&db, &source, &st, &mut poll, T0 + tick * 50_000).await;
-        log.push((tick, due));
-    }
-    assert_eq!(
-        log,
-        vec![
-            (1, None),
-            (
-                2,
-                Some("the store sat behind the seen tip for more than one tick")
-            ),
-            (3, None),
-        ]
-    );
-    assert_eq!(off_chain(&db, &net).await, None);
-}
+// ─── Item 4: refused pushes and the behind rule ────────────────────────────
+//
+// #34 (lane/ct-34-b): the lane's item 4 witness (a refused push raises the
+// seen height) is replaced by the round's
+// `a_refused_push_is_a_hint_to_poll_never_the_present_height`: the same
+// #32 order and the behind rule firing at the same tick, through a hint
+// to poll instead of the seen height.
 
 // ─── Item 5: a heal stays inside the lease's term ──────────────────────────
 
 /// Item 5: a broken chain over 300 heights under the tip (`c12 ..= c310`
-/// bulk rows, the link null, a height missing every 30 from `c11`: ten
-/// breaks), a courier read taking 35 ms, a lease term of 2 s: one pass's
+/// bulk rows, the link null, twelve heights missing every 30 from `c11`:
+/// ten breaks, 120 heights; #34, lane/ct-34-b: the heal reads only the
+/// missing heights now, so the holes are deeper than the lane's single
+/// heights), a courier read taking 35 ms, a lease term of 2 s: one pass's
 /// heal of 100 heights would read for 3.5 s and write past the term. Pass
 /// after pass, the heal reads the term before each span and yields with its
 /// progress recorded; the chain ends linked and served, and no write of the
@@ -487,7 +438,7 @@ async fn a_heal_over_300_broken_heights_stays_inside_a_2_s_term() {
     let c = branch(&[root()], 0, 311, "#34 heal");
     let db = linked_store(&c[..=10]).await;
     for h in &c[12..=310] {
-        if (h.height - X) % 30 != 11 {
+        if !(11..=22).contains(&((h.height - X) % 30)) {
             raw_row(&db, h, true);
         }
     }
@@ -571,9 +522,8 @@ fn live_lease(db: &SqliteDb) -> Option<String> {
 /// The read-through's half that runs on the request's own life
 /// (`routes::ensure_fresh_header`): the tip read, then the read-through.
 async fn the_request(db: &SqliteDb, source: &impl ChainSource, height: u32) {
-    let hooks = RecordedWebhooks::new("", "");
     let tip = find_chain_tip(db).await.unwrap().unwrap().height;
-    let _ = read_through(db, params(), source, &hooks, tip, height).await;
+    let _ = read_through(db, params(), source, tip, height).await;
 }
 
 /// R1 (Read B on PR #36, `sync.rs:1315` with `:160` at 7b1c2d5): a public
@@ -701,18 +651,32 @@ async fn the_admin_ingest_write_takes_the_lease() {
 /// write (`insert_headers_batch`, which activates rows stored inactive)
 /// takes the lease after its courier reads, as `/admin/bulk-sync` does:
 /// held elsewhere, nothing written and the route's 503; free, under its own
-/// lease.
+/// lease. The gap `c3 ..= c6` is below the tip `c10` (bulk rows above it).
 #[tokio::test]
 async fn the_admin_backfill_write_takes_the_lease() {
-    let c = branch(&[root()], 0, 6, "#34b backfill");
+    let c = branch(&[root()], 0, 10, "#34b backfill");
     let db = linked_store(&c[..=2]).await;
+    for h in &c[7..] {
+        raw_row(&db, h, true);
+    }
+    update_chain_tip_to_highest(&db).await.unwrap();
+    let served = |db: &SqliteDb| {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM headers WHERE is_active = 1",
+                [],
+                |r| r.get::<_, u32>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(served(&db), 7);
     held_elsewhere(&db);
     let g = Guard::new(&db, &db, "admin-backfill");
-    let answer = backfill_write(&g, params(), &c[3..]).await.unwrap();
+    let answer = backfill_write(&g, params(), &c[3..=6]).await.unwrap();
     assert_eq!(answer, None, "the lease held elsewhere: nothing written");
-    assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
+    assert_eq!(served(&db), 7);
     give_back(&db);
-    let answer = backfill_write(&g, params(), &c[3..]).await.unwrap();
+    let answer = backfill_write(&g, params(), &c[3..=6]).await.unwrap();
     assert_eq!(answer, Some((4, Vec::new())));
     assert_eq!(g.unleased(), Vec::<String>::new());
     assert_eq!(off_chain(&db, &c).await, None);
@@ -760,11 +724,19 @@ async fn a_heal_over_rival_active_rows_moves_pass_after_pass() {
         let parent = rival[rival.len() - 1].hash.clone();
         rival.push(header(X + i, &format!("#34b rival {i}"), &parent));
     }
+    // The rival rows carry the work of a chain that forked at `c10`, as an
+    // active branch does (their lowest row's parent is not stored, so no
+    // repair could sum it).
+    let mut work = storage::find_header_for_hash(&db, &c[10].hash)
+        .await
+        .unwrap()
+        .unwrap()
+        .chain_work;
     for h in rival.iter().chain(&c[41..]) {
-        raw_row(&db, h, true);
+        work = crate::types::add_work(&work, &crate::types::calculate_work(h.bits));
+        raw_row_worked(&db, h, true, &work);
     }
     update_chain_tip_to_highest(&db).await.unwrap();
-    storage::repair_cumulative_work(&db, 144).await.unwrap();
     let report = storage::link_check(&db, X, None).await.unwrap();
     assert_eq!(
         report
@@ -806,19 +778,23 @@ async fn a_hole_two_heights_deep_heals_in_one_pass() {
 }
 
 /// A tip event through the door as the object's session hands it
-/// (`tip_stream`'s `tip`): turned away (`busy`) it is asked no more here.
+/// (`tip_stream`'s `tip`, through `through_the_lease`), a second before
+/// `T0`: turned away (`busy`) it is asked no more here.
 async fn the_object_pushes(
     db: &SqliteDb,
     source: &ScriptedChain,
-    _st: &mut StreamState,
+    st: &mut StreamState,
     h: &BlockHeader,
 ) -> Result<crate::push::Announced, storage::IngestError> {
-    ingest_announced(
-        db,
-        params(),
-        source,
-        &RecordedWebhooks::new("", ""),
-        h.clone(),
+    let hooks = RecordedWebhooks::new("", "");
+    through_the_lease(
+        st,
+        h,
+        0,
+        "tip stream",
+        || ingest_announced(db, params(), source, &hooks, h.clone()),
+        || async {},
+        || T0 - 1_000,
     )
     .await
 }

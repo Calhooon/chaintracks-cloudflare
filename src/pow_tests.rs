@@ -215,13 +215,22 @@ async fn a_claimed_hash_that_is_not_the_hash_of_the_fields_is_refused() {
     assert!(!stored(&db, &liar.hash).await);
 }
 
-/// The read-through path (`routes::ensure_fresh_header`) hands a courier's
-/// header straight to `insert_with_parent_backfill`, no ladder in between.
+/// The live path (`insert_with_parent_backfill`, the cron's) takes a
+/// courier's header with no ladder in between. #34 (lane/ct-34-b): the
+/// read-through (`routes::ensure_fresh_header`) judges what it fetched
+/// without a write (`storage::judge_above`), and refuses it there too.
 #[tokio::test]
 async fn the_read_through_path_refuses_exponent_0x40() {
     let db = SqliteDb::migrated();
     let hooks = RecordedWebhooks::new(BETA_HOOK, BEARER);
     let s = seeded(&db, &hooks).await;
+    let judged = crate::storage::judge_above(&db, regtest(), std::slice::from_ref(&s.bad))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&judged, crate::storage::Judged::Refused(e) if format!("{e}").contains("high-hash: bits 0x407fffff overflow")),
+        "{judged:?}"
+    );
     let woc = ScriptedChain::new();
     let r = insert_with_parent_backfill(&db, regtest(), &woc, s.bad.clone()).await;
     assert!(r.is_err(), "accepted: {r:?}");

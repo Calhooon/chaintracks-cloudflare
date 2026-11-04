@@ -8,6 +8,7 @@ use crate::couriers::{CourierLadder, RUNG_FAULT_CAP};
 use crate::host_harness::{
     block_hash, flags, header, regtest, RecordedWebhooks, ScriptedChain, SqliteDb,
 };
+use crate::push::hand_over;
 use crate::storage::insert_header;
 use crate::sync::{
     bootstrap_from_peer, fetch_span, read_through, Bootstrap, ChainSource, HeaderPeer,
@@ -195,6 +196,26 @@ fn refusing() -> ScriptedChain {
     chain
 }
 
+/// The read-through as the route runs it (#34, lane/ct-34-b): the
+/// request's read and judgment (`sync::read_through`), then the run handed
+/// to the push's door (`push::hand_over`, the request's `waitUntil`).
+/// Answers whether the request answered with the header asked.
+async fn read_through_and_hand(
+    db: &SqliteDb,
+    ladder: &impl ChainSource,
+    hooks: &RecordedWebhooks,
+    tip: u32,
+    height: u32,
+) -> Option<()> {
+    let fetched = read_through(db, regtest(), ladder, tip, height)
+        .await
+        .unwrap();
+    if fetched.hand {
+        hand_over(db, regtest(), ladder, hooks, fetched.run, 0, || async {}).await;
+    }
+    fetched.answer.map(|_| ())
+}
+
 /// The 965877 shape on the read-through: the courier asked first refuses, the
 /// next one serves. On one courier (the path at `62cf619`) the request
 /// answers "unable to verify" for a block the network holds; on the ladder
@@ -213,24 +234,13 @@ async fn h12_a_fresh_block_does_not_depend_on_one_courier() {
     serving.publish(&fresher);
 
     // one courier, and it refuses: could not look, so nothing is stored
-    let alone = read_through(
-        &db,
-        regtest(),
-        &refusing(),
-        &hooks,
-        tip.height,
-        fresher.height,
-    )
-    .await
-    .unwrap();
+    let alone = read_through_and_hand(&db, &refusing(), &hooks, tip.height, fresher.height).await;
     assert_eq!(alone, None, "one refusing courier: unable to verify");
     assert_eq!(flags(&db, &tip.hash), (true, true), "the held tip stands");
 
     // the ladder: the second rung serves both, by height
     let ladder = ladder_of(refusing(), serving);
-    let landed = read_through(&db, regtest(), &ladder, &hooks, tip.height, fresher.height)
-        .await
-        .unwrap();
+    let landed = read_through_and_hand(&db, &ladder, &hooks, tip.height, fresher.height).await;
     assert_eq!(landed, Some(()), "the next courier's answer lands");
     assert_eq!(flags(&db, &fresher.hash), (true, true), "the tip moved");
     assert_eq!(flags(&db, &fresh.hash), (true, false));
@@ -244,6 +254,9 @@ async fn h12_a_fresh_block_does_not_depend_on_one_courier() {
 /// The parent walk of the read-through reads the ladder too: the fresh block
 /// builds on a competitor of our tip, which only the second courier holds by
 /// hash. On one courier that was the wedge; on the ladder the branch lands.
+/// #34 (lane/ct-34-b): the walk is the push's door's now; the request
+/// cannot judge a block that does not stand on our tip and answers "unable
+/// to verify" for now, and its hand-off lands the branch.
 #[tokio::test]
 async fn h12_the_parent_walk_of_the_read_through_reads_the_ladder() {
     let db = SqliteDb::migrated();
@@ -264,10 +277,11 @@ async fn h12_the_parent_walk_of_the_read_through_reads_the_ladder() {
     holds_the_parent.publish(&competitor);
 
     let ladder = ladder_of(by_height_only, holds_the_parent);
-    let landed = read_through(&db, regtest(), &ladder, &hooks, tip.height, fresh.height)
-        .await
-        .unwrap();
-    assert_eq!(landed, Some(()));
+    let landed = read_through_and_hand(&db, &ladder, &hooks, tip.height, fresh.height).await;
+    assert_eq!(
+        landed, None,
+        "the request could not judge it: unable to verify for now"
+    );
     assert_eq!(
         flags(&db, &fresh.hash),
         (true, true),
@@ -300,9 +314,7 @@ async fn h12_a_header_no_parent_vouches_for_is_refused_whoever_served_it() {
     a.publish(&foreign);
     b.publish(&foreign);
     let ladder = ladder_of(a, b);
-    let landed = read_through(&db, regtest(), &ladder, &hooks, tip.height, foreign.height)
-        .await
-        .unwrap();
+    let landed = read_through_and_hand(&db, &ladder, &hooks, tip.height, foreign.height).await;
     assert_eq!(landed, None, "unable to verify");
     assert_eq!(flags(&db, &tip.hash), (true, true), "the held tip stands");
 }

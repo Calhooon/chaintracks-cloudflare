@@ -97,55 +97,101 @@ pub(crate) async fn ingest_announced(
     }
     // #31 (#32 ask 1): the push writes holding the writer lease, as the
     // cron's pass does; held elsewhere, nothing is written (`"busy"`) and
-    // the object asks again.
-    // #34: a push turned away (`"busy"`), or refused because its ancestry
-    // could not be had (the parent walk's two refusals, the rules'
-    // `ancestry-missing`: #32's refusals at 18:48:50Z), names a height the
-    // network has that the store could not judge yet; it is recorded as
-    // seen, as a push that landed is, so the behind rule
-    // (`tip_stream::poll_due`) counts from the next tick instead of waiting
-    // for the store's tip to move. A header a rule refused with its ancestry
-    // in hand (its proof of work, the difficulty, its parent's height)
-    // names nothing, and the height of one not landed counts only within
-    // `PARENT_WALK_LIMIT` above the served tip (`note_unlanded`).
-    let height = header.height;
+    // the object asks again. #34 (lane/ct-34-b): behind the fence
+    // (`sync::Fenced`), so a push past its term writes nothing more.
+    // #34 (lane/ct-34-b, Read B's risk on PR #36): a push turned away, or
+    // one refused because its ancestry could not be had (`unjudged`), names
+    // a height the store could not judge; the door records nothing for it.
+    // It is a hint to poll, kept by the object (`StreamState::hint`, read
+    // by the behind rule), never the store's seen height: at 7b1c2d5 it
+    // raised `lastSeenHeight` and `/getPresentHeight` by up to 37 on the
+    // peer's word alone.
     let lease = sync::take_lease(db, "push").await;
     if let sync::Lease::Busy = lease {
-        note_unlanded(db, height).await;
         return answer(db, "busy", 0, None).await;
     }
-    let unjudged = std::cell::Cell::new(false);
-    let result = ingest_held(db, params, source, hooks, header, &refuse, &unjudged).await;
-    if let Err(IngestError::Refused(e)) = &result {
-        if unjudged.get() || e.to_string().contains(ANCESTRY_MISSING) {
-            note_unlanded(db, height).await;
-        }
-    }
+    let result = ingest_held(
+        &sync::Fenced::new(db, &lease),
+        params,
+        source,
+        hooks,
+        header,
+        &refuse,
+    )
+    .await;
     sync::release_lease(db, lease).await;
     result
 }
 
-/// #34: the height of a pushed header that did not land, recorded as seen
-/// when it stands within `PARENT_WALK_LIMIT` (+1) of the served tip: its
-/// height is the peer's claim, unproven by any stored ancestor, so a peer
-/// can raise `lastSeenHeight` (and `/getPresentHeight`) by at most the
-/// walk's bound, until the poll the behind rule brings records the
-/// couriers' answer over it. A read fault is loud and records nothing.
+/// #34: a refusal of the door that judged nothing of the header: its
+/// ancestry could not be had (the parent walk's two refusals, the rules'
+/// `ancestry-missing`: #32's refusals at 18:48:50Z). Its height is the
+/// peer's claim, a hint to poll (`StreamState::hint`), never a seen height.
 // Used by the Worker in production and retained for host tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-async fn note_unlanded(db: &impl HeaderDb, height: u32) {
-    match storage::find_chain_tip(db).await {
-        Ok(Some(tip)) if height <= tip.height.saturating_add(PARENT_WALK_LIMIT as u32 + 1) => {
-            sync::note_seen(db, height).await
+pub(crate) fn unjudged(e: &IngestError) -> bool {
+    match e {
+        IngestError::Refused(e) => {
+            let text = e.to_string();
+            [ANCESTRY_MISSING, WALK_TOO_DEEP, WALK_PARENT_MISSING]
+                .iter()
+                .any(|mark| text.contains(mark))
         }
-        Ok(_) => {}
-        Err(e) => log_error!("push: the tip read for the seen height failed: {e:?}"),
+        IngestError::Store(_) => false,
     }
 }
 
 /// #34: the rules' refusal of a header whose ancestors are not stored
 /// (`consensus::HeaderFault::AncestryMissing`), as its text carries it.
 const ANCESTRY_MISSING: &str = ": ancestry-missing: ";
+/// The parent walk's two refusals, as their text carries them.
+const WALK_TOO_DEEP: &str = "stands on no stored row within";
+const WALK_PARENT_MISSING: &str = "of a pushed header could not be had";
+
+/// #34 (lane/ct-34-b, R1 on PR #36): the read-through's run
+/// (`sync::read_through`) through the push's door, the lowest height on, each
+/// header as a tip event goes (`tip_stream::through_the_lease`): the door
+/// takes the writer lease for that header's write alone, a busy door is
+/// asked again `tries` times `wait` apart, and a header still turned away
+/// is dropped with its line. On the Worker this runs off the request's
+/// life (`ctx.wait_until`), so a caller that goes away abandons no lease.
+/// Stops at the header that did not land. Answers the headers that landed
+/// or were already served.
+pub(crate) async fn hand_over<W, WF>(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    hooks: &impl TipWebhooks,
+    run: Vec<BlockHeader>,
+    tries: u32,
+    mut wait: W,
+) -> u32
+where
+    W: FnMut() -> WF,
+    WF: std::future::Future<Output = ()>,
+{
+    // The state of this hand-off alone: its counters and times are read by
+    // no one (the drop's line is the record).
+    let mut st = crate::tip_stream::StreamState::default();
+    let mut landed = 0;
+    for header in run {
+        let answer = crate::tip_stream::through_the_lease(
+            &mut st,
+            &header,
+            tries,
+            "read-through",
+            || ingest_announced(db, params, source, hooks, header.clone()),
+            &mut wait,
+            || 0,
+        )
+        .await;
+        match answer {
+            Ok(a) if matches!(a.outcome, "known" | "active" | "activated") => landed += 1,
+            _ => break,
+        }
+    }
+    landed
+}
 
 // Used by the Worker in production and retained for host tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -156,7 +202,6 @@ async fn ingest_held<F, Fut>(
     hooks: &impl TipWebhooks,
     header: BlockHeader,
     refuse: &F,
-    unjudged: &std::cell::Cell<bool>,
 ) -> Result<Announced, IngestError>
 where
     F: Fn(worker::Error) -> Fut,
@@ -181,7 +226,6 @@ where
                 run[run.len() - 1].hash,
                 run[run.len() - 1].height
             ));
-            unjudged.set(true);
             return Err(refuse(e).await);
         }
         match source.header_by_hash(&want).await {
@@ -190,7 +234,6 @@ where
                 let e = worker::Error::RustError(format!(
                     "the parent {want} of a pushed header could not be had: {e}"
                 ));
-                unjudged.set(true);
                 return Err(refuse(e).await);
             }
         }

@@ -66,7 +66,7 @@ fn wrap_error(message: &str, status_code: u16) -> Result<Response> {
     Ok(response.with_status(status_code))
 }
 
-pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
+pub async fn handle_request(mut req: Request, env: &Env, ctx: &Context) -> Result<Response> {
     let path = req.path();
     let method = req.method();
 
@@ -149,7 +149,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
             if let Some(view) = view {
                 return event_response(db, env, &req, view, true).await;
             }
-            return handle_v2(&db, env, &chain, &v2p, &req.url()?).await;
+            return handle_v2(&db, env, ctx, &chain, &v2p, &req.url()?).await;
         }
         return v2_error("ERR_NOT_FOUND", "Not found", 404);
     }
@@ -182,7 +182,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         (Method::Get, "/findHeaderHexForHeight") => {
             // (read-through grace: see ensure_fresh_header)
             let url = req.url()?;
-            find_header_hex_for_height(&db, env, &chain, &url).await
+            find_header_hex_for_height(&db, env, ctx, &chain, &url).await
         }
         (Method::Get, "/findHeaderHexForBlockHash") => {
             let url = req.url()?;
@@ -196,7 +196,7 @@ pub async fn handle_request(mut req: Request, env: &Env) -> Result<Response> {
         // Validation
         (Method::Get, "/isValidRootForHeight") => {
             let url = req.url()?;
-            is_valid_root_for_height(&db, env, &chain, &url).await
+            is_valid_root_for_height(&db, env, ctx, &chain, &url).await
         }
 
         // Admin: ingest raw headers pushed by an operator (concatenated
@@ -313,6 +313,7 @@ async fn find_chain_tip_header_hex(db: &worker::D1Database) -> Result<Response> 
 async fn find_header_hex_for_height(
     db: &worker::D1Database,
     env: &Env,
+    ctx: &Context,
     chain: &Chain,
     url: &url::Url,
 ) -> Result<Response> {
@@ -335,11 +336,9 @@ async fn find_header_hex_for_height(
         return crate::edge::answer(edge, &key, response, settled, tags, None).await;
     }
     // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
-    if ensure_fresh_header(db, env, chain, height).await?.is_some() {
-        if let Some(h) = storage::served_header_for_height(db, height).await? {
-            let response = wrap_success(PublicBlockHeader::from(h))?;
-            return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
-        }
+    if let Some(h) = ensure_fresh_header(db, env, ctx, chain, height).await? {
+        let response = wrap_success(PublicBlockHeader::from(h))?;
+        return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
     }
     wrap_error("Header not found", 404)
 }
@@ -407,9 +406,10 @@ const GRACE_BLOCKS: u32 = 6;
 async fn ensure_fresh_header(
     db: &worker::D1Database,
     env: &Env,
+    ctx: &Context,
     chain: &Chain,
     height: u32,
-) -> Result<Option<()>> {
+) -> Result<Option<BlockHeader>> {
     let tip = match storage::find_chain_tip(db).await? {
         Some(t) => t.height,
         None => return Ok(None),
@@ -419,13 +419,54 @@ async fn ensure_fresh_header(
     }
     // Rule 28 (H12): the ladder the cron reads (WhatsOnChain, Arcade and
     // Bitails as each other's fallbacks), by height and for the parent walk,
-    // never one courier. Every answer is checked before it is stored.
+    // never one courier. Every answer is checked before it counts.
     let ladder = crate::sync::courier_ladder(env, chain);
     let params = crate::sync::chain_params(env, chain)?;
-    let landed = crate::sync::read_through(db, &params, &ladder, env, tip, height).await?;
+    let fetched = crate::sync::read_through(db, &params, &ladder, tip, height).await?;
     worker::console_log!("read-through: couriers: {}", ladder.summary());
-    Ok(landed)
+    // #34 (lane/ct-34-b, R1 on PR #36): the write is the push's door's,
+    // off this request's life: a caller that goes away (LOW's 2 s
+    // deadline) cancels the request, never a held lease.
+    if fetched.hand && !fetched.run.is_empty() {
+        let (env, chain, run) = (env.clone(), *chain, fetched.run.clone());
+        ctx.wait_until(async move {
+            let (Ok(db), Ok(params)) = (env.d1("DB"), crate::sync::chain_params(&env, &chain))
+            else {
+                return;
+            };
+            let ladder = crate::sync::courier_ladder(&env, &chain);
+            let landed = crate::push::hand_over(
+                &db,
+                &params,
+                &ladder,
+                &env,
+                run,
+                READ_THROUGH_TRIES,
+                || {
+                    worker::Delay::from(std::time::Duration::from_millis(
+                        crate::tip_stream::BUSY_WAIT_MS,
+                    ))
+                },
+            )
+            .await;
+            worker::console_log!(
+                "read-through: {landed} landed through the door; couriers: {}",
+                ladder.summary()
+            );
+        });
+    }
+    // The answer: the judged header, where the served ceiling reaches it
+    // (P0-4: never above a re-validation in progress).
+    match fetched.answer {
+        Some(h) if storage::served_ceiling(db).await?.admits(height) => Ok(Some(h)),
+        _ => Ok(None),
+    }
 }
+
+/// #34 (lane/ct-34-b): the asks of a read-through's hand-off after a busy
+/// door, `tip_stream::BUSY_WAIT_MS` apart: 18 s of waits, inside the 30 s a
+/// Worker's `waitUntil` runs after its answer.
+const READ_THROUGH_TRIES: u32 = 9;
 
 async fn find_header_hex_for_block_hash(
     db: &worker::D1Database,
@@ -486,6 +527,7 @@ async fn get_headers(db: &worker::D1Database, env: &Env, url: &url::Url) -> Resu
 async fn is_valid_root_for_height(
     db: &worker::D1Database,
     env: &Env,
+    ctx: &Context,
     chain: &Chain,
     url: &url::Url,
 ) -> Result<Response> {
@@ -523,11 +565,9 @@ async fn is_valid_root_for_height(
         return crate::edge::answer(edge, &key, wrap_success(valid)?, settled, tags, None).await;
     }
     // Fresh-block grace: verified read-through from the ladder (tip+1..=tip+6).
-    if ensure_fresh_header(db, env, chain, height).await?.is_some() {
-        if let Some(valid) = storage::check_root_for_height(db, &root, height).await? {
-            let response = wrap_success(valid)?;
-            return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
-        }
+    if let Some(h) = ensure_fresh_header(db, env, ctx, chain, height).await? {
+        let response = wrap_success(h.merkle_root.eq_ignore_ascii_case(&root))?;
+        return crate::edge::answer(edge, &key, response, false, String::new(), None).await;
     }
     wrap_error(
         &format!("No active header at height {height} ; unable to verify root"),
@@ -580,6 +620,7 @@ fn v2_valid_hash(h: &str) -> bool {
 async fn handle_v2(
     db: &worker::D1Database,
     env: &Env,
+    ctx: &Context,
     chain: &Chain,
     v2_path: &str,
     url: &url::Url,
@@ -625,8 +666,8 @@ async fn handle_v2(
             let mut settled = crate::edge::settled(tip, height, edge.line());
             if header.is_none() {
                 // Same fresh-block read-through grace as the v1 surface.
-                if ensure_fresh_header(db, env, chain, height).await?.is_some() {
-                    header = storage::served_header_for_height(db, height).await?;
+                if let Some(h) = ensure_fresh_header(db, env, ctx, chain, height).await? {
+                    header = Some(h);
                     settled = false;
                 }
             }

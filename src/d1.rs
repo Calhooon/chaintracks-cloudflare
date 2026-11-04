@@ -111,8 +111,8 @@ impl Query {
     }
 
     /// The statement text, exactly as it reaches the database (the host
-    /// harness runs and records it; the worker only ever `prepare`s).
-    #[cfg(test)]
+    /// harness runs and records it; the worker `prepare`s it, and the
+    /// writer lease's fence reads it, `sync::Fenced`).
     pub fn sql(&self) -> &str {
         &self.sql
     }
@@ -173,7 +173,13 @@ pub trait HeaderDb {
     /// One write; answers the rows it changed (D1 `meta.changes`).
     async fn execute(&self, q: Query) -> worker::Result<u32>;
     /// Up to 100 statements as ONE transaction (D1 `batch`).
-    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()>;
+    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+        self.batch_changes(stmts).await.map(|_| ())
+    }
+    /// #34 (lane/ct-34-b): `batch`, answering the rows each statement
+    /// changed (D1 `meta.changes`), so a write the fence carries in a batch
+    /// (`sync::Fenced`) still answers its own count.
+    async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>>;
 }
 
 /// The worker's database: each shape is the D1 call the storage layer made
@@ -197,13 +203,16 @@ impl HeaderDb for D1Database {
             .unwrap_or(0) as u32)
     }
 
-    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+    async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>> {
         let mut prepared = Vec::with_capacity(stmts.len());
         for q in stmts {
             prepared.push(q.prepare(self)?);
         }
-        D1Database::batch(self, prepared).await?;
-        Ok(())
+        Ok(D1Database::batch(self, prepared)
+            .await?
+            .iter()
+            .map(|r| r.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) as u32)
+            .collect())
     }
 }
 
