@@ -44,7 +44,9 @@ Three times answer three questions, each from the single `sync_state` row:
 
 On a quiet chain `lastSyncedAt` ages while `lastPassAt` stays a minute old; a
 stalled tracker ages both. A pass no courier answered, or one that failed,
-records `lastSyncError` and `lastSyncErrorAt` and leaves `lastPassAt`.
+records `lastSyncError` and `lastSyncErrorAt` and leaves `lastPassAt`; so
+does a pass whose writer lease lapsed under it (#34), with the lapse as
+its fault.
 
 The load: one `UPDATE` of the `sync_state` row a pass, 1,440 D1 writes a day
 at the minute cron, bounded by the cron and not by the chain. It is the one
@@ -115,9 +117,13 @@ no lease across its own life (#34): it reads the blocks through the
 ladder, judges them by the node's rules on the stored chain without a
 write, answers from the judged header, and hands the run to the push's
 door after its answer (the Worker's `waitUntil`), where each header takes
-the lease for its own write, a busy door is asked again 9 times 2 s apart,
-and a header still turned away is dropped with its line
-(`read-through: DROPPED ...`). The run handed stands on a stored row, so
+the lease for its own write, a busy door is asked again 2 s apart (9 times
+over the run), and a run still turned away is dropped with its line
+(`read-through: DROPPED ...`) and recorded in `lastSyncError`. The run
+holds one budget (#38): 20 s for its asks, waits and sends together,
+inside `waitUntil`'s 30 s, each courier read and webhook POST cut at 5 s;
+what it leaves the poll lands. The door gives the lease back before it
+sends the tip's webhooks. The run handed stands on a stored row, so
 no courier is read while the door holds the lease. A caller that goes
 away (a client's deadline) cancels a request that holds nothing. A block
 that does not stand on the stored tip (the network reorged) answers
