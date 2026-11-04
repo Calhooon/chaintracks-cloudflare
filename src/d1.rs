@@ -180,6 +180,10 @@ pub trait HeaderDb {
     /// changed (D1 `meta.changes`), so a write the fence carries in a batch
     /// (`sync::Fenced`) still answers its own count.
     async fn batch_changes(&self, stmts: Vec<Query>) -> worker::Result<Vec<u32>>;
+    /// #34 (round 3): a leased writer read its lease's term spent before a
+    /// write it then did not make (`sync::heal_links`). A store that fences
+    /// its writes (`sync::Fenced`) records the lapse; any other ignores it.
+    fn note_lapse(&self) {}
 }
 
 /// The worker's database: each shape is the D1 call the storage layer made
