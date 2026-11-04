@@ -1488,10 +1488,12 @@ pub(crate) struct Fetched {
     /// The header at the height asked, when the whole run passed the node's
     /// rules on the stored chain (`storage::judge_above`).
     pub answer: Option<BlockHeader>,
-    /// The run goes to the push's door (`push::hand_over`): it passed, or
-    /// the rules could not judge it here (its parent is not the stored tip:
-    /// the store moved, or the network reorged; the door's parent walk
-    /// judges it). A run a rule refused is not handed.
+    /// The run goes to the push's door (`push::hand_over`): it passed, so
+    /// it stands on a stored row and the door's parent walk reads no
+    /// courier; its hold of the lease is the write alone. A run the rules
+    /// could not judge here (it does not stand on the stored tip: the
+    /// network reorged) is not handed, nor one a rule refused: the cron's
+    /// pass and the push land a reorg, and the request reads nothing more.
     pub hand: bool,
 }
 
@@ -1511,7 +1513,9 @@ pub(crate) struct Fetched {
 /// hands the run to the push's door (`push::hand_over`) off its own life
 /// (`ctx.wait_until` on the Worker): the door takes the lease for one
 /// header's write at a time, asks again while it is held and drops with
-/// its line after its asks, as a tip event does.
+/// its line after its asks, as a tip event does. Only a run that passed is
+/// handed: it stands on a stored row, so no courier is read while the door
+/// holds the lease.
 pub(crate) async fn read_through(
     db: &impl HeaderDb,
     params: &ChainParams,
@@ -1540,11 +1544,11 @@ pub(crate) async fn read_through(
             hand: true,
         },
         storage::Judged::Unjudged(why) => {
-            log!("read-through: {why}; the door judges the run");
+            log!("read-through: {why}; unverified for now, the pass lands it");
             Fetched {
                 run,
                 answer: None,
-                hand: true,
+                hand: false,
             }
         }
         storage::Judged::Refused(e) => {
