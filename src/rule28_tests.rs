@@ -6,7 +6,7 @@
 //! was RED at `62cf619` and is green at the commit that names it.
 use crate::couriers::{CourierLadder, RUNG_FAULT_CAP};
 use crate::host_harness::{
-    block_hash, flags, header, regtest, RecordedWebhooks, ScriptedChain, SqliteDb,
+    block_hash, flags, header, regtest, FakeClock, RecordedWebhooks, ScriptedChain, SqliteDb,
 };
 use crate::push::hand_over;
 use crate::storage::insert_header;
@@ -211,7 +211,16 @@ async fn read_through_and_hand(
         .await
         .unwrap();
     if fetched.hand {
-        hand_over(db, regtest(), ladder, hooks, fetched.run, 0, || async {}).await;
+        hand_over(
+            db,
+            regtest(),
+            ladder,
+            hooks,
+            fetched.run,
+            0,
+            &FakeClock::at(0),
+        )
+        .await;
     }
     fetched.answer.map(|_| ())
 }

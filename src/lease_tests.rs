@@ -10,16 +10,16 @@ use std::rc::Rc;
 
 use crate::consensus::ChainParams;
 use crate::host_harness::{
-    block_hash, header, Guard, RecordedWebhooks, Recorder, ScriptedChain, SqliteDb,
+    block_hash, header, FakeClock, Guard, RecordedWebhooks, Recorder, ScriptedChain, SqliteDb,
 };
-use crate::push::{hand_over, ingest_announced};
+use crate::push::{hand_over, ingest_announced, HAND_OVER_BUDGET_MS, SEND_TIMEOUT_MS};
 use crate::storage::{
     self, find_chain_tip, find_header_for_height, insert_header, update_chain_tip_to_highest,
     SQL_INSERT_HEADER,
 };
 use crate::sync::{
     admin_ingest_write, backfill_write, bulk_write, read_through, run_cron, run_pushed_tick,
-    set_lease_term, ChainSource,
+    set_lease_term, ChainSource, TipWebhooks, WebhookDelivery, WebhookTarget,
 };
 use crate::tip_stream::{
     poll_due, through_the_lease, PollState, StreamState, BUSY_TRIES, HEARTBEAT_S, POLL_QUIET_S,
@@ -178,7 +178,16 @@ async fn read_through_to(db: &impl crate::d1::HeaderDb, source: &ScriptedChain, 
             .await
             .unwrap();
         if fetched.hand {
-            hand_over(db, params(), source, &hooks, fetched.run, 2, || async {}).await;
+            hand_over(
+                db,
+                params(),
+                source,
+                &hooks,
+                fetched.run,
+                2,
+                &FakeClock::at(T0),
+            )
+            .await;
         }
     }
 }
@@ -265,7 +274,7 @@ async fn the_read_through_and_the_pass_race_on_one_height_under_the_lease() {
 
 /// Item 1: `/admin/bulk-sync`'s write (`sync::bulk_write`) holds the lease
 /// over every row it writes, and finding it held writes nothing and says
-/// so (`None`: the route answers 503, run again). To red:
+/// so (`Err` with the reason: the route answers 503, run again). To red:
 /// `sync::bulk_write`, the lease not taken.
 #[tokio::test]
 async fn the_bulk_sync_write_takes_the_lease() {
@@ -274,11 +283,16 @@ async fn the_bulk_sync_write_takes_the_lease() {
     held_elsewhere(&db);
     let g = Guard::new(&db, &db, "bulk-sync");
     let answer = bulk_write(&g, params(), &c[3..]).await.unwrap();
-    assert_eq!(answer, None, "the lease held elsewhere: nothing written");
+    assert!(
+        answer
+            .as_ref()
+            .is_err_and(|why| why.contains("another writer holds the store")),
+        "the lease held elsewhere: nothing written: {answer:?}"
+    );
     assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
     give_back(&db);
     let answer = bulk_write(&g, params(), &c[3..]).await.unwrap();
-    assert_eq!(answer, Some(18));
+    assert_eq!(answer, Ok(18));
     assert_eq!(g.unleased(), Vec::<String>::new());
     assert_eq!(off_chain(&db, &c).await, None);
 }
@@ -433,6 +447,14 @@ async fn a_push_still_busy_after_its_tries_is_logged_and_counted_once() {
 /// progress recorded; the chain ends linked and served, and no write of the
 /// `headers` table lands outside the lease or past its term. To red:
 /// `sync::heal_links`, the term not read.
+///
+/// The pass count holds whatever the clock (#34 round 3, Read A2's F1 on
+/// PR #36): the lease is stored in whole seconds, so a 2 s term leaves
+/// 2001 to 3000 ms at its take. The heal goes on at a check only with at
+/// least half the term and twice its longest step left (1000 + 2 * 350
+/// ms: a step is ten 35 ms reads), and the check after `k` steps finds at
+/// most 3000 - 350 * k ms left, so a pass reads at most 40 heights and the
+/// 120 missing ones take 3 passes at least.
 #[tokio::test]
 async fn a_heal_over_300_broken_heights_stays_inside_a_2_s_term() {
     let c = branch(&[root()], 0, 311, "#34 heal");
@@ -462,7 +484,7 @@ async fn a_heal_over_300_broken_heights_stays_inside_a_2_s_term() {
     set_lease_term(None);
     assert_eq!(unleased, Vec::<String>::new(), "after {passes} passes");
     assert_eq!(off_chain(&db, &c).await, None, "after {passes} passes");
-    assert!(passes > 3, "the heal spread over passes: {passes}");
+    assert!(passes >= 3, "the heal spread over passes: {passes}");
 }
 
 // ─── The fix round (lane/ct-34-b) on PR #36 ─────────────────────────────────
@@ -703,24 +725,31 @@ async fn heal_passes(
 }
 
 /// R2 (Read B on PR #36, `sync.rs:1008` at 7b1c2d5): rival rows active over
-/// `c11 ..= c40` (a branch `r` whose lowest row names no stored block, so
-/// two links break: at `c10` and at `c40`, which `c41` names), the
-/// network's `c41 ..= c50` above them, a courier read taking 35 ms, a 2 s
+/// `c11 ..= c60` (a branch `r` whose lowest row names no stored block, so
+/// two links break: at `c10` and at `c60`, which `c61` names), the
+/// network's `c61 ..= c70` above them, a courier read taking 35 ms, a 2 s
 /// term. The heal yields pass after pass; each yield keeps what it read,
 /// so the next pass goes on from it, and the chain ends linked and served
-/// within 12 passes with no write outside the lease. At 7b1c2d5 a yielded
+/// within 20 passes with no write outside the lease. At 7b1c2d5 a yielded
 /// run over the rival rows ended `storedInactive` and every pass read the
 /// same heights again with no progress.
+///
+/// #34 round 3 (Read A2's F1 on PR #36: 12 of 30 runs failed alone): the
+/// yield holds whatever the clock. The lease is stored in whole seconds,
+/// so a 2 s term leaves 2001 to 3000 ms at its take, and a pass reads at
+/// most 40 heights (`a_heal_over_300_broken_heights_stays_inside_a_2_s_term`
+/// has the arithmetic). The band was 30 heights, which a term taken early
+/// in its second read whole in one pass; it is 50 now, which no term can.
 #[tokio::test]
 async fn a_heal_over_rival_active_rows_moves_pass_after_pass() {
-    let c = branch(&[root()], 0, 50, "#34b network");
+    let c = branch(&[root()], 0, 70, "#34b network");
     let db = linked_store(&c[..=10]).await;
     let mut rival = vec![header(
         X + 11,
         "#34b rival 11",
         &block_hash("nobody has it"),
     )];
-    for i in 12..=40 {
+    for i in 12..=60 {
         let parent = rival[rival.len() - 1].hash.clone();
         rival.push(header(X + i, &format!("#34b rival {i}"), &parent));
     }
@@ -732,7 +761,7 @@ async fn a_heal_over_rival_active_rows_moves_pass_after_pass() {
         .unwrap()
         .unwrap()
         .chain_work;
-    for h in rival.iter().chain(&c[41..]) {
+    for h in rival.iter().chain(&c[61..]) {
         work = crate::types::add_work(&work, &crate::types::calculate_work(h.bits));
         raw_row_worked(&db, h, true, &work);
     }
@@ -744,13 +773,13 @@ async fn a_heal_over_rival_active_rows_moves_pass_after_pass() {
             .iter()
             .map(|b| b.height - X)
             .collect::<Vec<_>>(),
-        vec![10, 40],
+        vec![10, 60],
         "{report:?}"
     );
     let source = published(&c);
     source.set_delay_ms(35);
     set_lease_term(Some(2));
-    let (passes, unleased) = heal_passes(&db, &c, &source, 12).await;
+    let (passes, unleased) = heal_passes(&db, &c, &source, 20).await;
     set_lease_term(None);
     assert_eq!(unleased, Vec::<String>::new(), "after {passes} passes");
     assert_eq!(off_chain(&db, &c).await, None, "after {passes} passes");
@@ -864,4 +893,250 @@ async fn a_refused_push_is_a_hint_to_poll_never_the_present_height() {
         ]
     );
     assert_eq!(off_chain(&db, &net).await, None);
+}
+
+// ─── Round 3 (lane/ct-34-c) on PR #36: #38 and the two lows ────────────────
+
+const CONSUMER: &str = "https://consumer.example/internal/tip-changed";
+
+/// A consumer of the tip's webhooks that notes, at each send, who holds the
+/// writer lease (the seam: what the door holds while it sends); with
+/// `hangs`, it never answers.
+struct Consumer<'a> {
+    db: &'a SqliteDb,
+    inner: RecordedWebhooks,
+    held_at_send: RefCell<Vec<Option<String>>>,
+    hangs: bool,
+}
+
+impl<'a> Consumer<'a> {
+    fn new(db: &'a SqliteDb, hangs: bool) -> Self {
+        Self {
+            db,
+            inner: RecordedWebhooks::new(CONSUMER, "bearer"),
+            held_at_send: RefCell::new(Vec::new()),
+            hangs,
+        }
+    }
+}
+
+impl TipWebhooks for Consumer<'_> {
+    fn targets(&self) -> Vec<WebhookTarget> {
+        self.inner.targets()
+    }
+
+    fn token(&self) -> String {
+        self.inner.token()
+    }
+
+    async fn post(&self, target: &WebhookTarget, token: &str, body: &str) -> WebhookDelivery {
+        self.held_at_send.borrow_mut().push(live_lease(self.db));
+        if self.hangs {
+            std::future::pending::<()>().await;
+        }
+        self.inner.post(target, token, body).await
+    }
+}
+
+fn last_error(db: &SqliteDb) -> Option<String> {
+    db.conn()
+        .query_row("SELECT last_error FROM sync_state WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+/// #38 (Read A2's F2 and Read B2's F1 on PR #36): the door gives the
+/// writer lease back before it sends the tip's webhooks, through the
+/// read-through's hand-off and through the tip stream's push alike: at
+/// every send the lease is free. At eade8cb the sends ran inside the hold
+/// (`ingest_held`), with no timeout, inside `waitUntil`'s 30 s.
+#[tokio::test]
+async fn the_door_gives_the_lease_back_before_the_tip_webhooks_are_sent() {
+    let c = branch(&[root()], 0, 6, "#38 seam");
+    let db = linked_store(&c[..=2]).await;
+    let source = published(&c);
+    let consumer = Consumer::new(&db, false);
+    let landed = hand_over(
+        &db,
+        params(),
+        &source,
+        &consumer,
+        c[3..=5].to_vec(),
+        9,
+        &FakeClock::at(T0),
+    )
+    .await;
+    assert_eq!(landed, 3);
+    let answer = ingest_announced(&db, params(), &source, &consumer, c[6].clone())
+        .await
+        .unwrap();
+    assert_eq!(answer.outcome, "active");
+    assert_eq!(*consumer.held_at_send.borrow(), vec![None; 4]);
+    assert_eq!(consumer.inner.take().len(), 4);
+    assert_eq!(off_chain(&db, &c).await, None);
+}
+
+/// #38: a consumer that never answers is cut at `SEND_TIMEOUT_MS` a send,
+/// and the hand-off's one budget holds the whole run under a fake clock:
+/// six headers, each landing and its send cut at 5 s, so the fifth finds
+/// the 20 s spent and the run stops there, recording the two heights left
+/// (`lastSyncError`); the lease is free at every send and after; the
+/// cron's next pass lands the rest. At eade8cb a send had no timeout, and
+/// the run's asks and waits had no bound but the tries of each header.
+#[tokio::test]
+async fn a_hand_off_send_that_hangs_is_cut_and_the_run_keeps_its_budget() {
+    let c = branch(&[root()], 0, 8, "#38 hangs");
+    let db = linked_store(&c[..=2]).await;
+    let source = published(&c);
+    let consumer = Consumer::new(&db, true);
+    let clock = FakeClock::at(T0);
+    let landed = hand_over(
+        &db,
+        params(),
+        &source,
+        &consumer,
+        c[3..].to_vec(),
+        9,
+        &clock,
+    )
+    .await;
+    use crate::push::Clock;
+    let spent = clock.now_ms() - T0;
+    assert_eq!(landed as u64, HAND_OVER_BUDGET_MS / SEND_TIMEOUT_MS);
+    assert!(spent <= HAND_OVER_BUDGET_MS, "{spent} ms");
+    assert_eq!(*consumer.held_at_send.borrow(), vec![None; 4]);
+    assert_eq!(live_lease(&db), None);
+    let fault = last_error(&db).unwrap_or_default();
+    assert!(
+        fault.contains(&format!(
+            "read-through: DROPPED the hand-off at {} ({}..={}, 2 header(s))",
+            c[7].hash, c[7].height, c[8].height
+        )),
+        "{fault}"
+    );
+    assert!(cron_pass(&db, &source).await);
+    assert_eq!(off_chain(&db, &c).await, None);
+}
+
+/// #38: a hand-off behind a lease held elsewhere stops inside its budget,
+/// whatever its tries: no wait begun that would end past
+/// `HAND_OVER_BUDGET_MS`, nothing written, the run recorded as left for
+/// the poll.
+#[tokio::test]
+async fn a_hand_off_behind_a_held_lease_stops_inside_its_budget() {
+    let c = branch(&[root()], 0, 8, "#38 held");
+    let db = linked_store(&c[..=2]).await;
+    held_elsewhere(&db);
+    let source = published(&c);
+    let consumer = Consumer::new(&db, false);
+    let clock = FakeClock::at(T0);
+    let landed = hand_over(
+        &db,
+        params(),
+        &source,
+        &consumer,
+        c[3..].to_vec(),
+        100,
+        &clock,
+    )
+    .await;
+    use crate::push::Clock;
+    let spent = clock.now_ms() - T0;
+    assert_eq!(landed, 0);
+    assert!(spent <= HAND_OVER_BUDGET_MS, "{spent} ms");
+    assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
+    let fault = last_error(&db).unwrap_or_default();
+    assert!(fault.contains("6 header(s)"), "{fault}");
+}
+
+/// A ladder that lets the lease lapse under its holder at its first read
+/// by hash (the heal's).
+struct Lapsing<'a> {
+    inner: &'a ScriptedChain,
+    db: &'a SqliteDb,
+}
+
+impl ChainSource for Lapsing<'_> {
+    async fn chain_info(&self) -> worker::Result<crate::woc::WocChainInfo> {
+        self.inner.chain_info().await
+    }
+
+    async fn header_by_height(&self, height: u32) -> worker::Result<BlockHeader> {
+        self.inner.header_by_height(height).await
+    }
+
+    async fn header_by_hash(&self, hash: &str) -> worker::Result<BlockHeader> {
+        lapse(self.db, false);
+        self.inner.header_by_hash(hash).await
+    }
+}
+
+fn last_pass_at(db: &SqliteDb) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT last_pass_at FROM sync_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Read A2's F3 on PR #36: a pass whose lease lapses mid-heal (the heal
+/// goes on past its faults, so the pass reached its end) is no completed
+/// pass: `lastPassAt` stays where it stood, the lapse is the fault
+/// recorded, and the pass answers it. At eade8cb it was stamped as a
+/// completed pass.
+#[tokio::test]
+async fn a_pass_whose_lease_lapses_mid_heal_is_no_completed_pass() {
+    let c = branch(&[root()], 0, 20, "#34c lapse");
+    let db = linked_store(&c[..=10]).await;
+    for h in &c[13..] {
+        raw_row(&db, h, true);
+    }
+    update_chain_tip_to_highest(&db).await.unwrap();
+    let source = published(&c);
+    let lapsing = Lapsing {
+        inner: &source,
+        db: &db,
+    };
+    let ran = run_cron(
+        &db,
+        params(),
+        &lapsing,
+        None,
+        &RecordedWebhooks::new("", ""),
+    )
+    .await;
+    assert!(ran.is_err(), "{ran:?}");
+    assert_eq!(last_pass_at(&db), None);
+    let fault = last_error(&db).unwrap_or_default();
+    assert!(fault.contains("the writer lease lapsed"), "{fault}");
+    // The next pass heals and is stamped.
+    give_back(&db);
+    assert!(cron_pass(&db, &source).await);
+    assert!(last_pass_at(&db).is_some());
+    assert_eq!(off_chain(&db, &c).await, None);
+}
+
+/// Read A2's F4 on PR #36: `/admin/bulk-sync` whose lease lapses under its
+/// write answers with the lapse as its reason (`Err`: the route's 503, as
+/// for a held lease), not as a refused batch (422 at eade8cb); nothing is
+/// written past the lapse.
+#[tokio::test]
+async fn a_bulk_sync_whose_lease_lapses_answers_the_lapse() {
+    let c = branch(&[root()], 0, 20, "#34c bulk");
+    let db = linked_store(&c[..=2]).await;
+    let rec = Recorder::new(&db);
+    rec.after_read(1, |db| async move { lapse(db, false) });
+    let g = Guard::new(&rec, &db, "bulk-sync");
+    let answer = bulk_write(&g, params(), &c[3..]).await.unwrap();
+    assert!(
+        answer
+            .as_ref()
+            .is_err_and(|why| why.contains("the writer lease lapsed")),
+        "{answer:?}"
+    );
+    assert_eq!(g.unleased(), Vec::<String>::new());
+    assert_eq!(find_chain_tip(&db).await.unwrap().unwrap().height, X + 2);
 }

@@ -562,6 +562,31 @@ impl TipWebhooks for RecordedWebhooks {
     }
 }
 
+/// #38: a clock that moves only when it is slept on: a sleep of `ms` moves
+/// it `ms` on and ends at once, so a hand-off's budget and its timeouts run
+/// in no wall time and the same every run.
+pub(crate) struct FakeClock {
+    now: Cell<u64>,
+}
+
+impl FakeClock {
+    pub fn at(now: u64) -> Self {
+        Self {
+            now: Cell::new(now),
+        }
+    }
+}
+
+impl crate::push::Clock for FakeClock {
+    fn now_ms(&self) -> u64 {
+        self.now.get()
+    }
+
+    async fn sleep(&self, ms: u64) {
+        self.now.set(self.now.get() + ms);
+    }
+}
+
 // ─── Chain fixtures ─────────────────────────────────────────────────────────
 
 /// A 64-hex block hash, unique per label: the real shape, so nothing on the

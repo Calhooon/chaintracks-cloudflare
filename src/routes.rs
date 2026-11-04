@@ -442,11 +442,7 @@ async fn ensure_fresh_header(
                 &env,
                 run,
                 READ_THROUGH_TRIES,
-                || {
-                    worker::Delay::from(std::time::Duration::from_millis(
-                        crate::tip_stream::BUSY_WAIT_MS,
-                    ))
-                },
+                &WorkerClock,
             )
             .await;
             worker::console_log!(
@@ -464,9 +460,23 @@ async fn ensure_fresh_header(
 }
 
 /// #34 (lane/ct-34-b): the asks of a read-through's hand-off after a busy
-/// door, `tip_stream::BUSY_WAIT_MS` apart: 18 s of waits, inside the 30 s a
-/// Worker's `waitUntil` runs after its answer.
+/// door, `tip_stream::BUSY_WAIT_MS` apart. #38: over the whole run, not per
+/// header, and inside the run's one budget (`push::HAND_OVER_BUDGET_MS`, 20
+/// s of the 30 s a Worker's `waitUntil` runs after its answer).
 const READ_THROUGH_TRIES: u32 = 9;
+
+/// #38: the Worker's clock, for the hand-off's budget and its timeouts.
+struct WorkerClock;
+
+impl crate::push::Clock for WorkerClock {
+    fn now_ms(&self) -> u64 {
+        worker::Date::now().as_millis()
+    }
+
+    async fn sleep(&self, ms: u64) {
+        worker::Delay::from(std::time::Duration::from_millis(ms)).await
+    }
+}
 
 async fn find_header_hex_for_block_hash(
     db: &worker::D1Database,
@@ -1044,15 +1054,14 @@ async fn admin_bulk_sync(
     // Batch insert (P0-4: refused whole when any header fails the node's
     // rules), the dual-active sweep and the tip (`sync::bulk_write`).
     let params = crate::sync::chain_params(env, chain)?;
-    let inserted =
-        match crate::sync::bulk_write(db, &params, &headers).await {
-            Ok(Some(n)) => n,
-            Ok(None) => return wrap_error(
-                "another writer holds the store (the writer lease); nothing was written, run again",
-                503,
-            ),
-            Err(e) => return wrap_error(&format!("{e}"), 422),
-        };
+    // #34: the writer lease turned it away (held elsewhere, or its term
+    // lapsed under the write: round 3, Read A2's F4 on PR #36): 503 with
+    // the reason, as the other leased operator writes answer.
+    let inserted = match crate::sync::bulk_write(db, &params, &headers).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(why)) => return wrap_error(&why, 503),
+        Err(e) => return wrap_error(&format!("{e}"), 422),
+    };
 
     wrap_success(serde_json::json!({
         "file": file_name,

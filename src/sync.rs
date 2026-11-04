@@ -119,8 +119,9 @@ pub(crate) async fn run_pushed_tick(
         log!("Cron: another writer holds the store (the writer lease); this tick writes nothing");
         return Ok(());
     }
-    let result =
-        run_pushed_tick_held(&Fenced::new(db, &lease), params, source, hooks, &lease).await;
+    let fenced = Fenced::new(db, &lease);
+    let held = run_pushed_tick_held(&fenced, params, source, hooks, &lease).await;
+    let result = fenced.close(held).await;
     release_lease(db, lease).await;
     result
 }
@@ -131,7 +132,7 @@ async fn run_pushed_tick_held(
     source: &impl ChainSource,
     hooks: &impl TipWebhooks,
     lease: &Lease,
-) -> Result<()> {
+) -> Result<Pass> {
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
     // #30: the link state is read on this tick too. #31 (Read B's Q1): and
@@ -146,9 +147,9 @@ async fn run_pushed_tick_held(
     }
     finish_sync(db, hooks, None).await;
     // #27: a tick the push covers is a completed pass too (the push is the
-    // sync source while it is live), so `lastPassAt` stays a minute old.
-    stamp_pass(db).await;
-    Ok(())
+    // sync source while it is live), so `lastPassAt` stays a minute old
+    // (`Fenced::close` stamps it).
+    Ok(Pass::Completed)
 }
 
 /// #31 (#32 ask 1): the writer lease's term, in seconds. A cron pass, a tick
@@ -283,6 +284,29 @@ impl<'a, D: HeaderDb> Fenced<'a, D> {
         .any(|head| sql.starts_with(head))
     }
 
+    /// #34 (round 3, Read A2's F3 on PR #36): the end of a pass or a tick
+    /// under this lease. A completed one is stamped (`lastPassAt`, #27);
+    /// one whose lease lapsed under it is no completed pass, whatever leg
+    /// the lapse cut (the heal, the link leg and the work repair go on
+    /// past their faults): it is not stamped, the lapse stays the last
+    /// fault recorded (a later leg's fault may have replaced it), and it
+    /// answers the lapse. The lapse is the fence's refusal, or the heal's
+    /// read of a spent term before a write it did not make
+    /// (`HeaderDb::note_lapse`); no read is added to the pass.
+    async fn close(&self, pass: Result<Pass>) -> Result<()> {
+        let pass = pass?;
+        if let (true, Some(owner)) = (self.lapsed.get(), self.owner) {
+            let text = lapse_text(owner);
+            log_error!("{text}");
+            record_fault(self.inner, &text).await;
+            return Err(lapsed(owner));
+        }
+        if pass == Pass::Completed {
+            stamp_pass(self.inner).await;
+        }
+        Ok(())
+    }
+
     /// `stmts` behind the fence, answering each one's changed rows.
     async fn fenced(&self, owner: &str, stmts: Vec<crate::d1::Query>) -> Result<Vec<u32>> {
         if self.lapsed.get() {
@@ -301,16 +325,21 @@ impl<'a, D: HeaderDb> Fenced<'a, D> {
                     return Err(e);
                 }
                 self.lapsed.set(true);
-                let text = format!(
-                    "{owner}: the writer lease lapsed (its term passed, or another writer took it): \
-                     this writer stops here; the rows it wrote stand and the next writer goes on from them"
-                );
+                let text = lapse_text(owner);
                 log_error!("{text}");
                 record_fault(self.inner, &text).await;
                 Err(lapsed(owner))
             }
         }
     }
+}
+
+/// The fault a lapse records (`lastSyncError`).
+fn lapse_text(owner: &str) -> String {
+    format!(
+        "{owner}: the writer lease lapsed (its term passed, or another writer took it): \
+         this writer stops here; the rows it wrote stand and the next writer goes on from them"
+    )
 }
 
 fn lapsed(owner: &str) -> Error {
@@ -349,6 +378,12 @@ impl<D: HeaderDb> HeaderDb for Fenced<'_, D> {
                 self.fenced(owner, stmts).await
             }
             _ => self.inner.batch_changes(stmts).await,
+        }
+    }
+
+    fn note_lapse(&self) {
+        if self.owner.is_some() {
+            self.lapsed.set(true);
         }
     }
 }
@@ -603,15 +638,9 @@ pub(crate) async fn run_cron(
         log!("Cron: another writer holds the store (the writer lease); this pass writes nothing");
         return Ok(false);
     }
-    let result = run_cron_held(
-        &Fenced::new(db, &lease),
-        params,
-        source,
-        upstream_url,
-        hooks,
-        &lease,
-    )
-    .await;
+    let fenced = Fenced::new(db, &lease);
+    let held = run_cron_held(&fenced, params, source, upstream_url, hooks, &lease).await;
+    let result = fenced.close(held).await;
     release_lease(db, lease).await;
     result.map(|()| true)
 }
@@ -623,7 +652,7 @@ async fn run_cron_held(
     upstream_url: Option<&str>,
     hooks: &impl TipWebhooks,
     lease: &Lease,
-) -> Result<()> {
+) -> Result<Pass> {
     let result = run_cron_inner(db, params, source, upstream_url, hooks, lease).await;
     match source.finish_observations(db, params).await {
         Ok(true) => announce_tip(db, hooks, None).await,
@@ -634,13 +663,10 @@ async fn run_cron_held(
         }
     }
     // #27: the stamp is the pass's last write, and only a completed pass
-    // writes it: a pass that failed (an error, the observations' fault) or
-    // that no courier answered records its fault as before and leaves
-    // `last_pass_at` where it stood.
-    if result? == Pass::Completed {
-        stamp_pass(db).await;
-    }
-    Ok(())
+    // writes it (`Fenced::close`): a pass that failed (an error, the
+    // observations' fault) or that no courier answered records its fault as
+    // before and leaves `last_pass_at` where it stood.
+    result
 }
 
 async fn run_cron_inner(
@@ -1163,6 +1189,7 @@ async fn heal_links(
                 "Cron: link heal: the lease's term ran out before the write; {} heights read, nothing written",
                 read.len()
             );
+            db.note_lapse();
             break 'breaks;
         }
         let at = broken.height;
@@ -1589,22 +1616,33 @@ pub(crate) async fn fetch_span(source: &impl ChainSource, from: u32, to: u32) ->
 /// them), the dual-active sweep this path can need (review M-3; otherwise
 /// only the catch-up runs it), and the tip chosen after it (#32). Answers
 /// the rows inserted. #34: under the writer lease, as the cron's pass;
-/// `None` when another writer holds it (nothing written; the route says so
-/// and the operator runs it again). A span of 100,000 rows can write past
-/// the lease's term (`LEASE_S`), as a long catch-up can.
+/// `Err` with the reason when the lease turned it away: another writer
+/// holds it (nothing written), or (round 3, Read A2's F4 on PR #36) its
+/// term lapsed under the write (a span of 100,000 rows can write past
+/// `LEASE_S`, as a long catch-up can): the fence stopped it, the chunks
+/// written before stand, and the route answers 503 with the reason, as
+/// for a held lease; the operator runs it again.
 pub(crate) async fn bulk_write(
     db: &impl HeaderDb,
     params: &ChainParams,
     headers: &[BlockHeader],
-) -> Result<Option<u32>> {
+) -> Result<std::result::Result<u32, String>> {
     let lease = take_lease(db, "bulk-sync").await;
     if let Lease::Busy = lease {
         log!("bulk-sync: another writer holds the store (the writer lease); nothing written");
-        return Ok(None);
+        return Ok(Err(
+            "another writer holds the store (the writer lease); nothing was written, run again"
+                .to_string(),
+        ));
     }
-    let result = bulk_write_held(&Fenced::new(db, &lease), params, headers).await;
+    let fenced = Fenced::new(db, &lease);
+    let result = bulk_write_held(&fenced, params, headers).await;
+    let lapse = fenced.owner.filter(|_| fenced.lapsed.get()).map(lapse_text);
     release_lease(db, lease).await;
-    result.map(Some)
+    match (result, lapse) {
+        (Err(_), Some(text)) => Ok(Err(format!("{text}; run again"))),
+        (result, _) => result.map(Ok),
+    }
 }
 
 async fn bulk_write_held(
