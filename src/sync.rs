@@ -1410,6 +1410,33 @@ async fn bulk_write_held(
     Ok(inserted)
 }
 
+/// `POST /admin/ingest`'s write (`storage::ingest_pushed`, the function the
+/// heal runs). `None`: another writer holds the store, nothing written.
+pub(crate) async fn admin_ingest_write(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> std::result::Result<Option<storage::IngestOutcome>, storage::IngestError> {
+    storage::ingest_pushed(db, params, headers).await.map(Some)
+}
+
+/// `/admin/backfill`'s write of the span it fetched (the batch through the
+/// node's rules), and the heights where another row stays active
+/// (`leftInactive`). `None`: another writer holds the store, nothing written.
+pub(crate) async fn backfill_write(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> Result<Option<(u32, Vec<u32>)>> {
+    let inserted = if headers.is_empty() {
+        0
+    } else {
+        storage::insert_headers_batch(db, params, headers).await?
+    };
+    let left_inactive = storage::heights_not_served(db, headers).await?;
+    Ok(Some((inserted, left_inactive)))
+}
+
 /// A PEER header service: another service speaking the header protocol, asked
 /// for a run of headers by `getHeaders` (the worker's is our own upstream,
 /// `UPSTREAM_CHAINTRACKS_URL`; the host suite scripts one). A peer is a

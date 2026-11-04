@@ -248,10 +248,13 @@ impl<'a, D: HeaderDb> Guard<'a, D> {
         self.unleased.borrow().clone()
     }
 
-    fn check(&self, sql: &str) {
+    /// Why a write of `sql` would land outside this writer's lease, read
+    /// before it is handed on; `None` when it is not a `headers` write or it
+    /// stands inside the lease.
+    fn check(&self, sql: &str) -> Option<String> {
         if !(sql.starts_with("INSERT OR IGNORE INTO headers") || sql.starts_with("UPDATE headers "))
         {
-            return;
+            return None;
         }
         let (owner, left_ms): (Option<String>, Option<f64>) = self
             .store
@@ -272,11 +275,17 @@ impl<'a, D: HeaderDb> Guard<'a, D> {
             }
             (Some(_), o, _) => Some(format!("the lease is {o:?}'s")),
         };
-        if let Some(why) = why {
+        why.map(|why| {
             let head: String = sql.chars().take(48).collect();
-            self.unleased
-                .borrow_mut()
-                .push(format!("{}: {why}: {head}", self.role));
+            format!("{}: {why}: {head}", self.role)
+        })
+    }
+
+    /// #34 (lane/ct-34-b): a write counts once it lands; a transaction the
+    /// fence rolled back (`sync::FENCE_SQL`) wrote nothing.
+    fn landed<T>(&self, found: Vec<String>, result: &worker::Result<T>) {
+        if result.is_ok() {
+            self.unleased.borrow_mut().extend(found);
         }
     }
 }
@@ -306,15 +315,17 @@ impl<D: HeaderDb> HeaderDb for Guard<'_, D> {
             *self.held.borrow_mut() = None;
             return self.inner.execute(q).await;
         }
-        self.check(q.sql());
-        self.inner.execute(q).await
+        let found: Vec<String> = self.check(q.sql()).into_iter().collect();
+        let result = self.inner.execute(q).await;
+        self.landed(found, &result);
+        result
     }
 
     async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
-        for q in &stmts {
-            self.check(q.sql());
-        }
-        self.inner.batch(stmts).await
+        let found: Vec<String> = stmts.iter().filter_map(|q| self.check(q.sql())).collect();
+        let result = self.inner.batch(stmts).await;
+        self.landed(found, &result);
+        result
     }
 }
 
