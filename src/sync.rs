@@ -119,7 +119,7 @@ pub(crate) async fn run_pushed_tick(
         log!("Cron: another writer holds the store (the writer lease); this tick writes nothing");
         return Ok(());
     }
-    let result = run_pushed_tick_held(db, params, source, hooks).await;
+    let result = run_pushed_tick_held(db, params, source, hooks, &lease).await;
     release_lease(db, lease).await;
     result
 }
@@ -129,6 +129,7 @@ async fn run_pushed_tick_held(
     params: &ChainParams,
     source: &impl ChainSource,
     hooks: &impl TipWebhooks,
+    lease: &Lease,
 ) -> Result<()> {
     crate::events::timer(db, hooks.feed()).await?;
     revalidate(db, params).await;
@@ -138,7 +139,7 @@ async fn run_pushed_tick_held(
     // live push never let run. A linked chain asks no courier here.
     match storage::find_chain_tip(db).await {
         Ok(tip) => {
-            link_leg(db, params, Some(source), tip.as_ref()).await;
+            link_leg(db, params, Some(source), tip.as_ref(), lease).await;
         }
         Err(e) => log_error!("Cron: the link check's tip read failed: {e:?}"),
     }
@@ -201,7 +202,8 @@ pub(crate) enum Lease {
     Unserialized,
 }
 
-/// #31: ask for the writer lease as `role` (`cron`, `tick`, `push`): one
+/// #31: ask for the writer lease as `role` (`cron`, `tick`, `push`; #34:
+/// `read`, the read-through, and `bulk-sync`): one
 /// `UPDATE` that takes it only when it is free, expired or already this
 /// owner's. The owner is the role and eight random bytes, so two isolates
 /// never share one.
@@ -479,7 +481,7 @@ pub(crate) async fn run_cron(
         log!("Cron: another writer holds the store (the writer lease); this pass writes nothing");
         return Ok(false);
     }
-    let result = run_cron_held(db, params, source, upstream_url, hooks).await;
+    let result = run_cron_held(db, params, source, upstream_url, hooks, &lease).await;
     release_lease(db, lease).await;
     result.map(|()| true)
 }
@@ -490,8 +492,9 @@ async fn run_cron_held(
     source: &impl ChainSource,
     upstream_url: Option<&str>,
     hooks: &impl TipWebhooks,
+    lease: &Lease,
 ) -> Result<()> {
-    let result = run_cron_inner(db, params, source, upstream_url, hooks).await;
+    let result = run_cron_inner(db, params, source, upstream_url, hooks, lease).await;
     match source.finish_observations(db, params).await {
         Ok(true) => announce_tip(db, hooks, None).await,
         Ok(false) => {}
@@ -516,6 +519,7 @@ async fn run_cron_inner(
     source: &impl ChainSource,
     upstream_url: Option<&str>,
     hooks: &impl TipWebhooks,
+    lease: &Lease,
 ) -> Result<Pass> {
     // #32: age is emitted even when the source is unreachable. This timer
     // uses the verified served tip and deduplicates overlapping cron ticks.
@@ -600,7 +604,7 @@ async fn run_cron_inner(
         revalidate(db, params).await;
         // #30: the link leg on the tip read once (LOW-4); a heal moves the
         // tip, so the announce reads it again.
-        if link_leg(db, params, Some(source), tip.as_ref()).await {
+        if link_leg(db, params, Some(source), tip.as_ref(), lease).await {
             tip = None;
         }
         if let Some(r) = source.report() {
@@ -763,7 +767,7 @@ async fn run_cron_inner(
 
     let mut new_tip = storage::find_chain_tip(db).await?;
     // #30: the link leg; a heal moves the tip, so the announce reads it again.
-    if link_leg(db, params, Some(source), new_tip.as_ref()).await {
+    if link_leg(db, params, Some(source), new_tip.as_ref(), lease).await {
         new_tip = storage::find_chain_tip(db).await?;
     }
     let new_height = new_tip.as_ref().map_or(0, |t| t.height);
@@ -788,6 +792,55 @@ async fn run_cron_inner(
 /// height: the issue's hole was 70 deep; a deeper one heals over passes.
 pub(crate) const HEAL_SPAN: u32 = 100;
 
+/// #34: the heights a heal reads through the ladder between two reads of
+/// the lease's remaining term.
+pub(crate) const HEAL_STEP: u32 = 10;
+
+/// #34: the milliseconds left of the lease `?1` holds (it frees once the
+/// clock's second passes `lease_until`, `TAKE_LEASE_SQL`); no row when the
+/// lease is no longer this owner's.
+pub(crate) const LEASE_LEFT_SQL: &str = "SELECT (lease_until + 1) * 1000 - \
+     CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) AS left_ms \
+     FROM sync_state WHERE id = 1 AND lease_owner = ?1";
+
+/// #34: the remaining term of the pass's lease in ms: `None` for a writer
+/// that runs unserialized (no migration 0015; unbounded, as before the
+/// lease); 0 when the lease is no longer this owner's or cannot be read.
+async fn lease_left_ms(db: &impl HeaderDb, lease: &Lease) -> Option<i64> {
+    let Lease::Held(owner) = lease else {
+        return None;
+    };
+    #[derive(serde::Deserialize)]
+    struct Row {
+        left_ms: Option<f64>,
+    }
+    match crate::d1::Query::new(LEASE_LEFT_SQL)
+        .bind(owner.as_str())
+        .first::<Row>(db)
+        .await
+    {
+        Ok(row) => Some(row.and_then(|r| r.left_ms).map_or(0, |v| v as i64)),
+        Err(e) => {
+            log_error!("Cron: link heal: the lease's term could not be read: {e:?}");
+            Some(0)
+        }
+    }
+}
+
+/// Milliseconds since the epoch, from the Worker's clock (the host's in tests).
+fn clock_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Date::now().as_millis()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
+}
+
 /// #30: the most broken heights `linkState` lists (`brokenCount` counts all).
 const LINK_STATE_BROKEN_CAP: usize = 32;
 
@@ -797,12 +850,14 @@ const LINK_STATE_BROKEN_CAP: usize = 32;
 /// is broken and a `source` is given, the heal (`heal_links`) and the check
 /// again; then the answer recorded for `/getInfo` (`linkState`), written
 /// only when it changed. Loud and non-fatal, like the other legs. Answers
-/// whether the heal moved the chain.
+/// whether the heal moved the chain. `lease` is the pass's own (#34: the
+/// heal reads its remaining term).
 pub(crate) async fn link_leg(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: Option<&impl ChainSource>,
     tip: Option<&BlockHeader>,
+    lease: &Lease,
 ) -> bool {
     let Some(tip) = tip else {
         return false;
@@ -816,7 +871,7 @@ pub(crate) async fn link_leg(
     };
     let mut healed = false;
     if let (false, Some(source)) = (report.linked, source) {
-        healed = heal_links(db, params, source, &report).await;
+        healed = heal_links(db, params, source, &report, lease).await;
         if healed {
             let again = match storage::find_chain_tip(db).await {
                 Ok(Some(tip)) => storage::link_state(db, tip.height).await.map(Some),
@@ -853,11 +908,22 @@ pub(crate) async fn link_leg(
 /// goes BACK from a new tip, 36 at most: a hole deeper than that under the
 /// tip, or one no new tip reaches, was never healed without an operator.
 /// Answers whether the run landed; a fault is recorded (`lastSyncError`).
+///
+/// #34: the heal stays inside the lease's term. It reads `HEAL_STEP`
+/// heights at a time and, before each step, the lease's remaining term: it
+/// goes on while half the term and twice its longest step are left (half
+/// the term kept for the write and the rest of the pass), and otherwise
+/// stops reading and writes the run it has (its
+/// progress, recorded in `linkState` by the leg; the next pass goes on from
+/// there). The write itself waits on a term not yet spent. A 100-height heal
+/// on slow couriers (one read a height, up to three rungs) could outrun the
+/// 120 s term and write unserialized.
 async fn heal_links(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,
     report: &storage::LinkReport,
+    lease: &Lease,
 ) -> bool {
     let Some(lowest) = report.broken.first().map(|b| b.height) else {
         return false;
@@ -869,7 +935,45 @@ async fn heal_links(
     if end <= floor {
         return false;
     }
-    let fetched = fetch_span(source, floor + 1, end).await;
+    let term_ms = i64::from(lease_term()) * 1000;
+    let mut fetched = Vec::new();
+    let mut longest: i64 = 0;
+    let mut from = floor + 1;
+    let mut yielded = None;
+    while from <= end {
+        if let Some(left) = lease_left_ms(db, lease).await {
+            if left < term_ms / 2 + 2 * longest {
+                yielded = Some(left);
+                break;
+            }
+        }
+        let to = end.min(from.saturating_add(HEAL_STEP - 1));
+        let started = clock_ms();
+        let step = fetch_span(source, from, to).await;
+        longest = longest.max(clock_ms().saturating_sub(started) as i64);
+        let whole = step.len() as u32 == to - from + 1;
+        fetched.extend(step);
+        if !whole {
+            break;
+        }
+        from = to + 1;
+    }
+    if let Some(left) = yielded {
+        log!(
+            "Cron: link heal: yielded at {from} with {left} ms of the lease's term left; read {}..{from} this pass, the next goes on",
+            floor + 1
+        );
+    }
+    if fetched.is_empty() && yielded.is_some() {
+        return false;
+    }
+    if let Some(left) = lease_left_ms(db, lease).await.filter(|left| *left <= 0) {
+        log_error!(
+            "Cron: link heal: the lease's term ran out before the write ({left} ms); {} heights read, nothing written",
+            fetched.len()
+        );
+        return false;
+    }
     if fetched.is_empty() {
         record_fault(
             db,
@@ -1191,7 +1295,34 @@ pub(crate) async fn insert_with_parent_backfill(
 /// refused, which the route answers as "unable to verify", never an error
 /// page and never "no such block". Rule 28 (H12): `source` is the courier
 /// ladder on the worker, so a fresh block never depends on one courier.
+///
+/// #34: the read-through writes active rows, so it takes the writer lease
+/// as the cron's pass does. Held by another writer (the pass or a push at
+/// the same tip), it writes nothing and the request answers "unable to
+/// verify" for now; the holder is landing the chain, and the next request
+/// reads it from the store. It does not hand its headers to the push's
+/// door: the door walks back by hash from one pushed tip, and the
+/// read-through fills a span by height under the same parent walk the pass
+/// uses, so the lease alone is the smaller change.
 pub(crate) async fn read_through(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    source: &impl ChainSource,
+    hooks: &impl TipWebhooks,
+    tip: u32,
+    height: u32,
+) -> Result<Option<()>> {
+    let lease = take_lease(db, "read").await;
+    if let Lease::Busy = lease {
+        log!("read-through: another writer holds the store (the writer lease); {height} is unverified for now");
+        return Ok(None);
+    }
+    let result = read_through_held(db, params, source, hooks, tip, height).await;
+    release_lease(db, lease).await;
+    result
+}
+
+async fn read_through_held(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,
@@ -1249,16 +1380,34 @@ pub(crate) async fn fetch_span(source: &impl ChainSource, from: u32, to: u32) ->
 /// batch through the node's rules (refused whole when any header fails
 /// them), the dual-active sweep this path can need (review M-3; otherwise
 /// only the catch-up runs it), and the tip chosen after it (#32). Answers
-/// the rows inserted.
+/// the rows inserted. #34: under the writer lease, as the cron's pass;
+/// `None` when another writer holds it (nothing written; the route says so
+/// and the operator runs it again). A span of 100,000 rows can write past
+/// the lease's term (`LEASE_S`), as a long catch-up can.
 pub(crate) async fn bulk_write(
     db: &impl HeaderDb,
     params: &ChainParams,
     headers: &[BlockHeader],
 ) -> Result<Option<u32>> {
+    let lease = take_lease(db, "bulk-sync").await;
+    if let Lease::Busy = lease {
+        log!("bulk-sync: another writer holds the store (the writer lease); nothing written");
+        return Ok(None);
+    }
+    let result = bulk_write_held(db, params, headers).await;
+    release_lease(db, lease).await;
+    result.map(Some)
+}
+
+async fn bulk_write_held(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> Result<u32> {
     let inserted = storage::insert_headers_batch(db, params, headers).await?;
     storage::dedupe_active_heights(db).await?;
     storage::update_chain_tip_to_highest(db).await?;
-    Ok(Some(inserted))
+    Ok(inserted)
 }
 
 /// A PEER header service: another service speaking the header protocol, asked

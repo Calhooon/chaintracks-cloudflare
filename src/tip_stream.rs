@@ -153,11 +153,14 @@ pub(crate) struct PollState {
 
 impl PollState {
     /// The object's `/wake`: the poll rule's answer for this tick, counted.
+    /// #34: the quiet timer is not started here: a pass the writer lease
+    /// turns away asks no courier, and counted as a poll it held the next
+    /// poll off for the quiet interval (`polled` starts it).
     pub fn woke(&mut self, due: Option<&str>, now: u64) {
+        let _ = now;
         match due {
             Some(why) => {
                 self.polls_run += 1;
-                self.last_poll_at = now;
                 self.last_reason = Some(why.to_string());
             }
             None => self.polls_skipped += 1,
@@ -166,10 +169,13 @@ impl PollState {
 
     /// The object's `/polled`: the pass the tick ran asked the couriers
     /// `requests` times; `ran` is false when the writer lease turned the
-    /// pass away (`sync::run_cron`).
+    /// pass away (`sync::run_cron`). #34: only a pass that ran is a poll
+    /// (`last_poll_at`).
     pub fn polled(&mut self, requests: u32, ran: bool, now: u64) {
-        let _ = (ran, now);
         self.poll_requests += requests;
+        if ran {
+            self.last_poll_at = now;
+        }
     }
 
     /// #31: one cron tick's answer to "is the store behind the seen tip".
@@ -212,7 +218,11 @@ pub(crate) const BUSY_WAIT_MS: u64 = 2_000;
 /// One tip event through the door under the writer lease (`ask`, the door's
 /// call): a `"busy"` answer is asked again, `tries` times, `wait` apart.
 /// Answers the door's last answer; a `"busy"` one is counted here, never by
-/// the caller.
+/// the caller. #34: `busy` counts the events turned away (once each, stored
+/// at a later try or not), and an event still turned away after its tries
+/// is dropped with one line naming it, logged and kept as `last_fault`; the
+/// poll covers it (`poll_due`, the behind rule: the door raised the seen
+/// height).
 pub(crate) async fn through_the_lease<A, AF, W, WF>(
     st: &mut StreamState,
     header: &crate::types::BlockHeader,
@@ -227,18 +237,29 @@ where
     W: FnMut() -> WF,
     WF: std::future::Future<Output = ()>,
 {
-    let _ = header;
     let mut asked = 0;
     loop {
         let answer = ask().await;
         match &answer {
             Ok(a) if a.outcome == "busy" && asked < tries => {
+                if asked == 0 {
+                    st.ingested("busy", now());
+                }
                 asked += 1;
-                st.ingested("busy", now());
                 wait().await;
             }
             Ok(a) if a.outcome == "busy" => {
-                st.ingested("busy", now());
+                if asked == 0 {
+                    st.ingested("busy", now());
+                }
+                let line = format!(
+                    "tip stream: DROPPED the push of {} at {}: the writer lease stayed held through {} asks {BUSY_WAIT_MS} ms apart; the poll covers it",
+                    header.hash,
+                    header.height,
+                    asked + 1
+                );
+                log_error!("{line}");
+                st.last_fault = Some(line);
                 break answer;
             }
             _ => break answer,
