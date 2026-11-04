@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.3] - 2026-11-04
 
 The follow-ups of the orphan-tip fix (#31) under the writer lease (#34, PR #36), with the findings of its reads: Read A (the hand-off's ask count, the read-through's courier reads under the lease), Read B (the read-through holding the cron's lease, the fence, the admin writes outside the lease, the heal's yield over rival rows, the seen height), Read A2 (a heal witness that depended on the clock, the webhook sends inside the lease, a lapsed pass stamped as completed, bulk-sync's lapse answered 422) and Read B2 (the hand-off's retries per header past `waitUntil`'s 30 s, #38); #37 closes inside the heal, and #39 stays open:
 
