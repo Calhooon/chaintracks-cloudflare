@@ -609,6 +609,36 @@ fn the_issue31_statements_are_the_new_literals() {
     }
 }
 
+/// #34, sync.rs: the milliseconds left of the writer lease, as its owner.
+pub(crate) const ISSUE34_LEASE_LEFT: &str = "SELECT (lease_until + 1) * 1000 - CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER) AS left_ms FROM sync_state WHERE id = 1 AND lease_owner = ?1";
+
+/// The #34 statement is the literal above, in no earlier vocabulary, and it
+/// reads the term `TAKE_LEASE_SQL` wrote: a lease taken now for 120 s has
+/// between 120,000 and 121,000 ms left.
+#[test]
+fn the_issue34_statement_is_the_new_literal() {
+    assert_eq!(crate::sync::LEASE_LEFT_SQL, ISSUE34_LEASE_LEFT);
+    let s = ISSUE34_LEASE_LEFT;
+    assert!(
+        !MAIN_VOCABULARY.contains(&s)
+            && !ROUND5_VOCABULARY.contains(&s)
+            && !D5_VOCABULARY.contains(&s)
+            && !P04_VOCABULARY.contains(&s)
+            && !CT33_VOCABULARY.contains(&s)
+            && !LASTPASS_VOCABULARY.contains(&s)
+            && !ISSUE30_VOCABULARY.contains(&s)
+            && !ISSUE31_VOCABULARY.contains(&s)
+    );
+    let db = crate::host_harness::SqliteDb::migrated();
+    db.conn()
+        .execute(ISSUE31_TAKE_LEASE, rusqlite::params!["cron:t", 120])
+        .unwrap();
+    let left: i64 = db.conn().query_row(s, ["cron:t"], |r| r.get(0)).unwrap();
+    assert!((120_000..=121_000).contains(&left), "{left}");
+    let other: Option<i64> = db.conn().query_row(s, ["push:u"], |r| r.get(0)).ok();
+    assert_eq!(other, None, "another owner reads no row");
+}
+
 /// The round-5 probes are the two literals above and nothing else.
 #[test]
 fn the_round_5_statements_are_the_two_new_literals() {
