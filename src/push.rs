@@ -133,18 +133,23 @@ pub(crate) fn unjudged(e: &IngestError) -> bool {
     match e {
         IngestError::Refused(e) => {
             let text = e.to_string();
-            [ANCESTRY_MISSING, WALK_TOO_DEEP, WALK_PARENT_MISSING]
-                .iter()
-                .any(|mark| text.contains(mark))
+            // The rule's mark from the rule's own reason, and the walk's
+            // from the constants its refusals are written with, so a
+            // rewording of either moves both sides.
+            let ancestry = format!(
+                ": {}: ",
+                crate::consensus::HeaderFault::AncestryMissing { height: 0 }.reason()
+            );
+            text.contains(&ancestry)
+                || text.contains(WALK_TOO_DEEP)
+                || text.contains(WALK_PARENT_MISSING)
         }
         IngestError::Store(_) => false,
     }
 }
 
-/// #34: the rules' refusal of a header whose ancestors are not stored
-/// (`consensus::HeaderFault::AncestryMissing`), as its text carries it.
-const ANCESTRY_MISSING: &str = ": ancestry-missing: ";
-/// The parent walk's two refusals, as their text carries them.
+/// The parent walk's two refusals, as their text carries them (written
+/// with these, `ingest_held`).
 const WALK_TOO_DEEP: &str = "stands on no stored row within";
 const WALK_PARENT_MISSING: &str = "of a pushed header could not be had";
 
@@ -222,7 +227,7 @@ where
         }
         if run.len() > PARENT_WALK_LIMIT {
             let e = worker::Error::RustError(format!(
-                "pushed header {} at {} stands on no stored row within {PARENT_WALK_LIMIT} ancestors (still missing {want}); the poll's catch-up covers it",
+                "pushed header {} at {} {WALK_TOO_DEEP} {PARENT_WALK_LIMIT} ancestors (still missing {want}); the poll's catch-up covers it",
                 run[run.len() - 1].hash,
                 run[run.len() - 1].height
             ));
@@ -232,7 +237,7 @@ where
             Ok(parent) => run.insert(0, parent),
             Err(e) => {
                 let e = worker::Error::RustError(format!(
-                    "the parent {want} of a pushed header could not be had: {e}"
+                    "the parent {want} {WALK_PARENT_MISSING}: {e}"
                 ));
                 return Err(refuse(e).await);
             }

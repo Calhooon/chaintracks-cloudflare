@@ -251,12 +251,13 @@ async fn h12_a_fresh_block_does_not_depend_on_one_courier() {
     );
 }
 
-/// The parent walk of the read-through reads the ladder too: the fresh block
-/// builds on a competitor of our tip, which only the second courier holds by
-/// hash. On one courier that was the wedge; on the ladder the branch lands.
-/// #34 (lane/ct-34-b): the walk is the push's door's now; the request
-/// cannot judge a block that does not stand on our tip and answers "unable
-/// to verify" for now, and its hand-off lands the branch.
+/// The parent walk reads the ladder too: the fresh block builds on a
+/// competitor of our tip, which only the second courier holds by hash. On
+/// one courier that was the wedge; on the ladder the branch lands. #34
+/// (lane/ct-34-b): the read-through walks nothing now; it cannot judge a
+/// block that does not stand on our tip, answers "unable to verify" for
+/// now, hands nothing and takes no lease, and the cron's next pass walks
+/// the branch through the ladder by hash.
 #[tokio::test]
 async fn h12_the_parent_walk_of_the_read_through_reads_the_ladder() {
     let db = SqliteDb::migrated();
@@ -272,6 +273,7 @@ async fn h12_the_parent_walk_of_the_read_through_reads_the_ladder() {
 
     let by_height_only = ScriptedChain::new();
     by_height_only.publish(&fresh);
+    by_height_only.tip(fresh.height, &fresh.hash);
     // this courier never serves the competitor by hash (loop 9's refusal)
     let holds_the_parent = ScriptedChain::new();
     holds_the_parent.publish(&competitor);
@@ -282,6 +284,22 @@ async fn h12_the_parent_walk_of_the_read_through_reads_the_ladder() {
         landed, None,
         "the request could not judge it: unable to verify for now"
     );
+    assert_eq!(
+        flags(&db, &tip.hash),
+        (true, true),
+        "the request wrote nothing"
+    );
+    let lease: Option<String> = db
+        .conn()
+        .query_row("SELECT lease_owner FROM sync_state WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(lease, None);
+
+    assert!(crate::sync::run_cron(&db, regtest(), &ladder, None, &hooks)
+        .await
+        .unwrap());
     assert_eq!(
         flags(&db, &fresh.hash),
         (true, true),

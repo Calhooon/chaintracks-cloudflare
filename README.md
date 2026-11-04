@@ -117,10 +117,12 @@ write, answers from the judged header, and hands the run to the push's
 door after its answer (the Worker's `waitUntil`), where each header takes
 the lease for its own write, a busy door is asked again 9 times 2 s apart,
 and a header still turned away is dropped with its line
-(`read-through: DROPPED ...`). A caller that goes away (a client's
-deadline) cancels a request that holds nothing. A block that does not
-stand on the stored tip (the network reorged) answers "unable to verify"
-for now, and the door's parent walk lands it.
+(`read-through: DROPPED ...`). The run handed stands on a stored row, so
+no courier is read while the door holds the lease. A caller that goes
+away (a client's deadline) cancels a request that holds nothing. A block
+that does not stand on the stored tip (the network reorged) answers
+"unable to verify" for now and is not handed; the cron's pass or the push
+lands it.
 
 A push turned away through its asks, or refused because its ancestry could
 not be had, is a hint to poll and never the store's height: the object
