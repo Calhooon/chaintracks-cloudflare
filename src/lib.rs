@@ -50,6 +50,8 @@ mod host_harness;
 #[cfg(test)]
 mod lastpass_tests;
 #[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
 mod orphan_tip_tests;
 #[cfg(test)]
 mod pow_tests;
