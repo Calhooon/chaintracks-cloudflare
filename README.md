@@ -72,23 +72,38 @@ names it. A height no courier serves is recorded as `lastSyncError` and
 `linkState` stays `linked: false`. A tick the push covers heals the same
 way through the same ladder (#31); a linked chain asks no courier there. A
 heal costs at most one courier request a rung a height (three on main),
-at most 300 a pass. A break more than 400 heights under the tip is seen by
+at most 300 a pass. A heal stays inside the writer lease's term (#34): it
+reads 10 heights at a time and the lease's remaining term before each
+span, goes on while half the term and twice its longest span are left,
+and otherwise writes what it read and stops; `linkState` records where it
+stopped and the next pass goes on from there. A break more than 400 heights under the tip is seen by
 no pass, only by `/admin/linkcheck` (a slow full pass is issue #33 of this
 repository).
 
 ## One writer at a time
 
-The cron's pass, a tick the push covers and a push through the tip stream's
-door are three writers of one chain state; on 2026-11-02 18:48Z a reorg sync
-and a push of the same headers interleaved (#32). Each now takes the writer
-lease (migration 0015: `sync_state.lease_owner`, `lease_until`) with one
+The cron's pass, a tick the push covers, a push through the tip stream's
+door, the public read-through (a request up to six blocks above the tip)
+and `/admin/bulk-sync` are five writers of one chain state; on 2026-11-02
+18:48Z a reorg sync and a push of the same headers interleaved (#32). Each
+now takes the writer lease (migration 0015: `sync_state.lease_owner`, `lease_until`) with one
 `UPDATE` before it writes and gives it back after; a writer that finds it
 held writes nothing, and a holder that died frees it after 120 s. A pass
-turned away waits for the next tick; a push turned away answers `busy` and
-the object asks again, 15 times 2 s apart. The load: two `sync_state`
-writes per pass, per tick and per push that is not `known`. Before migration
-0015 every writer logs the missing column and writes unserialized, as before.
-`/admin/ingest` and `/admin/backfill` do not take it.
+turned away waits for the next tick and is no poll (the quiet interval is
+not restarted by it); a push turned away answers `busy` and the object asks
+again, 15 times 2 s apart, then drops it with one line naming the header
+(`tip stream: DROPPED the push of ...`, kept as `last_fault` on the
+object's `/status`; `busy` counts events, not asks). A read-through turned
+away answers "unable to verify" for now (the holder is landing the chain);
+`/admin/bulk-sync` turned away answers 503 and writes nothing, run it
+again. A push turned away, or refused because its ancestry could not be
+had, records its height as `lastSeenHeight` (within 37 of the served tip),
+so the behind rule counts from the next tick. The load: two `sync_state`
+writes per pass, per tick, per read-through, per bulk-sync call and per push
+that is not `known`, and one read per 10 heights a heal reads. Before
+migration 0015 every writer logs the missing column and writes
+unserialized, as before. `/admin/ingest` and `/admin/backfill` do not take
+it.
 
 Behind a live push the cron still polls when the stream is down, when no
 push that advanced the active chain and no poll landed in the quiet
@@ -97,7 +112,8 @@ store's tip sat below `lastSeenHeight` for more than one tick.
 
 The load: four reads a pass (three bounded by the window, about 1,200 rows,
 and the stored state), and a write of the `sync_state` row only when the answer changed (a new tip), so an
-idle pass on a linked chain still writes `lastPassAt` alone. Before migration
+idle pass on a linked chain writes `lastPassAt` and the writer lease's two
+writes (its take and its give-back) alone. Before migration
 0014 the leg logs, the cron still syncs, and `/getInfo` names the column in
 `syncSchemaFault`.
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+The follow-ups of the orphan-tip fix (#31) under the writer lease (#34):
+
+- The public read-through and `/admin/bulk-sync` take the writer lease; held elsewhere, the read-through answers "unable to verify" for now and bulk-sync answers 503 with nothing written.
+- A poll the lease turned away is no poll: the object's quiet interval restarts only for a pass that ran (`/polled?ran=0`).
+- A push still turned away after its 15 asks is dropped with one line naming the header (`last_fault`), and `busy` counts events, not asks.
+- A push turned away, or refused because its ancestry could not be had (`ancestry-missing`, the parent walk's refusals), records its height as seen within 37 of the served tip, so the behind rule counts from the next tick.
+- A heal stays inside the lease's term: 10 heights a span, the remaining term read before each, yielding with its progress in `linkState` when less than half the term plus twice its longest span is left.
+- The README names the five writers, the idle pass's lease writes and the routes outside the lease (`/admin/ingest`, `/admin/backfill`).
+
 ## [0.7.2] - 2026-11-03
 
 - An orphan or broken tip heals without an operator (#30, the production stall
