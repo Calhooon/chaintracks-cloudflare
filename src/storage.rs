@@ -309,6 +309,10 @@ pub async fn find_active_header_for_hash(
 /// tip, or reorg window). Mirrors the Go BHS tracker's INVALID vs
 /// UNABLE_TO_VERIFY split (go-wallet-toolbox bhs/service.go) ; collapsing
 /// both to `false` let a storage hole read as "proof invalid" downstream.
+/// #34 (lane/ct-34-b): the routes read the served row and compare its root
+/// themselves, and a fresh block's root is the judged header's
+/// (`routes::ensure_fresh_header`); this stays the suite's read of a root.
+#[cfg(test)]
 pub async fn check_root_for_height(
     db: &impl HeaderDb,
     root: &str,
@@ -1284,6 +1288,136 @@ pub async fn insert_headers_batch(
     Ok(inserted)
 }
 
+/// #34 (lane/ct-34-b): what the node's rules say of a run fetched above the
+/// store's tip, read here without a write (`judge_above`).
+#[derive(Debug)]
+pub(crate) enum Judged {
+    /// Every header passed: its proof of work, the run linked header to
+    /// header and to the active row below it, the checkpoints and the bits.
+    Passed,
+    /// A header failed a rule (the refusal as the writers word it).
+    Refused(worker::Error),
+    /// The rules could not be read here: the run does not stand on the
+    /// active row below it (the store moved, or the network reorged), or
+    /// the bits' ancestry is not stored. The writer's own path judges it.
+    Unjudged(String),
+}
+
+/// #34 (lane/ct-34-b, R1 on PR #36): the read-through's judgment of the run
+/// it fetched above the tip, with no write, by the rules every writer
+/// applies (`insert_headers_batch`, `insert_header`): the proof of work of
+/// each header, the run linked and standing on the active row below it,
+/// then the checkpoints and the bits against the stored ancestry
+/// (`load_window`). A run above the tip is above every checkpoint the store
+/// holds, so the checkpoint's fork rule asks nothing of it. One read of the
+/// parent and the window's reads.
+pub(crate) async fn judge_above(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> worker::Result<Judged> {
+    let Some(first) = headers.first() else {
+        return Ok(Judged::Unjudged("nothing was fetched".into()));
+    };
+    for header in headers {
+        if let Err(f) = header.check_pow(params) {
+            return Ok(Judged::Refused(refused(header, &f)));
+        }
+    }
+    for pair in headers.windows(2) {
+        if pair[1].height != pair[0].height + 1
+            || !pair[1].previous_hash.eq_ignore_ascii_case(&pair[0].hash)
+        {
+            let fault = HeaderFault::PrevNotFound {
+                prev: pair[1].previous_hash.clone(),
+            };
+            return Ok(Judged::Refused(refused(&pair[1], &fault)));
+        }
+    }
+    let parent = find_header_for_hash(db, &first.previous_hash)
+        .await?
+        .filter(|p| p.is_active && p.height + 1 == first.height);
+    let Some(parent) = parent else {
+        return Ok(Judged::Unjudged(format!(
+            "the header at {} does not stand on the active row below it",
+            first.height
+        )));
+    };
+    let depth = headers
+        .iter()
+        .map(|h| {
+            params
+                .pow
+                .window_depth(h.height - 1)
+                .saturating_sub(h.height - first.height)
+        })
+        .max()
+        .unwrap_or(1);
+    let mut window = load_window(db, &parent, depth).await?;
+    for header in headers {
+        match consensus::check_context(&window, header, params) {
+            Ok(()) => window.push(Link::from(header)),
+            Err(f @ HeaderFault::AncestryMissing { .. }) => {
+                return Ok(Judged::Unjudged(format!("{}", refused(header, &f))));
+            }
+            Err(f) => return Ok(Judged::Refused(refused(header, &f))),
+        }
+    }
+    Ok(Judged::Passed)
+}
+
+/// #34 (lane/ct-34-b): the active rows of `from ..= to` whose parent link
+/// is null (bulk rows) linked by id to the row each names, in one
+/// statement (`SQL_LINK_SPAN`, the activating path's). The heal runs it
+/// over its window once a run landed, so the rows between the breaks are
+/// linked for every walk by id, as the forward run left them (#31).
+pub(crate) async fn link_active_span(db: &impl HeaderDb, from: u32, to: u32) -> worker::Result<()> {
+    Query::new(SQL_LINK_SPAN).bind(from).bind(to).run(db).await
+}
+
+/// #34 (lane/ct-34-b, R2 on PR #36): the rows a heal read by hash under a
+/// broken link and could not yet stand on an active row (its term ran
+/// short, its reads were spent, a courier could not serve the next
+/// parent): kept INACTIVE and unlinked with their own work, after their
+/// proof of work and the checkpoints at their heights, so the next pass
+/// walks them from the store and reads only what is still missing. Never
+/// served and never the tip: the activation (`ingest_pushed`) judges the
+/// whole run by every rule before any of it is active. Answers the rows
+/// handed (a row already stored is left as it stands).
+pub(crate) async fn store_heal_progress(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> worker::Result<u32> {
+    for header in headers {
+        header.check_pow(params).map_err(|f| refused(header, &f))?;
+        consensus::check_checkpoint(header.height, &header.hash, params)
+            .map_err(|f| refused(header, &f))?;
+    }
+    let mut batch = BatchCollector::new(db);
+    for header in headers {
+        batch.add(
+            SQL_INSERT_HEADER,
+            vec![
+                QVal::Null,
+                QVal::Text(header.previous_hash.clone()),
+                QVal::Int(header.height as i64),
+                QVal::Bool(false),
+                QVal::Bool(false),
+                QVal::Text(header.hash.clone()),
+                QVal::Text(calculate_work(header.bits)),
+                QVal::Int(header.version as i64),
+                QVal::Text(header.merkle_root.clone()),
+                QVal::Int(header.time as i64),
+                QVal::Int(header.bits as i64),
+                QVal::Int(header.nonce as i64),
+            ],
+        );
+    }
+    batch.execute().await?;
+    Ok(headers.len() as u32)
+}
+
 /// What `POST /admin/ingest` did with a push (#33): the answer the route serves.
 #[derive(Debug, Default)]
 pub struct IngestOutcome {
@@ -1955,17 +2089,6 @@ pub async fn headers_hex_under(
         return Ok(String::new());
     }
     get_headers_hex(db, start, count).await
-}
-
-/// The active header at `height`, if the ceiling admits it (the routes).
-pub async fn served_header_for_height(
-    db: &impl HeaderDb,
-    height: u32,
-) -> worker::Result<Option<BlockHeader>> {
-    if !served_ceiling(db).await?.admits(height) {
-        return Ok(None);
-    }
-    find_header_for_height(db, height).await
 }
 
 /// The served tip: the chain tip once the store is re-validated, before that

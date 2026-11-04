@@ -94,6 +94,12 @@ pub(crate) struct StreamState {
     /// #31: tip events the door turned away because another writer held the
     /// store (`"busy"`; the object asked again).
     pub busy: u32,
+    /// #34 (lane/ct-34-b): the height of the last push that did not land
+    /// (turned away through its asks, or refused with its ancestry not to
+    /// be had), and when: a hint to poll (`PollState::note_behind_or_hinted`),
+    /// never the store's seen height.
+    pub hint_height: u32,
+    pub hint_at: u64,
 }
 
 impl StreamState {
@@ -123,6 +129,12 @@ impl StreamState {
             }
             _ => self.stored += 1,
         }
+    }
+
+    /// #34 (lane/ct-34-b): a push at `height` did not land at `now`.
+    pub fn hint(&mut self, height: u32, now: u64) {
+        self.hint_height = height;
+        self.hint_at = now;
     }
 
     /// The cron should bring the alarm forward: the stream is not live and
@@ -186,6 +198,18 @@ impl PollState {
             0
         };
     }
+
+    /// #34 (lane/ct-34-b): the object's `/wake`: the store sat behind the
+    /// seen tip (`behind`, `sync::store_behind`), or a push that did not
+    /// land named a height above the tip the stream last served, after the
+    /// last poll that ran (`StreamState::hint`). The hint asks for a poll
+    /// and is spent by it; the store's seen height is the couriers' answer
+    /// and the landed pushes' alone.
+    pub fn note_behind_or_hinted(&mut self, behind: bool, stream: &StreamState) {
+        let hinted =
+            stream.hint_at > self.last_poll_at && stream.hint_height > stream.last_tip_height;
+        self.note_behind(behind || hinted);
+    }
 }
 
 /// Whether this cron tick asks the couriers, and why: always while the
@@ -220,13 +244,16 @@ pub(crate) const BUSY_WAIT_MS: u64 = 2_000;
 /// Answers the door's last answer; a `"busy"` one is counted here, never by
 /// the caller. #34: `busy` counts the events turned away (once each, stored
 /// at a later try or not), and an event still turned away after its tries
-/// is dropped with one line naming it, logged and kept as `last_fault`; the
-/// poll covers it (`poll_due`, the behind rule: the door raised the seen
-/// height).
+/// is dropped with one line naming it (`who`: the tip stream, or the
+/// read-through's hand-off), logged and kept as `last_fault`; the poll
+/// covers it (`poll_due`, the behind rule). #34 (lane/ct-34-b): a dropped
+/// event, and one the door refused unjudged (`push::unjudged`), leave
+/// their height as the stream's hint (`StreamState::hint`).
 pub(crate) async fn through_the_lease<A, AF, W, WF>(
     st: &mut StreamState,
     header: &crate::types::BlockHeader,
     tries: u32,
+    who: &str,
     mut ask: A,
     mut wait: W,
     now: impl Fn() -> u64,
@@ -253,13 +280,18 @@ where
                     st.ingested("busy", now());
                 }
                 let line = format!(
-                    "tip stream: DROPPED the push of {} at {}: the writer lease stayed held through {} asks {BUSY_WAIT_MS} ms apart; the poll covers it",
+                    "{who}: DROPPED the push of {} at {}: the writer lease stayed held through {} asks {BUSY_WAIT_MS} ms apart; the poll covers it",
                     header.hash,
                     header.height,
                     asked + 1
                 );
                 log_error!("{line}");
                 st.last_fault = Some(line);
+                st.hint(header.height, now());
+                break answer;
+            }
+            Err(e) if crate::push::unjudged(e) => {
+                st.hint(header.height, now());
                 break answer;
             }
             _ => break answer,
@@ -352,7 +384,7 @@ mod object {
                         log!("tip stream: woken by the cron (alarm {alarm:?})");
                     }
                     let mut poll = self.poll().await;
-                    poll.note_behind(behind);
+                    poll.note_behind_or_hinted(behind, &st);
                     let due = poll_due(&st, &poll, now, cfg.heartbeat_ms, cfg.quiet_ms);
                     poll.woke(due, now);
                     storage.put(POLL_KEY, &poll).await?;
@@ -580,6 +612,7 @@ mod object {
                 st,
                 &header,
                 BUSY_TRIES,
+                "tip stream",
                 || push::ingest_announced(&db, &params, &ladder, &self.env, header.clone()),
                 || Delay::from(Duration::from_millis(BUSY_WAIT_MS)),
                 now_ms,

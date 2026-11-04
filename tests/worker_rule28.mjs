@@ -130,7 +130,16 @@ print(json.dumps(statements))
   assert(hosts().every(h => [WOC, ARCADE, BITAILS].includes(h)), `only the couriers: ${hosts()}`)
   const root = await call(`/isValidRootForHeight?height=${TIP + 2}&root=${fields(TIP + 2).merkleRoot}`)
   assert.deepEqual(await body(root), {status: 'success', value: true}, 'the root of a fresh block, read through the ladder')
-  assert.deepEqual(await body(await call('/currentHeight')), {status: 'success', value: TIP + 2})
+  // #34 (lane/ct-34-b): the request holds no lease; its run lands through the
+  // push's door after the answer (waitUntil), so the tip is read until it moves.
+  let landed
+  for (let i = 0; i < 50; i++) {
+    landed = await body(await call('/currentHeight'))
+    if (landed.value === TIP + 2) break
+    await new Promise(r => setTimeout(r, 100))
+  }
+  assert.deepEqual(landed, {status: 'success', value: TIP + 2}, 'the hand-off landed the read-through\'s run')
+  assert.equal((await db.prepare('SELECT lease_owner FROM sync_state WHERE id = 1').first()).lease_owner, null, 'no lease is left held')
   // no courier holds the next block yet: unable to verify, never "invalid", and every courier was asked
   out.length = 0
   const beyond = await call(`/isValidRootForHeight?height=${TIP + 3}&root=${fields(TIP + 3).merkleRoot}`)

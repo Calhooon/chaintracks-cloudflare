@@ -119,7 +119,8 @@ pub(crate) async fn run_pushed_tick(
         log!("Cron: another writer holds the store (the writer lease); this tick writes nothing");
         return Ok(());
     }
-    let result = run_pushed_tick_held(db, params, source, hooks, &lease).await;
+    let result =
+        run_pushed_tick_held(&Fenced::new(db, &lease), params, source, hooks, &lease).await;
     release_lease(db, lease).await;
     result
 }
@@ -154,9 +155,10 @@ async fn run_pushed_tick_held(
 /// the push covers and a push through the door each hold it while they
 /// write; a holder that died (an evicted object, a pass past its limits)
 /// frees it at the term. Two minutes: a pass of the minute cron and a push's
-/// parent walk end well inside it; a pass longer than the term (a catch-up
-/// of thousands of headers through the couriers one by one) writes past it
-/// unserialized, as every pass did before the lease.
+/// parent walk end well inside it. #34 (lane/ct-34-b): a pass longer than
+/// the term (a catch-up of thousands of headers through the couriers one by
+/// one) stops at it, fenced (`Fenced`): the rows it wrote stand and the
+/// next pass goes on from them.
 pub(crate) const LEASE_S: u32 = 120;
 
 #[cfg(test)]
@@ -227,6 +229,126 @@ pub(crate) async fn take_lease(db: &impl HeaderDb, role: &str) -> Lease {
                 "{role}: the writer lease could not be taken (migration 0015 applied?), unserialized: {e:?}"
             );
             Lease::Unserialized
+        }
+    }
+}
+
+/// #34 (lane/ct-34-b, the fence): the guard every leased write of the
+/// `headers` table carries as the head of its own transaction. It changes
+/// nothing while the lease is still `?1`'s and inside its term (the take's
+/// own rule, `TAKE_LEASE_SQL`); otherwise it sets the one row's id to 2,
+/// which `sync_state`'s `CHECK (id = 1)` (migration 0001) refuses, and the
+/// refusal rolls the whole transaction back (a D1 batch is one
+/// transaction). The check and the write are one transaction, so no
+/// successor's take can land between them. Bind: ?1 the owner.
+pub(crate) const FENCE_SQL: &str = "UPDATE sync_state SET id = 2 WHERE id = 1 AND NOT \
+     (lease_owner IS ?1 AND COALESCE(lease_until, 0) >= CAST(strftime('%s', 'now') AS INTEGER))";
+
+/// #34 (lane/ct-34-b, Read B's (3) on PR #36): a leased writer's view of
+/// the store. Every write of the `headers` table goes with `FENCE_SQL` in
+/// one transaction: a holder whose term has lapsed, or whose lease another
+/// writer took, writes nothing more. At the lapse it stops: one log line,
+/// the fault recorded (`lastSyncError`), and every later `headers` write of
+/// the holder refused without a read; the rows it wrote stand and the next
+/// writer goes on from them. Reads and the `sync_state` records (the seen
+/// height, the faults, the stamps) pass through. A writer running
+/// unserialized (no migration 0015) is not fenced, as before the lease.
+pub(crate) struct Fenced<'a, D: HeaderDb> {
+    inner: &'a D,
+    owner: Option<&'a str>,
+    lapsed: std::cell::Cell<bool>,
+}
+
+impl<'a, D: HeaderDb> Fenced<'a, D> {
+    pub(crate) fn new(inner: &'a D, lease: &'a Lease) -> Self {
+        Self {
+            inner,
+            owner: match lease {
+                Lease::Held(owner) => Some(owner.as_str()),
+                _ => None,
+            },
+            lapsed: std::cell::Cell::new(false),
+        }
+    }
+
+    /// A write of the `headers` table (the statements `storage` hands D1).
+    fn writes_headers(sql: &str) -> bool {
+        [
+            "INSERT OR IGNORE INTO headers",
+            "INSERT INTO headers",
+            "UPDATE headers ",
+            "DELETE FROM headers",
+        ]
+        .iter()
+        .any(|head| sql.starts_with(head))
+    }
+
+    /// `stmts` behind the fence, answering each one's changed rows.
+    async fn fenced(&self, owner: &str, stmts: Vec<crate::d1::Query>) -> Result<Vec<u32>> {
+        if self.lapsed.get() {
+            return Err(lapsed(owner));
+        }
+        let mut all = Vec::with_capacity(stmts.len() + 1);
+        all.push(crate::d1::Query::new(FENCE_SQL).bind(owner));
+        all.extend(stmts);
+        match self.inner.batch_changes(all).await {
+            Ok(mut changed) => {
+                changed.remove(0);
+                Ok(changed)
+            }
+            Err(e) => {
+                if lease_left_of(self.inner, owner).await.unwrap_or(0) > 0 {
+                    return Err(e);
+                }
+                self.lapsed.set(true);
+                let text = format!(
+                    "{owner}: the writer lease lapsed (its term passed, or another writer took it): \
+                     this writer stops here; the rows it wrote stand and the next writer goes on from them"
+                );
+                log_error!("{text}");
+                record_fault(self.inner, &text).await;
+                Err(lapsed(owner))
+            }
+        }
+    }
+}
+
+fn lapsed(owner: &str) -> Error {
+    Error::RustError(format!(
+        "{owner}: the writer lease lapsed; nothing more is written"
+    ))
+}
+
+impl<D: HeaderDb> HeaderDb for Fenced<'_, D> {
+    async fn first<T: serde::de::DeserializeOwned>(
+        &self,
+        q: crate::d1::Query,
+    ) -> Result<Option<T>> {
+        self.inner.first(q).await
+    }
+
+    async fn all<T: serde::de::DeserializeOwned>(&self, q: crate::d1::Query) -> Result<Vec<T>> {
+        self.inner.all(q).await
+    }
+
+    async fn execute(&self, q: crate::d1::Query) -> Result<u32> {
+        match self.owner {
+            Some(owner) if Self::writes_headers(q.sql()) => Ok(self
+                .fenced(owner, vec![q])
+                .await?
+                .first()
+                .copied()
+                .unwrap_or(0)),
+            _ => self.inner.execute(q).await,
+        }
+    }
+
+    async fn batch_changes(&self, stmts: Vec<crate::d1::Query>) -> Result<Vec<u32>> {
+        match self.owner {
+            Some(owner) if stmts.iter().any(|q| Self::writes_headers(q.sql())) => {
+                self.fenced(owner, stmts).await
+            }
+            _ => self.inner.batch_changes(stmts).await,
         }
     }
 }
@@ -481,7 +603,15 @@ pub(crate) async fn run_cron(
         log!("Cron: another writer holds the store (the writer lease); this pass writes nothing");
         return Ok(false);
     }
-    let result = run_cron_held(db, params, source, upstream_url, hooks, &lease).await;
+    let result = run_cron_held(
+        &Fenced::new(db, &lease),
+        params,
+        source,
+        upstream_url,
+        hooks,
+        &lease,
+    )
+    .await;
     release_lease(db, lease).await;
     result.map(|()| true)
 }
@@ -810,18 +940,24 @@ async fn lease_left_ms(db: &impl HeaderDb, lease: &Lease) -> Option<i64> {
     let Lease::Held(owner) = lease else {
         return None;
     };
+    lease_left_of(db, owner).await
+}
+
+/// The milliseconds left of `owner`'s lease: 0 when it is no longer
+/// `owner`'s or cannot be read (loud).
+async fn lease_left_of(db: &impl HeaderDb, owner: &str) -> Option<i64> {
     #[derive(serde::Deserialize)]
     struct Row {
         left_ms: Option<f64>,
     }
     match crate::d1::Query::new(LEASE_LEFT_SQL)
-        .bind(owner.as_str())
+        .bind(owner)
         .first::<Row>(db)
         .await
     {
         Ok(row) => Some(row.and_then(|r| r.left_ms).map_or(0, |v| v as i64)),
         Err(e) => {
-            log_error!("Cron: link heal: the lease's term could not be read: {e:?}");
+            log_error!("{owner}: the lease's term could not be read: {e:?}");
             Some(0)
         }
     }
@@ -898,26 +1034,40 @@ pub(crate) async fn link_leg(
     healed
 }
 
-/// #30: walk FORWARD by height from the highest linked active row under the
-/// first broken link, through the ladder (`fetch_span`, at most `HEAL_SPAN`
-/// heights), and hand the run to the activating path (`storage::ingest_pushed`,
-/// the operator's `POST /admin/ingest`): a run under a stored active child
-/// that names it is activated with the child relinked; a run with no such
-/// child is written as the bulk writer writes, activating the rows stored
-/// inactive where nothing is active. The parent walk (`insert_with_parent_backfill`)
-/// goes BACK from a new tip, 36 at most: a hole deeper than that under the
-/// tip, or one no new tip reaches, was never healed without an operator.
-/// Answers whether the run landed; a fault is recorded (`lastSyncError`).
+/// #30: the heal of a broken active chain through the ladder, handing each
+/// run to the activating path (`storage::ingest_pushed`, the operator's
+/// `POST /admin/ingest`): a run under a stored active child that names it
+/// is activated with the child relinked; a run filling a hole is written as
+/// the bulk writer writes, activating the rows stored inactive where
+/// nothing is active. The parent walk (`insert_with_parent_backfill`) goes
+/// BACK from a new tip, 36 at most: a hole deeper than that under the tip,
+/// or one no new tip reaches, was never healed without an operator.
+/// Answers whether a run landed; a fault is recorded (`lastSyncError`).
 ///
-/// #34: the heal stays inside the lease's term. It reads `HEAL_STEP`
-/// heights at a time and, before each step, the lease's remaining term: it
-/// goes on while half the term and twice its longest step are left (half
-/// the term kept for the write and the rest of the pass), and otherwise
-/// stops reading and writes the run it has (its
-/// progress, recorded in `linkState` by the leg; the next pass goes on from
-/// there). The write itself waits on a term not yet spent. A 100-height heal
-/// on slow couriers (one read a height, up to three rungs) could outrun the
-/// 120 s term and write unserialized.
+/// #34 (lane/ct-34-b, R2 on PR #36 and #37): the walk goes BACK by hash
+/// from the parent each broken link's child names (`next_names`), the
+/// highest break down (the one under the tip on), through the store where
+/// the rows are held (no courier read) and through the ladder where they
+/// are not, until it stands on an active row; the run from there to the
+/// child is what the chain names, whatever is active at its heights (rival
+/// rows, or none). Before, the walk went FORWARD by height from the row
+/// under the lowest break: a hole two or more deep had no stored row there
+/// and the run stood on nothing (`PrevNotFound`, #37), and over rival
+/// active rows a yielded run reached no child that named it
+/// (`storedInactive`, R2); either way every pass read the same heights
+/// again for no progress.
+///
+/// #34: the heal stays inside the lease's term. Before every `HEAL_STEP`
+/// courier reads it reads the lease's remaining term and goes on while
+/// half the term and twice its longest step are left (half the term kept
+/// for the write and the rest of the pass), at most `HEAL_SPAN` reads a
+/// pass. A walk cut short (the term, the read budget, a courier that could
+/// not serve the next parent) keeps the rows it read
+/// (`storage::store_heal_progress`: inactive, never served), so each pass
+/// moves the walk down by the rows it read and the next goes on from them;
+/// a run that reaches no active row within `storage::MAX_ACTIVATION`
+/// heights stops with that reason recorded. The writes wait on a term not
+/// yet spent, and the fence (`Fenced`) refuses one past it.
 async fn heal_links(
     db: &impl HeaderDb,
     params: &ChainParams,
@@ -925,116 +1075,157 @@ async fn heal_links(
     report: &storage::LinkReport,
     lease: &Lease,
 ) -> bool {
-    let Some(lowest) = report.broken.first().map(|b| b.height) else {
-        return false;
-    };
-    // The row below the first broken link is the highest the walk trusts:
-    // the link check found its own link (or it is the window's floor).
-    let floor = lowest.saturating_sub(1);
-    let end = report.to.min(floor.saturating_add(HEAL_SPAN));
-    if end <= floor {
-        return false;
-    }
     let term_ms = i64::from(lease_term()) * 1000;
-    let mut fetched = Vec::new();
+    let mut reads = 0u32;
     let mut longest: i64 = 0;
-    let mut from = floor + 1;
-    let mut yielded = None;
-    while from <= end {
-        if let Some(left) = lease_left_ms(db, lease).await {
-            if left < term_ms / 2 + 2 * longest {
-                yielded = Some(left);
-                break;
+    let mut step_started = clock_ms();
+    let mut healed = false;
+    'breaks: for broken in report.broken.iter().rev() {
+        // The run the child names, highest height last once reversed.
+        let mut run: Vec<BlockHeader> = Vec::new();
+        let mut read: Vec<BlockHeader> = Vec::new();
+        let mut want = broken.next_names.clone();
+        let mut height = broken.height;
+        let stop: Option<(String, bool)> = loop {
+            let stored = match storage::find_header_for_hash(db, &want).await {
+                Ok(stored) => stored,
+                Err(e) => {
+                    log_error!("Cron: link heal: the store could not be read: {e:?}");
+                    return healed;
+                }
+            };
+            match stored {
+                Some(row) if row.is_active => break None,
+                Some(row) => {
+                    want = row.previous_hash.clone();
+                    run.push(row);
+                }
+                None => {
+                    if reads >= HEAL_SPAN {
+                        break Some((
+                            format!("the pass's {HEAL_SPAN} courier reads are spent"),
+                            false,
+                        ));
+                    }
+                    if reads.is_multiple_of(HEAL_STEP) {
+                        let now = clock_ms();
+                        if reads > 0 {
+                            longest = longest.max(now.saturating_sub(step_started) as i64);
+                        }
+                        step_started = now;
+                        if let Some(left) = lease_left_ms(db, lease).await {
+                            if left < term_ms / 2 + 2 * longest {
+                                break Some((
+                                    format!("yielded with {left} ms of the lease's term left"),
+                                    false,
+                                ));
+                            }
+                        }
+                    }
+                    reads += 1;
+                    match source.header_by_hash(&want).await {
+                        Ok(h) if h.height == height && h.hash.eq_ignore_ascii_case(&want) => {
+                            want = h.previous_hash.clone();
+                            read.push(h.clone());
+                            run.push(h);
+                        }
+                        Ok(h) => {
+                            break Some((
+                                format!(
+                                    "a courier answered {} at {} for {want} at {height}",
+                                    h.hash, h.height
+                                ),
+                                true,
+                            ))
+                        }
+                        Err(e) => {
+                            break Some((
+                                format!("no courier served {want} at {height}: {e}"),
+                                true,
+                            ))
+                        }
+                    }
+                }
             }
-        }
-        let to = end.min(from.saturating_add(HEAL_STEP - 1));
-        let started = clock_ms();
-        let step = fetch_span(source, from, to).await;
-        longest = longest.max(clock_ms().saturating_sub(started) as i64);
-        let whole = step.len() as u32 == to - from + 1;
-        fetched.extend(step);
-        if !whole {
-            break;
-        }
-        from = to + 1;
-    }
-    if let Some(left) = yielded {
-        log!(
-            "Cron: link heal: yielded at {from} with {left} ms of the lease's term left; read {}..{from} this pass, the next goes on",
-            floor + 1
-        );
-    }
-    if fetched.is_empty() && yielded.is_some() {
-        return false;
-    }
-    if let Some(left) = lease_left_ms(db, lease).await.filter(|left| *left <= 0) {
-        log_error!(
-            "Cron: link heal: the lease's term ran out before the write ({left} ms); {} heights read, nothing written",
-            fetched.len()
-        );
-        return false;
-    }
-    if fetched.is_empty() {
-        record_fault(
-            db,
-            &format!(
-                "link heal: no courier served the header at {} (the chain is not linked there)",
-                floor + 1
-            ),
-        )
-        .await;
-        return false;
-    }
-    let active: Vec<BlockHeader> =
-        match crate::d1::Query::new(storage::sql_active_headers_between())
-            .bind(floor + 1)
-            .bind(end)
-            .all::<storage::HeaderRow>(db)
-            .await
-        {
-            Ok(rows) => rows.into_iter().map(|r| r.into_block_header()).collect(),
-            Err(e) => {
-                log_error!("Cron: link heal: the active rows could not be read: {e:?}");
-                return false;
+            if run.len() >= storage::MAX_ACTIVATION || height == 0 {
+                break Some((
+                    format!(
+                        "the run the chain names reaches no active row within {} heights",
+                        storage::MAX_ACTIVATION
+                    ),
+                    true,
+                ));
             }
+            height -= 1;
         };
-    // The child: the highest fetched header the active chain already holds.
-    // The run under it is what the activating path makes the active rows.
-    let child = fetched.iter().rposition(|h| {
-        active
-            .iter()
-            .any(|r| r.height == h.height && r.hash.eq_ignore_ascii_case(&h.hash))
-    });
-    let run = match child {
-        Some(k) if k > 0 => &fetched[..k],
-        _ => &fetched[..],
-    };
-    let (first, last) = (run[0].height, run[run.len() - 1].height);
-    match storage::ingest_pushed(db, params, run).await {
-        Ok(out) if out.outcome != "storedInactive" => {
-            log!(
-                "Cron: link heal: {first}..={last} {} ({} canonicalized)",
-                out.outcome,
-                out.canonicalized
+        if lease_left_ms(db, lease).await.is_some_and(|left| left <= 0) {
+            log_error!(
+                "Cron: link heal: the lease's term ran out before the write; {} heights read, nothing written",
+                read.len()
             );
-            true
+            break 'breaks;
         }
-        Ok(out) => {
-            record_fault(
-                db,
-                &format!(
-                    "link heal: {first}..={last} stored inactive: {}",
-                    out.reason.unwrap_or_default()
-                ),
-            )
-            .await;
-            false
-        }
-        Err(storage::IngestError::Refused(e)) | Err(storage::IngestError::Store(e)) => {
-            record_fault(db, &format!("link heal: {first}..={last}: {e}")).await;
-            false
+        let at = broken.height;
+        match stop {
+            None if run.is_empty() => {}
+            None => {
+                run.reverse();
+                let (first, last) = (run[0].height, run[run.len() - 1].height);
+                match storage::ingest_pushed(db, params, &run).await {
+                    Ok(out) if out.outcome != "storedInactive" => {
+                        log!(
+                            "Cron: link heal: {first}..={last} {} ({} canonicalized, {} read this pass)",
+                            out.outcome,
+                            out.canonicalized,
+                            read.len()
+                        );
+                        healed = true;
+                    }
+                    Ok(out) => {
+                        record_fault(
+                            db,
+                            &format!(
+                                "link heal: {first}..={last} stored inactive: {}",
+                                out.reason.unwrap_or_default()
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(storage::IngestError::Refused(e)) | Err(storage::IngestError::Store(e)) => {
+                        record_fault(db, &format!("link heal: {first}..={last}: {e}")).await;
+                    }
+                }
+            }
+            Some((why, fault)) => {
+                if !read.is_empty() {
+                    match storage::store_heal_progress(db, params, &read).await {
+                        Ok(kept) => log!(
+                            "Cron: link heal: under the break at {at}, kept {kept} rows read this pass ({}..={}); the next pass goes on from {want}",
+                            read[read.len() - 1].height,
+                            read[0].height
+                        ),
+                        Err(e) => {
+                            record_fault(db, &format!("link heal: under the break at {at}: {e}")).await;
+                            break 'breaks;
+                        }
+                    }
+                }
+                if fault {
+                    // This break waits on its fault; the others go on.
+                    record_fault(db, &format!("link heal: under the break at {at}: {why}")).await;
+                    continue;
+                }
+                log!("Cron: link heal: under the break at {at}: {why}; the next pass goes on");
+                break 'breaks;
+            }
         }
     }
+    if healed {
+        if let Err(e) = storage::link_active_span(db, report.from, report.to).await {
+            log_error!("Cron: link heal: the window's rows were not linked by id: {e:?}");
+        }
+    }
+    healed
 }
 
 /// #31: the store's tip and the highest height a courier or the push named,
@@ -1288,72 +1479,85 @@ pub(crate) async fn insert_with_parent_backfill(
     Ok(repaired)
 }
 
-/// The read-through for a FRESH block (`routes::ensure_fresh_header`): fill
-/// `tip + 1 ..= height` from `source` through the full validation path (the
-/// node's rules, the parent walk) and announce whatever landed. `Some` when
-/// the whole span landed; `None` when a header could not be had or was
-/// refused, which the route answers as "unable to verify", never an error
-/// page and never "no such block". Rule 28 (H12): `source` is the courier
-/// ladder on the worker, so a fresh block never depends on one courier.
+/// What the read-through fetched (`read_through`).
+#[derive(Debug, Default)]
+pub(crate) struct Fetched {
+    /// `tip + 1 ..` by height through the ladder, up to the height asked or
+    /// the height no courier served.
+    pub run: Vec<BlockHeader>,
+    /// The header at the height asked, when the whole run passed the node's
+    /// rules on the stored chain (`storage::judge_above`).
+    pub answer: Option<BlockHeader>,
+    /// The run goes to the push's door (`push::hand_over`): it passed, or
+    /// the rules could not judge it here (its parent is not the stored tip:
+    /// the store moved, or the network reorged; the door's parent walk
+    /// judges it). A run a rule refused is not handed.
+    pub hand: bool,
+}
+
+/// The read-through for a FRESH block (`routes::ensure_fresh_header`):
+/// `tip + 1 ..= height` from `source`, judged by the node's rules on the
+/// stored chain (`storage::judge_above`), never written here. Rule 28
+/// (H12): `source` is the courier ladder on the worker, so a fresh block
+/// never depends on one courier.
 ///
-/// #34: the read-through writes active rows, so it takes the writer lease
-/// as the cron's pass does. Held by another writer (the pass or a push at
-/// the same tip), it writes nothing and the request answers "unable to
-/// verify" for now; the holder is landing the chain, and the next request
-/// reads it from the store. It does not hand its headers to the push's
-/// door: the door walks back by hash from one pushed tip, and the
-/// read-through fills a span by height under the same parent walk the pass
-/// uses, so the lease alone is the smaller change.
+/// #34 (lane/ct-34-b, R1 on PR #36): a public request never holds the
+/// writer lease across its own life. At 7b1c2d5 the read-through took the
+/// cron's 120 s lease around its courier reads and its write; a caller
+/// that went away (LOW's 2 s deadline) ended the request with the lease
+/// held, and every pass, push and read-through was turned away for two
+/// minutes, #32's stall through a new door. Now the request reads and
+/// judges, answers from what the store holds and the judged header, and
+/// hands the run to the push's door (`push::hand_over`) off its own life
+/// (`ctx.wait_until` on the Worker): the door takes the lease for one
+/// header's write at a time, asks again while it is held and drops with
+/// its line after its asks, as a tip event does.
 pub(crate) async fn read_through(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,
-    hooks: &impl TipWebhooks,
     tip: u32,
     height: u32,
-) -> Result<Option<()>> {
-    let lease = take_lease(db, "read").await;
-    if let Lease::Busy = lease {
-        log!("read-through: another writer holds the store (the writer lease); {height} is unverified for now");
-        return Ok(None);
-    }
-    let result = read_through_held(db, params, source, hooks, tip, height).await;
-    release_lease(db, lease).await;
-    result
-}
-
-async fn read_through_held(
-    db: &impl HeaderDb,
-    params: &ChainParams,
-    source: &impl ChainSource,
-    hooks: &impl TipWebhooks,
-    tip: u32,
-    height: u32,
-) -> Result<Option<()>> {
-    // Fill the whole gap tip+1..=height so linkage/backfill stays simple.
+) -> Result<Fetched> {
+    let mut run = Vec::new();
     for h in (tip + 1)..=height {
         match source.header_by_height(h).await {
-            Ok(header) => {
-                // P0-4: a header the node's rules refuse is never stored, and
-                // the request answers "unable to verify", never an error page.
-                if let Err(e) = insert_with_parent_backfill(db, params, source, header).await {
-                    log!("read-through: header at {h} refused: {e:?}");
-                    announce_tip(db, hooks, None).await;
-                    return Ok(None);
-                }
-            }
+            Ok(header) => run.push(header),
             Err(e) => {
                 log!("read-through: no courier has the header at {h} yet: {e:?}");
-                // Whatever DID land is a tip move the consumers must hear.
-                announce_tip(db, hooks, None).await;
-                return Ok(None);
+                break;
             }
         }
     }
-    // The chain tip moved on a consumer's request, not the cron's: announce it
-    // here (bsv-low W2-P4 ; the cron alone left block 965076 unannounced).
-    announce_tip(db, hooks, None).await;
-    Ok(Some(()))
+    if run.is_empty() {
+        return Ok(Fetched::default());
+    }
+    let whole = run[run.len() - 1].height == height;
+    Ok(match storage::judge_above(db, params, &run).await? {
+        storage::Judged::Passed => Fetched {
+            answer: if whole { run.last().cloned() } else { None },
+            run,
+            hand: true,
+        },
+        storage::Judged::Unjudged(why) => {
+            log!("read-through: {why}; the door judges the run");
+            Fetched {
+                run,
+                answer: None,
+                hand: true,
+            }
+        }
+        storage::Judged::Refused(e) => {
+            // P0-4: a header the node's rules refuse is never stored, and
+            // the request answers "unable to verify", never an error page.
+            log!("read-through: refused: {e:?}");
+            Fetched {
+                run,
+                answer: None,
+                hand: false,
+            }
+        }
+    })
 }
 
 /// The headers of `from ..= to` by height from `source`, in order, ending at
@@ -1394,7 +1598,7 @@ pub(crate) async fn bulk_write(
         log!("bulk-sync: another writer holds the store (the writer lease); nothing written");
         return Ok(None);
     }
-    let result = bulk_write_held(db, params, headers).await;
+    let result = bulk_write_held(&Fenced::new(db, &lease), params, headers).await;
     release_lease(db, lease).await;
     result.map(Some)
 }
@@ -1412,27 +1616,48 @@ async fn bulk_write_held(
 
 /// `POST /admin/ingest`'s write (`storage::ingest_pushed`, the function the
 /// heal runs). `None`: another writer holds the store, nothing written.
+/// #34 (lane/ct-34-b, Read B's (1) on PR #36): under the writer lease and
+/// its fence, as the pass's heal: an operator's push during a pass was an
+/// unserialized second writer of the same rows. The route answers a held
+/// lease with 503 and its reason; the operator runs it again.
 pub(crate) async fn admin_ingest_write(
     db: &impl HeaderDb,
     params: &ChainParams,
     headers: &[BlockHeader],
 ) -> std::result::Result<Option<storage::IngestOutcome>, storage::IngestError> {
-    storage::ingest_pushed(db, params, headers).await.map(Some)
+    let lease = take_lease(db, "admin-ingest").await;
+    if let Lease::Busy = lease {
+        log!("admin ingest: another writer holds the store (the writer lease); nothing written");
+        return Ok(None);
+    }
+    let result = storage::ingest_pushed(&Fenced::new(db, &lease), params, headers).await;
+    release_lease(db, lease).await;
+    result.map(Some)
 }
 
 /// `/admin/backfill`'s write of the span it fetched (the batch through the
 /// node's rules), and the heights where another row stays active
 /// (`leftInactive`). `None`: another writer holds the store, nothing written.
+/// #34 (lane/ct-34-b, Read B's (1) on PR #36): the write activates rows
+/// stored inactive, so it takes the lease as `/admin/bulk-sync` does, after
+/// the route's courier reads (up to 800; never under the lease), and writes
+/// behind the fence.
 pub(crate) async fn backfill_write(
     db: &impl HeaderDb,
     params: &ChainParams,
     headers: &[BlockHeader],
 ) -> Result<Option<(u32, Vec<u32>)>> {
-    let inserted = if headers.is_empty() {
-        0
-    } else {
-        storage::insert_headers_batch(db, params, headers).await?
-    };
+    if headers.is_empty() {
+        return Ok(Some((0, Vec::new())));
+    }
+    let lease = take_lease(db, "admin-backfill").await;
+    if let Lease::Busy = lease {
+        log!("admin backfill: another writer holds the store (the writer lease); nothing written");
+        return Ok(None);
+    }
+    let result = storage::insert_headers_batch(&Fenced::new(db, &lease), params, headers).await;
+    release_lease(db, lease).await;
+    let inserted = result?;
     let left_inactive = storage::heights_not_served(db, headers).await?;
     Ok(Some((inserted, left_inactive)))
 }

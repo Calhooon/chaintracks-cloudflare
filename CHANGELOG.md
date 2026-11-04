@@ -2,14 +2,17 @@
 
 ## [Unreleased]
 
-The follow-ups of the orphan-tip fix (#31) under the writer lease (#34):
+The follow-ups of the orphan-tip fix (#31) under the writer lease (#34), with the fix round of its two reads (Read B on PR #36):
 
-- The public read-through and `/admin/bulk-sync` take the writer lease; held elsewhere, the read-through answers "unable to verify" for now and bulk-sync answers 503 with nothing written.
-- A poll the lease turned away is no poll: the object's quiet interval restarts only for a pass that ran (`/polled?ran=0`).
+- The public read-through holds no lease across its own life: it reads and judges the blocks without a write (`storage::judge_above`), answers from the judged header, and hands the run to the push's door after its answer (`waitUntil`; 9 asks 2 s apart while the lease is held, then dropped with its line). At 7b1c2d5 it held the cron's 120 s lease around its courier reads, and a caller that went away left it held for the term.
+- `/admin/bulk-sync`, `POST /admin/ingest` and `/admin/backfill` take the writer lease (the backfill after its courier reads); held elsewhere they answer 503 with the reason and write nothing.
+- The fence: every write of the `headers` table a lease holder makes carries one guard statement in its own transaction (`sync::FENCE_SQL`, failing on `sync_state`'s `CHECK (id = 1)`), so a holder past its term, or one whose lease another writer took, writes nothing more; it logs one line, records the fault in `lastSyncError` and stops, and the next writer goes on from the rows it wrote. A pass longer than the term now stops at it instead of writing on unserialized.
+- A poll the lease turned away is no poll: the object's quiet interval restarts only for a pass that ran (`/polled?ran=0`). A pass that ends in an error counts as not run too, so a store faulting every tick polls every tick instead of once a quiet interval.
 - A push still turned away after its 15 asks is dropped with one line naming the header (`last_fault`), and `busy` counts events, not asks.
-- A push turned away, or refused because its ancestry could not be had (`ancestry-missing`, the parent walk's refusals), records its height as seen within 37 of the served tip, so the behind rule counts from the next tick.
-- A heal stays inside the lease's term: 10 heights a span, the remaining term read before each, yielding with its progress in `linkState` when less than half the term plus twice its longest span is left.
-- The README names the five writers, the idle pass's lease writes and the routes outside the lease (`/admin/ingest`, `/admin/backfill`).
+- A push turned away through its asks, or refused because its ancestry could not be had (`ancestry-missing`, the parent walk's refusals), leaves its height on the object as a hint to poll (`hintHeight`): the behind rule counts it from the next tick until a poll runs. It never raises `lastSeenHeight` or `/getPresentHeight`.
+- The heal walks back by hash from the row above each broken link, from the highest break down, through the store where the rows are held and the ladder where they are not, and activates the run the chain names whatever is active at its heights: a band of rival active rows and a hole two or more heights deep (#37) heal, where the forward walk read the same heights every pass for no progress.
+- A heal stays inside the lease's term: the remaining term read before every 10 courier reads, yielding when less than half the term plus twice its longest step is left, and keeping the rows it read (inactive, never served) so the next pass goes on from them; a run that reaches no active row within 400 heights stops with that reason recorded.
+- The README names the writers, the fence, the read-through's hand-off and the hint.
 
 ## [0.7.2] - 2026-11-03
 
