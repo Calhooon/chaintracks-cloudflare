@@ -217,6 +217,107 @@ pub(crate) fn leased(handed: Vec<Handed>) -> Vec<Handed> {
     handed[1..handed.len() - 1].to_vec()
 }
 
+/// #34: a writer's view of the store that checks every write of the
+/// `headers` table at the storage seam: the write must land while the
+/// writer lease is this writer's (taken through this view, not given back)
+/// and inside its term (`lease_until`, the second it frees at). Each writer
+/// of a race gets its own view over the one store, so a write made while
+/// another writer holds the lease is caught as surely as one made with none.
+/// What it caught: `unleased()`.
+pub(crate) struct Guard<'a, D: HeaderDb> {
+    inner: &'a D,
+    store: &'a SqliteDb,
+    role: &'static str,
+    held: RefCell<Option<String>>,
+    unleased: RefCell<Vec<String>>,
+}
+
+impl<'a, D: HeaderDb> Guard<'a, D> {
+    pub fn new(inner: &'a D, store: &'a SqliteDb, role: &'static str) -> Self {
+        Self {
+            inner,
+            store,
+            role,
+            held: RefCell::new(None),
+            unleased: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The `headers` writes made outside this writer's lease or its term.
+    pub fn unleased(&self) -> Vec<String> {
+        self.unleased.borrow().clone()
+    }
+
+    fn check(&self, sql: &str) {
+        if !(sql.starts_with("INSERT OR IGNORE INTO headers") || sql.starts_with("UPDATE headers "))
+        {
+            return;
+        }
+        let (owner, left_ms): (Option<String>, Option<f64>) = self
+            .store
+            .conn()
+            .query_row(
+                "SELECT lease_owner, (lease_until + 1 - (julianday('now') - 2440587.5) * 86400.0) * 1000.0 \
+                 FROM sync_state WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let held = self.held.borrow().clone();
+        let why = match (&held, &owner, left_ms) {
+            (None, _, _) => Some("no lease taken".to_string()),
+            (Some(h), Some(o), Some(left)) if h == o && left > 0.0 => None,
+            (Some(h), Some(o), Some(left)) if h == o => {
+                Some(format!("{:.0} ms past the term", -left))
+            }
+            (Some(_), o, _) => Some(format!("the lease is {o:?}'s")),
+        };
+        if let Some(why) = why {
+            let head: String = sql.chars().take(48).collect();
+            self.unleased
+                .borrow_mut()
+                .push(format!("{}: {why}: {head}", self.role));
+        }
+    }
+}
+
+impl<D: HeaderDb> HeaderDb for Guard<'_, D> {
+    async fn first<T: DeserializeOwned>(&self, q: Query) -> worker::Result<Option<T>> {
+        self.inner.first(q).await
+    }
+
+    async fn all<T: DeserializeOwned>(&self, q: Query) -> worker::Result<Vec<T>> {
+        self.inner.all(q).await
+    }
+
+    async fn execute(&self, q: Query) -> worker::Result<u32> {
+        let owner = match q.params().first() {
+            Some(QVal::Text(s)) => Some(s.clone()),
+            _ => None,
+        };
+        if q.sql() == crate::sync::TAKE_LEASE_SQL {
+            let changed = self.inner.execute(q).await?;
+            if changed == 1 {
+                *self.held.borrow_mut() = owner;
+            }
+            return Ok(changed);
+        }
+        if q.sql() == crate::sync::RELEASE_LEASE_SQL {
+            *self.held.borrow_mut() = None;
+            return self.inner.execute(q).await;
+        }
+        self.check(q.sql());
+        self.inner.execute(q).await
+    }
+
+    async fn batch(&self, stmts: Vec<Query>) -> worker::Result<()> {
+        for q in &stmts {
+            self.check(q.sql());
+        }
+        self.inner.batch(stmts).await
+    }
+}
+
 /// One scripted interleaving: a future run against the inner database.
 type Interleave<'a> = Box<dyn FnOnce(&'a SqliteDb) -> Pin<Box<dyn Future<Output = ()> + 'a>> + 'a>;
 
@@ -687,6 +788,8 @@ pub(crate) struct ScriptedChain {
     /// Every call, answered or refused (bsv-low loop 10 D5: the ladder's
     /// per-tick skip of a faulting rung is pinned on this count).
     calls: Cell<u32>,
+    /// #34: the wall time each call takes, in ms (a courier's latency).
+    delay_ms: Cell<u64>,
 }
 
 impl ScriptedChain {
@@ -698,7 +801,13 @@ impl ScriptedChain {
             by_hash: RefCell::new(HashMap::new()),
             unavailable: Cell::new(false),
             calls: Cell::new(0),
+            delay_ms: Cell::new(0),
         }
+    }
+
+    /// #34: every later call takes `ms` of wall time, as a courier's read.
+    pub fn set_delay_ms(&self, ms: u64) {
+        self.delay_ms.set(ms);
     }
     /// How many calls this chain has taken (answered or refused).
     pub fn calls(&self) -> u32 {
@@ -723,6 +832,9 @@ impl ScriptedChain {
 
     fn down(&self) -> worker::Result<()> {
         self.calls.set(self.calls.get() + 1);
+        if self.delay_ms.get() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms.get()));
+        }
         if self.unavailable.get() {
             Err(worker::Error::RustError(
                 "scripted chain: unavailable".to_string(),

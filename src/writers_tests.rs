@@ -303,7 +303,7 @@ async fn a_second_of_the_push(
 }
 
 /// One cron tick at `now`, as `sync::poll_for_new_blocks` and the object's
-/// `/wake` run it: the behind count, the poll rule, then the poll or the
+/// `/wake` and `/polled` run it: the behind count, the poll rule, then the poll or the
 /// tick the push covers, both handed the ladder. Answers whether it polled.
 async fn a_cron_tick(
     db: &SqliteDb,
@@ -315,9 +315,10 @@ async fn a_cron_tick(
     let hooks = RecordedWebhooks::new("", "");
     poll.note_behind(store_behind(db).await);
     let due = poll_due(st, poll, now, HB, QUIET);
+    poll.woke(due, now);
     if due.is_some() {
-        poll.last_poll_at = now;
-        run_cron(db, params(), source, None, &hooks).await.unwrap();
+        let ran = run_cron(db, params(), source, None, &hooks).await.unwrap();
+        poll.polled(0, ran, now);
     } else {
         run_pushed_tick(db, params(), source, &hooks).await.unwrap();
     }

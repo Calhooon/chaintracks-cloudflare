@@ -72,6 +72,10 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
     let result = if poll {
         let ladder = courier_ladder(env, &chain);
         let result = run_cron(&db, &params, &ladder, upstream_url.as_deref(), &tick).await;
+        // #34: a pass the lease turned away asked no courier.
+        #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
+        let ran = matches!(result, Ok(true));
+        let result = result.map(|_| ());
         let requests = ladder.requests();
         log!(
             "Cron: the poll asked the couriers {requests} times ({})",
@@ -81,7 +85,7 @@ pub async fn poll_for_new_blocks(env: &Env) -> Result<()> {
                 .unwrap_or("no push source answered")
         );
         #[cfg(target_arch = "wasm32")]
-        crate::tip_stream::polled(env, requests).await;
+        crate::tip_stream::polled(env, requests, ran).await;
         result
     } else {
         log!("Cron: the push is live; the couriers are not asked this tick");
@@ -154,6 +158,27 @@ async fn run_pushed_tick_held(
 /// unserialized, as every pass did before the lease.
 pub(crate) const LEASE_S: u32 = 120;
 
+#[cfg(test)]
+thread_local! {
+    /// #34: a test's lease term in seconds (`set_lease_term`); `None`: `LEASE_S`.
+    static TEST_LEASE_S: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// #34 (test only): the term every lease taken on this thread carries.
+#[cfg(test)]
+pub(crate) fn set_lease_term(seconds: Option<u32>) {
+    TEST_LEASE_S.with(|t| t.set(seconds));
+}
+
+/// The term a lease is taken for: `LEASE_S`, or a test's own.
+pub(crate) fn lease_term() -> u32 {
+    #[cfg(test)]
+    if let Some(s) = TEST_LEASE_S.with(|t| t.get()) {
+        return s;
+    }
+    LEASE_S
+}
+
 /// #31: take the lease, when it is free, expired, or this owner's. Binds:
 /// ?1 the owner, ?2 the term in seconds.
 pub(crate) const TAKE_LEASE_SQL: &str = "UPDATE sync_state SET lease_owner = ?1, \
@@ -189,7 +214,7 @@ pub(crate) async fn take_lease(db: &impl HeaderDb, role: &str) -> Lease {
     let owner = format!("{role}:{}", hex::encode(token));
     match crate::d1::Query::new(TAKE_LEASE_SQL)
         .bind(owner.as_str())
-        .bind(LEASE_S)
+        .bind(lease_term())
         .run_changes(db)
         .await
     {
@@ -437,23 +462,26 @@ impl ChainSource for WocClient {
 }
 
 /// The cron's body, on any store, chain source and webhook consumer.
+/// Answers whether the pass ran: `false` when another writer held the lease
+/// and the pass wrote nothing (#34: the object's quiet timer is not reset by
+/// a pass that asked no courier).
 pub(crate) async fn run_cron(
     db: &impl HeaderDb,
     params: &ChainParams,
     source: &impl ChainSource,
     upstream_url: Option<&str>,
     hooks: &impl TipWebhooks,
-) -> Result<()> {
+) -> Result<bool> {
     // #31 (#32 ask 1): the pass holds the writer lease; a pass that finds it
     // held writes nothing and the next tick asks again.
     let lease = take_lease(db, "cron").await;
     if let Lease::Busy = lease {
         log!("Cron: another writer holds the store (the writer lease); this pass writes nothing");
-        return Ok(());
+        return Ok(false);
     }
     let result = run_cron_held(db, params, source, upstream_url, hooks).await;
     release_lease(db, lease).await;
-    result
+    result.map(|()| true)
 }
 
 async fn run_cron_held(
@@ -1215,6 +1243,22 @@ pub(crate) async fn fetch_span(source: &impl ChainSource, from: u32, to: u32) ->
         }
     }
     headers
+}
+
+/// `/admin/bulk-sync`'s write of one span (the route's fetch done): the
+/// batch through the node's rules (refused whole when any header fails
+/// them), the dual-active sweep this path can need (review M-3; otherwise
+/// only the catch-up runs it), and the tip chosen after it (#32). Answers
+/// the rows inserted.
+pub(crate) async fn bulk_write(
+    db: &impl HeaderDb,
+    params: &ChainParams,
+    headers: &[BlockHeader],
+) -> Result<Option<u32>> {
+    let inserted = storage::insert_headers_batch(db, params, headers).await?;
+    storage::dedupe_active_heights(db).await?;
+    storage::update_chain_tip_to_highest(db).await?;
+    Ok(Some(inserted))
 }
 
 /// A PEER header service: another service speaking the header protocol, asked

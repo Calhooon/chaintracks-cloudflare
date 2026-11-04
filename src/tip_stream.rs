@@ -152,6 +152,26 @@ pub(crate) struct PollState {
 }
 
 impl PollState {
+    /// The object's `/wake`: the poll rule's answer for this tick, counted.
+    pub fn woke(&mut self, due: Option<&str>, now: u64) {
+        match due {
+            Some(why) => {
+                self.polls_run += 1;
+                self.last_poll_at = now;
+                self.last_reason = Some(why.to_string());
+            }
+            None => self.polls_skipped += 1,
+        }
+    }
+
+    /// The object's `/polled`: the pass the tick ran asked the couriers
+    /// `requests` times; `ran` is false when the writer lease turned the
+    /// pass away (`sync::run_cron`).
+    pub fn polled(&mut self, requests: u32, ran: bool, now: u64) {
+        let _ = (ran, now);
+        self.poll_requests += requests;
+    }
+
     /// #31: one cron tick's answer to "is the store behind the seen tip".
     pub fn note_behind(&mut self, behind: bool) {
         self.behind_ticks = if behind {
@@ -184,6 +204,48 @@ pub(crate) fn poll_due(
     (now.saturating_sub(heard) >= quiet_ms).then_some("the push was quiet for the interval")
 }
 
+/// #31: a push turned away by the writer lease is asked again this many
+/// times, this far apart: 30 s, inside the heartbeat's 45.
+pub(crate) const BUSY_TRIES: u32 = 15;
+pub(crate) const BUSY_WAIT_MS: u64 = 2_000;
+
+/// One tip event through the door under the writer lease (`ask`, the door's
+/// call): a `"busy"` answer is asked again, `tries` times, `wait` apart.
+/// Answers the door's last answer; a `"busy"` one is counted here, never by
+/// the caller.
+pub(crate) async fn through_the_lease<A, AF, W, WF>(
+    st: &mut StreamState,
+    header: &crate::types::BlockHeader,
+    tries: u32,
+    mut ask: A,
+    mut wait: W,
+    now: impl Fn() -> u64,
+) -> Result<crate::push::Announced, crate::storage::IngestError>
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = Result<crate::push::Announced, crate::storage::IngestError>>,
+    W: FnMut() -> WF,
+    WF: std::future::Future<Output = ()>,
+{
+    let _ = header;
+    let mut asked = 0;
+    loop {
+        let answer = ask().await;
+        match &answer {
+            Ok(a) if a.outcome == "busy" && asked < tries => {
+                asked += 1;
+                st.ingested("busy", now());
+                wait().await;
+            }
+            Ok(a) if a.outcome == "busy" => {
+                st.ingested("busy", now());
+                break answer;
+            }
+            _ => break answer,
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod object {
     use super::*;
@@ -196,10 +258,6 @@ mod object {
     use worker::*;
 
     const KEY: &str = "state";
-    /// #31: a push turned away by the writer lease is asked again this many
-    /// times, this far apart: 30 s, inside the heartbeat's 45.
-    const BUSY_TRIES: u32 = 15;
-    const BUSY_WAIT_MS: u64 = 2_000;
     const POLL_KEY: &str = "poll";
 
     fn now_ms() -> u64 {
@@ -275,14 +333,7 @@ mod object {
                     let mut poll = self.poll().await;
                     poll.note_behind(behind);
                     let due = poll_due(&st, &poll, now, cfg.heartbeat_ms, cfg.quiet_ms);
-                    match due {
-                        Some(why) => {
-                            poll.polls_run += 1;
-                            poll.last_poll_at = now;
-                            poll.last_reason = Some(why.to_string());
-                        }
-                        None => poll.polls_skipped += 1,
-                    }
+                    poll.woke(due, now);
                     storage.put(POLL_KEY, &poll).await?;
                     Response::from_json(&serde_json::json!({
                         "woke": woke,
@@ -294,14 +345,16 @@ mod object {
                     }))
                 }
                 (Method::Post, "/polled") => {
-                    let requests: u32 = req
-                        .url()?
+                    let url = req.url()?;
+                    let requests: u32 = url
                         .query_pairs()
                         .find(|(k, _)| k == "requests")
                         .and_then(|(_, v)| v.parse().ok())
                         .unwrap_or(0);
+                    // #34: absent (an older Worker's call) is a pass that ran.
+                    let ran = !url.query_pairs().any(|(k, v)| k == "ran" && v == "0");
                     let mut poll = self.poll().await;
-                    poll.poll_requests += requests;
+                    poll.polled(requests, ran, now);
                     self.state.storage().put(POLL_KEY, &poll).await?;
                     Response::from_json(&poll)
                 }
@@ -501,26 +554,24 @@ mod object {
             let ladder = sync::courier_ladder(&self.env, &chain);
             // #31: a writer holding the store turns the push away (`busy`);
             // it is asked again, `BUSY_TRIES` times `BUSY_WAIT_MS` apart,
-            // inside the heartbeat.
-            let mut tries = 0;
-            let answer = loop {
-                let answer =
-                    push::ingest_announced(&db, &params, &ladder, &self.env, header.clone()).await;
-                match &answer {
-                    Ok(a) if a.outcome == "busy" && tries < BUSY_TRIES => {
-                        tries += 1;
-                        st.ingested("busy", now_ms());
-                        Delay::from(Duration::from_millis(BUSY_WAIT_MS)).await;
-                    }
-                    _ => break answer,
-                }
-            };
+            // inside the heartbeat (`through_the_lease` counts it).
+            let answer = through_the_lease(
+                st,
+                &header,
+                BUSY_TRIES,
+                || push::ingest_announced(&db, &params, &ladder, &self.env, header.clone()),
+                || Delay::from(Duration::from_millis(BUSY_WAIT_MS)),
+                now_ms,
+            )
+            .await;
             match answer {
                 Ok(a) => {
                     st.drops_in_row = 0;
                     st.last_tip_height = a.tip_height;
                     st.last_tip_hash = a.tip_hash.clone();
-                    st.ingested(a.outcome, now_ms());
+                    if a.outcome != "busy" {
+                        st.ingested(a.outcome, now_ms());
+                    }
                     if a.stored() {
                         log!(
                             "tip stream: {} (walked {}){}, the tip {} {}",
@@ -566,12 +617,16 @@ pub(crate) async fn wake(env: &worker::Env, behind: bool) -> Option<serde_json::
     call(env, url).await
 }
 
-/// The cron's record of a poll's courier requests.
+/// The cron's record of a poll's courier requests, and whether the pass ran
+/// (#34: a pass the writer lease turned away is no poll).
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn polled(env: &worker::Env, requests: u32) {
+pub(crate) async fn polled(env: &worker::Env, requests: u32, ran: bool) {
     let _ = call(
         env,
-        &format!("https://tip-stream/polled?requests={requests}"),
+        &format!(
+            "https://tip-stream/polled?requests={requests}&ran={}",
+            u8::from(ran)
+        ),
     )
     .await;
 }

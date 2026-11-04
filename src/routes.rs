@@ -997,18 +997,18 @@ async fn admin_bulk_sync(
     };
     let count = headers.len();
 
-    // Batch insert (P0-4: refused whole when any header fails the node's rules)
+    // Batch insert (P0-4: refused whole when any header fails the node's
+    // rules), the dual-active sweep and the tip (`sync::bulk_write`).
     let params = crate::sync::chain_params(env, chain)?;
-    let inserted = match storage::insert_headers_batch(db, &params, &headers).await {
-        Ok(n) => n,
-        Err(e) => return wrap_error(&format!("{e}"), 422),
-    };
-
-    // Self-heal dual-active debris this bulk path can create (review M-3 ;
-    // the sweep otherwise only runs on cron catch-up, which may be never).
-    storage::dedupe_active_heights(db).await?;
-    // #32: choose and publish the tip after the old debris is deactivated.
-    storage::update_chain_tip_to_highest(db).await?;
+    let inserted =
+        match crate::sync::bulk_write(db, &params, &headers).await {
+            Ok(Some(n)) => n,
+            Ok(None) => return wrap_error(
+                "another writer holds the store (the writer lease); nothing was written, run again",
+                503,
+            ),
+            Err(e) => return wrap_error(&format!("{e}"), 422),
+        };
 
     wrap_success(serde_json::json!({
         "file": file_name,
