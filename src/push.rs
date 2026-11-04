@@ -98,14 +98,54 @@ pub(crate) async fn ingest_announced(
     // #31 (#32 ask 1): the push writes holding the writer lease, as the
     // cron's pass does; held elsewhere, nothing is written (`"busy"`) and
     // the object asks again.
+    // #34: a push turned away (`"busy"`), or refused because its ancestry
+    // could not be had (the parent walk's two refusals, the rules'
+    // `ancestry-missing`: #32's refusals at 18:48:50Z), names a height the
+    // network has that the store could not judge yet; it is recorded as
+    // seen, as a push that landed is, so the behind rule
+    // (`tip_stream::poll_due`) counts from the next tick instead of waiting
+    // for the store's tip to move. A header a rule refused with its ancestry
+    // in hand (its proof of work, the difficulty, its parent's height)
+    // names nothing, and the height of one not landed counts only within
+    // `PARENT_WALK_LIMIT` above the served tip (`note_unlanded`).
+    let height = header.height;
     let lease = sync::take_lease(db, "push").await;
     if let sync::Lease::Busy = lease {
+        note_unlanded(db, height).await;
         return answer(db, "busy", 0, None).await;
     }
-    let result = ingest_held(db, params, source, hooks, header, &refuse).await;
+    let unjudged = std::cell::Cell::new(false);
+    let result = ingest_held(db, params, source, hooks, header, &refuse, &unjudged).await;
+    if let Err(IngestError::Refused(e)) = &result {
+        if unjudged.get() || e.to_string().contains(ANCESTRY_MISSING) {
+            note_unlanded(db, height).await;
+        }
+    }
     sync::release_lease(db, lease).await;
     result
 }
+
+/// #34: the height of a pushed header that did not land, recorded as seen
+/// when it stands within `PARENT_WALK_LIMIT` (+1) of the served tip: its
+/// height is the peer's claim, unproven by any stored ancestor, so a peer
+/// can raise `lastSeenHeight` (and `/getPresentHeight`) by at most the
+/// walk's bound, until the poll the behind rule brings records the
+/// couriers' answer over it. A read fault is loud and records nothing.
+// Used by the Worker in production and retained for host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+async fn note_unlanded(db: &impl HeaderDb, height: u32) {
+    match storage::find_chain_tip(db).await {
+        Ok(Some(tip)) if height <= tip.height.saturating_add(PARENT_WALK_LIMIT as u32 + 1) => {
+            sync::note_seen(db, height).await
+        }
+        Ok(_) => {}
+        Err(e) => log_error!("push: the tip read for the seen height failed: {e:?}"),
+    }
+}
+
+/// #34: the rules' refusal of a header whose ancestors are not stored
+/// (`consensus::HeaderFault::AncestryMissing`), as its text carries it.
+const ANCESTRY_MISSING: &str = ": ancestry-missing: ";
 
 // Used by the Worker in production and retained for host tests.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -116,6 +156,7 @@ async fn ingest_held<F, Fut>(
     hooks: &impl TipWebhooks,
     header: BlockHeader,
     refuse: &F,
+    unjudged: &std::cell::Cell<bool>,
 ) -> Result<Announced, IngestError>
 where
     F: Fn(worker::Error) -> Fut,
@@ -140,6 +181,7 @@ where
                 run[run.len() - 1].hash,
                 run[run.len() - 1].height
             ));
+            unjudged.set(true);
             return Err(refuse(e).await);
         }
         match source.header_by_hash(&want).await {
@@ -148,6 +190,7 @@ where
                 let e = worker::Error::RustError(format!(
                     "the parent {want} of a pushed header could not be had: {e}"
                 ));
+                unjudged.set(true);
                 return Err(refuse(e).await);
             }
         }
