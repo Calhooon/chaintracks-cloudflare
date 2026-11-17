@@ -28,7 +28,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: . -> target
-    - run: cargo test --no-fail-fast
+    - run: cargo test --locked --no-fail-fast
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -56,8 +56,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         workspaces: . -> target
-    - run: cargo clippy --all-targets -- -D warnings
-    - run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+    - run: cargo clippy --locked --all-targets -- -D warnings
+    - run: cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
   wasm32:
     name: wasm32
     runs-on: ubuntu-latest
@@ -72,7 +72,8 @@ jobs:
       with:
         workspaces: . -> target
     - run: cargo install worker-build@0.7.5 --locked
-    - run: worker-build --release
+    - run: worker-build --release --locked
+    - run: git diff --exit-code
   worker:
     env:
       # the bootstrap witness caches its two bulk files under the target dir (tests/worker_bootstrap.mjs)
@@ -93,13 +94,14 @@ jobs:
       with:
         node-version: '22'
     - run: cargo install worker-build@0.7.5 --locked
-    - run: worker-build --release
+    - run: worker-build --release --locked
+    - run: git diff --exit-code
     - run: npm install --prefix "$RUNNER_TEMP/worker-gate-node" --no-save --package-lock=false miniflare@4.20260426.0
     - run: |
         export MINIFLARE_MODULE="$RUNNER_TEMP/worker-gate-node/node_modules/miniflare/dist/src/index.js"
         export LANE32_WITNESS_FILE="$RUNNER_TEMP/chain-events.json"
         rm -f "$LANE32_WITNESS_FILE"
-        cargo test --lib chain_event_tests::scenario_announced_nobody_hears_has_a_versioned_reorg --no-fail-fast -- --exact
+        cargo test --locked --lib chain_event_tests::scenario_announced_nobody_hears_has_a_versioned_reorg --no-fail-fast -- --exact
         test -s "$LANE32_WITNESS_FILE"
         # worker_events.mjs runs both chain-event feeds itself; the others run under each.
         node tests/worker_events.mjs "$LANE32_WITNESS_FILE" || exit
