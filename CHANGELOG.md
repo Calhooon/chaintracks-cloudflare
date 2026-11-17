@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.4] - 2026-11-17
+
+The bsv-rs floor (#44). No source line of this crate moves, and no migration is added (the last is `0015_writer_lease.sql`):
+
+- The bsv-rs requirement is `0.8.11` (it was `0.8.1`; a caret requirement still, `default-features = false`, `features = ["block"]`), the newest 0.8 release on the crates.io index that is not yanked (read 2026-11-17 13:42Z; no 0.8.12 there). `Cargo.lock` is not tracked here, so the requirement is the floor of every build: the 0.7.3 build resolved 0.8.3, and a build of this version resolves 0.8.11 or later. `/health`'s `build` names the version it resolved.
+- What this build compiles of bsv-rs is the `block` feature alone, which is `block` and `primitives` (bsv-rs's feature table: `block = ["primitives"]`), with `error` and `util`. What this Worker calls is `src/block` (the header frame, the compact target, chain work, the difficulty rule) and, of `primitives`, `hash.rs` and `u256.rs`: each of those files is byte for byte the same in the 0.8.3 and 0.8.11 crate files, so no answer of this service moves.
+- Of the nineteen advisories bsv-rs has published (its Security tab, read 2026-11-17), three name code under `primitives`, which this build compiles, and all three are closed by the new floor. This Worker calls none of the three doors:
+  - GHSA-9c8r-76f3-m426 (`Signature::from_der` read malformed encodings of a valid signature as that signature; `primitives::ec`), patched in 0.8.6.
+  - GHSA-cwxv-4866-5gq2 (a Shamir backup share at x = 0 accepted at recovery, `KeyShares::from_backup_format`; `primitives::bsv::shamir`), patched in 0.8.7.
+  - GHSA-67vc-6c8g-7x48 (`sighash::parse_transaction` read a transaction from the front of a longer buffer; `primitives::bsv::sighash`), patched in 0.8.11.
+- The other sixteen name code under features this build does not compile (`transaction`, `script`, `auth`, `overlay`, `kvstore`, `registry`, `identity`), so none of that code is in the Worker at any version: GHSA-j8hr-pjhm-6h27, GHSA-84xq-3662-pvx5, GHSA-gg5p-wgff-v3hr, GHSA-mj2m-jxgv-r446, GHSA-89w7-x33x-6m9c, GHSA-4mcm-g5xq-jv3r, GHSA-w6jf-m9c7-6599, GHSA-crr5-gh8p-q2h2, GHSA-x3m6-jp5x-236c, GHSA-vmgj-w2jr-c52x, GHSA-qhj8-j8mj-9cgc, GHSA-fr33-7jw7-mwwh, GHSA-h4m7-c6p8-725m, GHSA-cgp9-rj5h-jxw6, GHSA-gvmh-f5gf-5vjj and GHSA-82g9-h6jw-r99f. Fifteen of them are patched at or below 0.8.11 all the same.
+- The sixteenth, GHSA-82g9-h6jw-r99f (`Transaction::from_ef` and `from_hex_ef` allocate without a bound over the transaction), has no patched version: its remedy is the caller's, `from_ef_bounded` and `from_hex_ef_bounded`. Outside this entry the tree holds 0 occurrences of `from_ef` or `from_hex_ef` (the whole tree searched, tests and docs included), and the `transaction` feature that carries them is not compiled: there is nothing to bound here.
+- No other dependency's requirement moves.
+
 ## [0.7.3] - 2026-11-04
 
 The follow-ups of the orphan-tip fix (#31) under the writer lease (#34, PR #36), with the findings of its reads: Read A (the hand-off's ask count, the read-through's courier reads under the lease), Read B (the read-through holding the cron's lease, the fence, the admin writes outside the lease, the heal's yield over rival rows, the seen height), Read A2 (a heal witness that depended on the clock, the webhook sends inside the lease, a lapsed pass stamped as completed, bulk-sync's lapse answered 422) and Read B2 (the hand-off's retries per header past `waitUntil`'s 30 s, #38); #37 closes inside the heal, and #39 stays open:
