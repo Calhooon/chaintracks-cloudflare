@@ -1,6 +1,6 @@
 [package]
 name = "bsv-chaintracks-cloudflare"
-version = "0.7.3"
+version = "0.7.4"
 description = "A BSV block-header service on Cloudflare Workers: D1 header storage, R2 bulk export, a chain-event feed."
 license = "MIT"
 repository = "https://github.com/Calhooon/chaintracks-cloudflare"
@@ -43,7 +43,7 @@ hex = "0.4"
 url = "2"
 # The chain primitives (the header frame, the compact target, chain work,
 # sha256d) and the difficulty rule are bsv-rs's; the caret, one bsv-rs per lock.
-bsv-rs = { version = "0.8.1", default-features = false, features = ["block"] }
+bsv-rs = { version = "0.8.11", default-features = false, features = ["block"] }
 futures-util = "0.3"
 
 [dev-dependencies]
