@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.5] - 2026-11-17
+
+The bsv-rs floor at 0.8.12. No source line of this crate moves, and no migration is added (the last is `0015_writer_lease.sql`):
+
+- The bsv-rs requirement is `0.8.12` (it was `0.8.11`; a caret requirement still, `default-features = false`, `features = ["block"]`), the release that closes GHSA-33fm-jcm5-4m3m. The tracked `Cargo.lock` moves bsv-rs alone (0.8.11 to 0.8.12, with this crate's own version): 0.8.12 requires no dependency differently. `/health`'s `build` names 0.8.12.
+- What 0.8.12 changes is the BEEF linker of the `transaction` feature alone (`src/transaction/beef.rs`, `src/transaction/beef/link.rs` and the new `src/transaction/beef/link_limits.rs`: a heap bound on linking, `BeefLinkLimits::max_link_heap_bytes`, 56 MiB by default, beside the wire bound). This build compiles the `block` feature (`block` and `primitives`), not `transaction`, and this Worker reads headers, not BEEFs: every file of `src/block`, `src/primitives`, `error` and `util` is byte for byte the same in the 0.8.11 and 0.8.12 crate files, so no answer of this service moves.
+- No other dependency's requirement moves.
+
 ## [0.7.4] - 2026-11-17
 
 The bsv-rs floor (#44). No source line of this crate moves, and no migration is added (the last is `0015_writer_lease.sql`):
