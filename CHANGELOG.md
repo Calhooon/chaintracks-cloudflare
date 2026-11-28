@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.6] - 2026-11-28
+
+The bsv-rs floor at 0.8.14. No source line of this crate moves, and no migration is added (the last is `0015_writer_lease.sql`):
+
+- The bsv-rs requirement is `0.8.14` (it was `0.8.12`; a caret requirement still, `default-features = false`, `features = ["block"]`). The tracked `Cargo.lock` moves bsv-rs alone (0.8.12 to 0.8.14, its version and checksum, with this crate's own version): 0.8.14 requires no dependency differently. `/health`'s `build` names 0.8.14.
+- 0.8.14 closes ten advisories bsv-rs has published (its Security tab, read 2026-11-28), each affecting every 0.8 release up to 0.8.13. What this build compiles of bsv-rs is the `block` feature alone, which is `block` and `primitives` (bsv-rs's feature table at 0.8.14: `block = ["primitives"]`), with `error` and `util`. Every file of `src/block`, `src/primitives` and `src/util`, and `src/lib.rs`, is byte for byte the same in the 0.8.12 and 0.8.14 crate files; the two additions to `src/error.rs` are gated on `transaction` and `compat`. So none of the ten reaches this build, and no answer of this service moves:
+  - `transaction`: GHSA-fm3p-cmwv-rf6h (`MerklePath`, `src/transaction/merkle_path.rs`), GHSA-grrj-gwrr-v7r3 and GHSA-63w6-rpmj-r9gg (`Transaction::verify`).
+  - `script`: GHSA-56fp-4337-6vfh and GHSA-7vx5-cf5p-5c48 (script evaluation, `src/script/spend.rs`).
+  - `wallet`, `auth` and `overlay`: GHSA-4gp5-q4cj-4qjf (the wallet wire, certificates and lookup answers).
+  - `compat`: GHSA-43mf-m7fg-m74w (ECIES).
+  - `messages`: GHSA-mqr8-3gvc-hhg3 (`messages::verify`).
+  - `overlay`: GHSA-33px-hj7f-4cpj (`LookupResolver::query`).
+  - `auth`: GHSA-wh67-gjx6-4qqh (`Peer::start`).
+- No other dependency's requirement moves.
+
 ## [0.7.5] - 2026-11-17
 
 The bsv-rs floor at 0.8.12. No source line of this crate moves, and no migration is added (the last is `0015_writer_lease.sql`):
