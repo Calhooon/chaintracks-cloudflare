@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-chaintracks-cloudflare"
-version = "0.7.5"
+version = "0.7.6"
 dependencies = [
  "bsv-rs",
  "chrono",
@@ -150,9 +150,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.8.12"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b90062a5e36e2c3698dcac54739cbda9f2c528e5cc7568ce33904607d944d89"
+checksum = "9320af937dc8336b8e519b4c2c180099ef2ab8ea37fd4e5b5d04b4f2afa9debd"
 dependencies = [
  "aes",
  "aes-gcm",
